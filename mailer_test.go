@@ -338,35 +338,3 @@ func TestGatewayMailerTransportClient(t *testing.T) {
 		}
 	})
 }
-
-// The deprecated transport is kept for the gateways built against it since
-// 0.3.0, so its body must not change shape: PascalCase, no Text key unless one
-// is set, X-Mailer-Secret rather than X-API-Key.
-func TestHTTPMailerTransportBodyIsUnchangedByText(t *testing.T) {
-	var got map[string]any
-	var secret string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		secret = r.Header.Get("X-Mailer-Secret")
-		raw, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(raw, &got)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	transport := NewHTTPMailerTransport(server.URL, "s3cret") // the deprecated shape is what is under test
-	if err := transport.Send(context.Background(), MailMessage{To: "u@example.com", Subject: "Hi", Body: "<p>hi</p>", IsHTML: true}); err != nil {
-		t.Fatalf("send: %v", err)
-	}
-	if secret != "s3cret" {
-		t.Errorf("X-Mailer-Secret = %q", secret)
-	}
-	want := map[string]any{"To": "u@example.com", "Subject": "Hi", "Body": "<p>hi</p>", "IsHTML": true}
-	if len(got) != len(want) {
-		t.Errorf("body keys = %v, want exactly %v", got, want)
-	}
-	for key, value := range want {
-		if got[key] != value {
-			t.Errorf("body[%q] = %v, want %v", key, got[key], value)
-		}
-	}
-}

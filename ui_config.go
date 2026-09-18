@@ -76,8 +76,7 @@ type UIOptions struct {
 	// registered and the router answers whatever it answers for an unknown path.
 	//
 	// It is also what points an emailed link at a UI page rather than at the API
-	// route itself — see HTTPConfig.UILink. The deprecated HTTPConfig.UIEnabled
-	// is an alias for it.
+	// route itself — see HTTPConfig.UILink.
 	Enabled bool
 	// Headless is the reference's config.ui.headless (auth-config.model.ts:343):
 	// the SPA case, in which the hosting application provides its own pages and

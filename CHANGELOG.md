@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The removals promised through the 0.x line, and nothing else. Every symbol under
+Removed carried a `Deprecated:` note naming v1.0.0 as the release it goes in,
+and it goes here, with what a host does instead spelled out symbol by symbol.
+One deprecation stays, and stays on purpose: `AdminOptions.Secret` mirrors the
+reference's own deprecated `adminSecret` (`admin.router.ts:44-56`), so it is a
+reproduction of the reference and not a shim of this port's, and it is kept
+because the reference keeps it.
+
+Nothing here changes the wire the family's clients speak. Every removed path and
+id was this port's own — the hand-written pages, the PascalCase mail body, the
+pre-reference template ids, the pre-0.6.0 JWKS path — and none of them was ever
+a deviation from the reference, so the deviation register is untouched and the
+generated section of README.md is unchanged.
+
+### Removed
+- **BREAKING — `ServeAuthUI()`, `ServeAdminUI()` and `ServeAuthJS()`**, together
+  with `ui/auth.html`, `ui/admin.html`, `ui/auth.js`, the `uiFS` embed and the
+  `ui_test.go` contract tests written against those three files (deprecated in
+  0.9.0). Nothing inside the module had served the two pages since 0.9.0, and
+  `ServeAuthJS` had been a wrapper over the vendored asset since then. What a
+  host does instead: set `HTTPConfig.UI.Enabled` and the adapter mounts
+  `<prefix>/ui`, where `UIHandler` serves the reference's own pages — login,
+  register, forgot-password, reset-password, 2FA, magic-link and the rest — with
+  the config injection they expect, and `auth.js` at `<prefix>/ui/auth.js`, the
+  path those pages load it from; a host that wants the bytes somewhere else
+  reads `UpstreamUIAssetFS()` or `ReadUpstreamUIAsset("auth.js")`. For the
+  admin page: set `HTTPConfig.Admin.Enabled` with an access policy and the
+  adapter mounts the admin console at `Admin.Path` (`/admin`), the reference's
+  own admin SPA served from that mount — `examples/chi-postgres`,
+  `examples/echo-sqlite` and `examples/gin-mongodb` now do exactly that where
+  they mounted `ServeAdminUI()`. The `ui/` directory holds `ui/upstream/assets/`
+  and nothing else, and the vendored assets themselves are untouched: their git
+  object names are still upstream's and the drift test still pins them.
+- **BREAKING — `HTTPConfig.UIEnabled`** (deprecated in 0.7.0). Set
+  `HTTPConfig.UI.Enabled`. It was an alias and not a second switch, so the
+  replacement is a rename with nothing behind it: every link `UILink` and
+  `LinkBase` built under `UIEnabled` is built the same under `UI.Enabled`, and
+  the routes it mounted are mounted the same. `ResolveHTTPConfig` no longer
+  copies one field into the other, because there is one field.
+- **BREAKING — `HTTPMailerTransport` and `NewHTTPMailerTransport`** (deprecated
+  in 0.4.0): the 0.3.0 transport that POSTed `MailMessage` as PascalCase JSON —
+  `{"To", "Subject", "Body", "IsHTML"}` — under an `X-Mailer-Secret` header, a
+  request of this port's own that no gateway built for the reference accepts.
+  Use `NewGatewayMailerTransport(MailerConfig{…})`, which sends the reference's
+  contract: `{to, subject, html, text, from, fromName?, provider?}` under
+  `X-API-Key`, delivered on `2xx` alone. **A gateway built against the old body
+  changes with it** — the keys are camelCase, the HTML travels as `html` with
+  `text` beside it (`MailMessage.Text`, or the HTML again when that is empty),
+  the sender is in the body, and the secret header is `X-API-Key`. Nothing
+  else in the package built one. `MailMessage.Text` keeps its `omitempty` tag,
+  so a host that encodes a `MailMessage` itself sees the bytes it saw before.
+- **BREAKING — the template ids `reset_password`, `magic_link`, `verify_email`
+  and `email_change`** (deprecated in 0.4.0). They were aliases of
+  `TemplatePasswordReset`, `TemplateMagicLink` and `TemplateVerifyEmail` —
+  `email_change` of `TemplateVerifyEmail` too, since the reference has no
+  separate template for that mail — resolved before a store was consulted.
+  Nothing resolves them now, and **that changes what a stored row means**, not
+  only what a caller may pass: `Register`, `RenderMail` and `Render` take an id
+  as given, and a `TemplateStore` is asked for exactly the id the mailer
+  passes. A deployment whose template store holds a row under `reset_password`
+  served the password-reset mail from that row until this release and serves
+  the built-in from now on, because `PasswordResetMailer` asks the store for
+  `password-reset` and no longer looks under the old id. The migration is a
+  rename of the stored id to the constant — `reset_password` →
+  `password-reset`, `magic_link` → `magic-link`, `verify_email` →
+  `verify-email`, `email_change` → `verify-email` — done once, in the store. A
+  caller that passes an old id to `RenderMail` now gets "not found", and a
+  `Register` under one registers that id and nothing else. There is no fallback
+  lookup on purpose: a lookup that tried both spellings would keep the alias
+  alive under another name.
+- **BREAKING — the `<basePath>/jwks` alias that `(*IDP).RegisterHandlers`
+  registered beside the canonical JWKS path** (deprecated in 0.6.0, when the
+  well-known path arrived; upstream plan D-13). The path this package published
+  before 0.6.0 answers the mux's 404 now. The four adapters never mounted the
+  alias, so a deployment that mounts an adapter is unaffected; only a host
+  calling `RegisterHandlers` on a mux of its own served it, and its relying
+  parties are on the canonical path already if they read discovery, since
+  `jwks_uri` has pointed there since 0.6.0. One configured by hand against
+  `<base>/jwks` is pointed at `<base>/.well-known/jwks.json`
+  (`DefaultJWKSPath`) — or the deployment sets `IDPConfig.JWKSPath: "/jwks"`,
+  which makes that the one canonical path, with nothing special about it any
+  more.
+
+### Changed
+- **The vendored admin SPA is held to the admin document** by the
+  route-coverage test (`TestVendoredAssetsCallRoutesThatExist`,
+  `ui_upstream_test.go`), which used to hold only the auth-router literals and
+  silently skipped everything the admin console serves — an exemption kept
+  from before M8 mounted that console. Every request `admin.js` builds is
+  `BASE + path` with `BASE` the admin mount, so its literals are spelled
+  `/api/…` rather than `/admin/…`; each one now has to resolve against
+  `GenerateAdminOpenAPISpec` with the mount stripped, or against the hand-kept
+  list of the sixteen routes the reference's generator omits, which
+  `openapi_admin_test.go` already pinned and now shares
+  (`adminUndocumentedPaths`). All of them do. Six resolve only through that
+  list — `/api/actions`, `/api/settings/ui`, `/api/templates/mail`,
+  `/api/templates/ui`, `/api/upload/files` and the `/api/upload/` head — which
+  is the SPA calling routes the reference's own document does not describe.
+  The first-segment filter that decides which literals are route calls is now
+  derived from each document rather than kept by hand: the hand-kept list
+  carried `/metadata` from the port's own pre-0.2.0 `auth.js` long after
+  anything called it, and the only `'/metadata'` left in the assets is the tail
+  of a concatenation (`'/api/users/' + id + '/metadata'`), which the
+  concatenation rule already reads correctly. No vendored asset calls the tools
+  router, and the test says so instead of holding an empty set to
+  `GenerateToolsOpenAPISpec`: a `/tools` literal arriving with a re-vendor
+  fails until that document is wired in.
+- **The three examples mount the admin console** (`HTTPConfig.Admin.Enabled`
+  with `AdminIsAdminFlag()`) where they mounted the removed `ServeAdminUI()`
+  page, and their comments no longer describe an admin API that "is not
+  mounted yet".
+
 ## [0.11.0] - 2026-09-12
 
 The event plane, and the tools router on top of it. **This release carries the

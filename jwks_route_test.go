@@ -140,9 +140,9 @@ func TestIDPJWKSHandlerHeaders(t *testing.T) {
 
 // TestIDPRegisterHandlersJWKSPathsAndDiscovery: RegisterHandlers mounts the
 // canonical path the adapters mount, GET-only as the reference registers it
-// (auth.router.ts:490), keeps <base>/jwks as the deprecated alias of it
-// (upstream plan D-13) serving the identical bytes and headers, and points the
-// discovery document's jwks_uri at the canonical one.
+// (auth.router.ts:490), points the discovery document's jwks_uri at it, and
+// no longer serves <base>/jwks — the pre-0.6.0 path that was the deprecated
+// alias through the 0.x line (upstream plan D-13) and went with v1.0.0.
 //
 // The Issuer here carries the mount prefix, because that is what makes jwks_uri
 // resolve to the mounted route — the coupling README_DETAILED documents. The
@@ -160,42 +160,41 @@ func TestIDPRegisterHandlersJWKSPathsAndDiscovery(t *testing.T) {
 	mux := http.NewServeMux()
 	idp.RegisterHandlers(mux, basePath)
 
-	var canonical string
-	for _, path := range []string{basePath + DefaultJWKSPath, basePath + "/jwks"} {
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET %s = %d, want 200", path, rec.Code)
+	path := basePath + DefaultJWKSPath
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200", path, rec.Code)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != jwksCacheControl {
+		t.Errorf("GET %s Cache-Control = %q, want %q", path, got, jwksCacheControl)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("GET %s Access-Control-Allow-Origin = %q, want *", path, got)
+	}
+	// GET only, as the reference registers it with router.get
+	// (auth.router.ts:490) and as all four adapters mount it: a method-less
+	// ServeMux pattern would answer the document to POST too, and cache it.
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		bad := httptest.NewRecorder()
+		mux.ServeHTTP(bad, httptest.NewRequest(method, path, nil))
+		if bad.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s = %d, want 405 — the route is GET-only", method, path, bad.Code)
 		}
-		if got := rec.Header().Get("Cache-Control"); got != jwksCacheControl {
-			t.Errorf("GET %s Cache-Control = %q, want %q", path, got, jwksCacheControl)
+		if got := bad.Header().Get("Cache-Control"); got != "" {
+			t.Errorf("%s %s Cache-Control = %q, want none", method, path, got)
 		}
-		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-			t.Errorf("GET %s Access-Control-Allow-Origin = %q, want *", path, got)
+		if strings.Contains(bad.Body.String(), `"keys"`) {
+			t.Errorf("%s %s was served the JWKS document: %s", method, path, bad.Body.String())
 		}
-		// GET only, as the reference registers it with router.get
-		// (auth.router.ts:490) and as all four adapters mount it: a method-less
-		// ServeMux pattern would answer the document to POST too, and cache it.
-		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
-			bad := httptest.NewRecorder()
-			mux.ServeHTTP(bad, httptest.NewRequest(method, path, nil))
-			if bad.Code != http.StatusMethodNotAllowed {
-				t.Errorf("%s %s = %d, want 405 — the route is GET-only", method, path, bad.Code)
-			}
-			if got := bad.Header().Get("Cache-Control"); got != "" {
-				t.Errorf("%s %s Cache-Control = %q, want none", method, path, got)
-			}
-			if strings.Contains(bad.Body.String(), `"keys"`) {
-				t.Errorf("%s %s was served the JWKS document: %s", method, path, bad.Body.String())
-			}
-		}
-		if canonical == "" {
-			canonical = rec.Body.String()
-			continue
-		}
-		if rec.Body.String() != canonical {
-			t.Errorf("the deprecated alias serves %s, the canonical path serves %s", rec.Body.String(), canonical)
-		}
+	}
+
+	// The removed alias is a miss, and a plain one: 404 from the mux itself,
+	// not a redirect and not the document under another name.
+	gone := httptest.NewRecorder()
+	mux.ServeHTTP(gone, httptest.NewRequest(http.MethodGet, basePath+"/jwks", nil))
+	if gone.Code != http.StatusNotFound {
+		t.Errorf("GET %s/jwks = %d, want 404 — the alias was removed in v1.0.0", basePath, gone.Code)
 	}
 
 	doc := decodeDiscovery(t, mux, basePath)
@@ -209,7 +208,7 @@ func TestIDPRegisterHandlersJWKSPathsAndDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse jwks_uri %q: %v", advertised, err)
 	}
-	rec := httptest.NewRecorder()
+	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, parsed.Path, nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET %s (the path of the advertised jwks_uri %q) = %d, want 200",
@@ -228,16 +227,17 @@ func TestIDPRegisterHandlersJWKSPathsAndDiscovery(t *testing.T) {
 		t.Fatalf("jwks_uri = %v, want the JWKSURL override", doc["jwks_uri"])
 	}
 
-	// A JWKSPath of "/jwks" makes the alias the canonical path; registering the
-	// same pattern twice would panic in ServeMux.
-	collide, err := NewIDP(IDPConfig{Issuer: issuer, Signer: key, JWKSPath: "/jwks"}, nil)
+	// "/jwks" is an ordinary JWKSPath now, with nothing special about it: a
+	// deployment that wants the old URL back configures it and gets exactly
+	// one registration there.
+	configured, err := NewIDP(IDPConfig{Issuer: issuer, Signer: key, JWKSPath: "/jwks"}, nil)
 	if err != nil {
 		t.Fatalf("NewIDP: %v", err)
 	}
-	collideMux := http.NewServeMux()
-	collide.RegisterHandlers(collideMux, basePath)
+	configuredMux := http.NewServeMux()
+	configured.RegisterHandlers(configuredMux, basePath)
 	rec = httptest.NewRecorder()
-	collideMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, basePath+"/jwks", nil))
+	configuredMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, basePath+"/jwks", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET %s/jwks with JWKSPath=/jwks = %d, want 200", basePath, rec.Code)
 	}

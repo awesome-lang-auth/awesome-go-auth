@@ -379,7 +379,7 @@ func TestRefreshTokenFromRequestFallsBackToTheCookie(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // TestHTTPConfigUILink pins buildUiLink (auth.router.ts:261-271) branch by
-// branch: the /ui segment under UIEnabled, one trailing slash stripped from the
+// branch: the /ui segment under UI.Enabled, one trailing slash stripped from the
 // prefix, one leading slash stripped from the path, and the site URL used as
 // given.
 func TestHTTPConfigUILink(t *testing.T) {
@@ -392,15 +392,15 @@ func TestHTTPConfigUILink(t *testing.T) {
 		want string
 	}{
 		{"default prefix, API route", HTTPConfig{}, site, "/reset-password?token=t", site + "/auth/reset-password?token=t"},
-		{"default prefix, static UI", HTTPConfig{UIEnabled: true}, site, "/reset-password?token=t", site + "/auth/ui/reset-password?token=t"},
+		{"default prefix, static UI", HTTPConfig{UI: UIOptions{Enabled: true}}, site, "/reset-password?token=t", site + "/auth/ui/reset-password?token=t"},
 		{"trailing-slash prefix, API route", HTTPConfig{APIPrefix: "/api/auth/"}, site, "/verify-email?token=t", site + "/api/auth/verify-email?token=t"},
-		{"trailing-slash prefix, static UI", HTTPConfig{APIPrefix: "/api/auth/", UIEnabled: true}, site, "/verify-email?token=t", site + "/api/auth/ui/verify-email?token=t"},
+		{"trailing-slash prefix, static UI", HTTPConfig{APIPrefix: "/api/auth/", UI: UIOptions{Enabled: true}}, site, "/verify-email?token=t", site + "/api/auth/ui/verify-email?token=t"},
 		{"root prefix", HTTPConfig{APIPrefix: "/"}, site, "/verify-email?token=t", site + "/verify-email?token=t"},
 		{"path without a leading slash", HTTPConfig{}, site, "verify-email?token=t", site + "/auth/verify-email?token=t"},
 		// The reference's empty-path shape keeps its trailing slash (:269); the
 		// strip belongs to LinkBase, where the reference strips it too.
 		{"empty path, API route", HTTPConfig{}, site, "", site + "/auth/"},
-		{"empty path, static UI", HTTPConfig{UIEnabled: true}, site, "", site + "/auth/ui/"},
+		{"empty path, static UI", HTTPConfig{UI: UIOptions{Enabled: true}}, site, "", site + "/auth/ui/"},
 		// No site URL is a relative link, as in the reference with siteUrl unset.
 		{"no site URL", HTTPConfig{}, "", "/reset-password?token=t", "/auth/reset-password?token=t"},
 	}
@@ -423,7 +423,7 @@ func TestHTTPConfigLinkBase(t *testing.T) {
 		want string
 	}{
 		{"default prefix", HTTPConfig{}, site + "/auth"},
-		{"static UI", HTTPConfig{UIEnabled: true}, site + "/auth/ui"},
+		{"static UI", HTTPConfig{UI: UIOptions{Enabled: true}}, site + "/auth/ui"},
 		{"trailing-slash prefix", HTTPConfig{APIPrefix: "/api/auth/"}, site + "/api/auth"},
 		{"root prefix", HTTPConfig{APIPrefix: "/"}, site},
 	}
@@ -436,7 +436,7 @@ func TestHTTPConfigLinkBase(t *testing.T) {
 		t.Errorf("LinkBase(\"\") = %q, want \"\" so the mailer's BaseURL applies", got)
 	}
 	// The composition the adapters and the mailers rely on.
-	ui := HTTPConfig{UIEnabled: true}
+	ui := HTTPConfig{UI: UIOptions{Enabled: true}}
 	if got := MagicLinkURL(ui.LinkBase(site), "tok"); got != site+"/auth/ui/magic-link/verify?token=tok" {
 		t.Errorf("MagicLinkURL over LinkBase = %q", got)
 	}

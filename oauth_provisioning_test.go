@@ -494,7 +494,7 @@ func TestAccountConflictLink(t *testing.T) {
 			site + "/auth/account-conflict?provider=acme&code=OAUTH_ACCOUNT_CONFLICT&email=held%40example.com",
 		},
 		{
-			"static UI", HTTPConfig{UIEnabled: true}, "acme", "held@example.com",
+			"static UI", HTTPConfig{UI: UIOptions{Enabled: true}}, "acme", "held@example.com",
 			site + "/auth/ui/account-conflict?provider=acme&code=OAUTH_ACCOUNT_CONFLICT&email=held%40example.com",
 		},
 		{

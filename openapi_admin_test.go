@@ -206,13 +206,39 @@ func TestAdminOpenAPIDocumentMatchesTheMount(t *testing.T) {
 	}
 }
 
-// TestAdminOpenAPIOmitsWhatTheReferenceOmits is the reverse direction, spelled
-// out rather than derived: these are the routes the console mounts and the
-// reference's generator does not describe, the four upload routes included.
+// adminUndocumentedPaths is the reverse direction of the admin document,
+// spelled out rather than derived: the routes the console mounts and the
+// reference's generator does not describe, the four upload routes included,
+// each with the reason. Relative to the admin mount, as the constants are.
 //
 // It is a stop-point. A PR that decides the document should grow one of these
 // has to delete its line here, which is exactly the visibility a deliberate
-// divergence from a transcription needs.
+// divergence from a transcription needs. Two tests read it:
+// TestAdminOpenAPIOmitsWhatTheReferenceOmits holds the document to it, and
+// TestVendoredAssetsCallRoutesThatExist (ui_upstream_test.go) lets a call in
+// the vendored admin SPA resolve to one of these, since a route the SPA calls
+// and the document leaves out is still a route the console serves.
+var adminUndocumentedPaths = map[string]string{
+	AdminPromoteUsersPath + "/{id}" + AdminPromoteSuffix: "the promote route, which the dev " +
+		"line's own generator does not describe either — so the one route that grants the " +
+		"admin console is the one route the document does not mention",
+	AdminShellPath:                  "the SPA shell",
+	AdminCSSPath:                    "a static asset",
+	AdminJSPath:                     "a static asset",
+	AdminLoginPath:                  "the console's own login",
+	AdminLogoutPath:                 "the console's own logout",
+	AdminActionsPath:                "the action registry listing",
+	AdminSettingsUIPath:             "the branding patch, which hasUi describes at /api/ui-settings instead",
+	AdminMailTemplatesPath:          "the mail template routes",
+	AdminUITemplatesPath:            "the UI translation routes",
+	AdminUploadLogoPath:             "the logo upload, which hasUi describes at /api/ui/logo instead",
+	AdminUploadBGImagePath:          "the background upload",
+	AdminUploadFilesPath:            "the upload listing",
+	AdminUploadPath + "/{filename}": "the upload delete",
+}
+
+// TestAdminOpenAPIOmitsWhatTheReferenceOmits holds the document to
+// adminUndocumentedPaths: none of them is described.
 func TestAdminOpenAPIOmitsWhatTheReferenceOmits(t *testing.T) {
 	a := newAdminOpenAPIAuth(t)
 	cfg := uploadConfig()
@@ -220,25 +246,7 @@ func TestAdminOpenAPIOmitsWhatTheReferenceOmits(t *testing.T) {
 	paths := adminSpecPaths(t, GenerateAdminOpenAPISpec(a.AdminOpenAPIInfo(cfg)))
 
 	base := cfg.AdminDocsBasePath()
-	undocumented := map[string]string{
-		AdminPromoteUsersPath + "/{id}" + AdminPromoteSuffix: "the promote route, which the dev " +
-			"line's own generator does not describe either — so the one route that grants the " +
-			"admin console is the one route the document does not mention",
-		AdminShellPath:                  "the SPA shell",
-		AdminCSSPath:                    "a static asset",
-		AdminJSPath:                     "a static asset",
-		AdminLoginPath:                  "the console's own login",
-		AdminLogoutPath:                 "the console's own logout",
-		AdminActionsPath:                "the action registry listing",
-		AdminSettingsUIPath:             "the branding patch, which hasUi describes at /api/ui-settings instead",
-		AdminMailTemplatesPath:          "the mail template routes",
-		AdminUITemplatesPath:            "the UI translation routes",
-		AdminUploadLogoPath:             "the logo upload, which hasUi describes at /api/ui/logo instead",
-		AdminUploadBGImagePath:          "the background upload",
-		AdminUploadFilesPath:            "the upload listing",
-		AdminUploadPath + "/{filename}": "the upload delete",
-	}
-	for rel, what := range undocumented {
+	for rel, what := range adminUndocumentedPaths {
 		if _, ok := paths[base+rel]; ok {
 			t.Errorf("the document describes %q (%s), which the reference's does not", base+rel, what)
 		}

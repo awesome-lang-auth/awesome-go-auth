@@ -686,7 +686,7 @@ func TestIDPInjectedSignerSignsIDTokenOnly(t *testing.T) {
 		t.Fatalf("POST /token = %d, want 200", status)
 	}
 
-	resp, err := f.client.Get(f.srv.URL + "/oidc/jwks")
+	resp, err := f.client.Get(f.srv.URL + "/oidc" + DefaultJWKSPath)
 	if err != nil {
 		t.Fatalf("GET /jwks: %v", err)
 	}
@@ -751,7 +751,7 @@ func TestIDPJWKSDocumentShape(t *testing.T) {
 		t.Fatalf("JWKS() = %s\nwant      %s", got, want)
 	}
 
-	resp, err := f.client.Get(f.srv.URL + "/oidc/jwks")
+	resp, err := f.client.Get(f.srv.URL + "/oidc" + DefaultJWKSPath)
 	if err != nil {
 		t.Fatalf("GET /jwks: %v", err)
 	}

@@ -14,9 +14,10 @@ import (
 // Until now this port served its own hand-written UI: an 18 KB auth.js and two
 // HTML pages someone wrote by reading the reference rather than copying it.
 // That was a standing bet that a re-implementation would stay in step with a
-// tree it shared no bytes with, and the bet had already been lost once — the
-// comment at the top of ui_test.go is the post-mortem, listing three routes the
-// hand-written SDK called that no adapter has ever mounted. Every later
+// tree it shared no bytes with, and the bet had already been lost once: the
+// hand-written SDK called three routes — /auth/totp/setup, /auth/email/verify
+// and /auth/metadata — that no adapter has ever mounted (the post-mortem is at
+// the route-coverage check in ui_upstream_test.go). Every later
 // divergence would have been just as silent, because nothing compared the two.
 //
 // So the assets are now copies. The reference's own files, at the revision this

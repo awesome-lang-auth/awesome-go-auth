@@ -120,12 +120,24 @@ func main() {
 	//
 	// UI.Enabled mounts the hosted UI at /auth/ui: the login, register,
 	// forgot-password and 2FA pages, the config document they boot from, and
-	// auth.js beside them. Branding is optional — with none, the pages render
-	// the library's defaults.
+	// auth.js beside them — the pages load it from /auth/ui/auth.js, so it
+	// needs no route of its own. Branding is optional — with none, the pages
+	// render the library's defaults.
+	//
+	// Admin mounts the admin console at /admin — beside the auth mount, not
+	// under it, as the reference's admin router is a sibling of its auth router
+	// — with the reference's own SPA served from the same mount. It mounts only
+	// with an access decision: AdminIsAdminFlag admits a session whose user
+	// carries the IsAdmin flag and nothing else (admin.router.ts:370). Set the
+	// flag on the first administrator through the user store; from inside the
+	// console, POST /admin/users/{id}/promote with {"method": "flag"} grants it
+	// to the next.
 	cfg := auth.DefaultHTTPConfig()
 	cfg.Docs.Enabled = getEnv("APP_ENV", "development") != "production"
 	cfg.UI.Enabled = true
 	cfg.UI.Branding = auth.UIBranding{SiteName: "Gin + MongoDB Example"}
+	cfg.Admin.Enabled = true
+	cfg.Admin.AccessPolicy = auth.AdminIsAdminFlag()
 	ginAdapter.MountWithConfig(r, a, cfg)
 
 	// OIDC IDP endpoints, on a mux of this application's own, under /oidc.
@@ -140,12 +152,6 @@ func main() {
 	oidcMux := http.NewServeMux()
 	idp.RegisterHandlers(oidcMux, "/oidc/")
 	r.Any("/oidc/*path", gin.WrapH(oidcMux))
-
-	// The admin dashboard is still the hand-written page: the reference's admin
-	// SPA is vendored and served under /auth/ui, but the admin API it calls is
-	// not mounted yet, so this stays until that lands. auth.js no longer needs a
-	// route of its own — /auth/ui/auth.js is where the pages load it from.
-	r.GET("/admin", gin.WrapH(auth.ServeAdminUI())) //nolint:staticcheck // no replacement until the admin router lands
 
 	// A second copy of the document, at the root and under this app's own name.
 	// The mount already serves one at /auth/openapi.json (see Docs.Enabled

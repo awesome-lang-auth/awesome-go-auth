@@ -170,16 +170,22 @@ func main() {
 	// forgot-password and 2FA pages, the config document they boot from, and
 	// auth.js beside them. Branding is optional — with none, the pages render
 	// the library's defaults.
+	//
+	// Admin mounts the admin console at /admin — beside the auth mount, not
+	// under it, as the reference's admin router is a sibling of its auth router
+	// — with the reference's own SPA served from the same mount. It mounts only
+	// with an access decision: AdminIsAdminFlag admits a session whose user
+	// carries the IsAdmin flag and nothing else (admin.router.ts:370). Set the
+	// flag on the first administrator through the user store; from inside the
+	// console, POST /admin/users/{id}/promote with {"method": "flag"} grants it
+	// to the next.
 	cfg := auth.DefaultHTTPConfig()
 	cfg.Docs.Enabled = getEnv("APP_ENV", "development") != "production"
 	cfg.UI.Enabled = true
 	cfg.UI.Branding = auth.UIBranding{SiteName: "Chi + Postgres Example"}
+	cfg.Admin.Enabled = true
+	cfg.Admin.AccessPolicy = auth.AdminIsAdminFlag()
 	chiAdapter.MountWithConfig(r, a, cfg)
-
-	// The admin dashboard is still the hand-written page: the reference's admin
-	// SPA is vendored and served under /auth/ui, but the admin API it calls is
-	// not mounted yet, so this stays until that lands.
-	r.Get("/admin", auth.ServeAdminUI().ServeHTTP) //nolint:staticcheck // no replacement until the admin router lands
 
 	// SSE endpoint, behind the same access-token middleware the auth routes use.
 	// The topics are the server's decision — never the client's — so they are

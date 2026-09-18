@@ -467,15 +467,6 @@ func testUIConfig(t *testing.T, mount Mounter) {
 		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
 		assertUIUnrouted(t, env.Do(uiConfigRequest(env, "")))
 	})
-
-	t.Run("the deprecated UIEnabled still mounts it", func(t *testing.T) {
-		// A deployment configured before UIOptions existed keeps working, which
-		// is the whole point of keeping the field.
-		cfg := auth.DefaultHTTPConfig()
-		cfg.UIEnabled = true
-		env := NewEnv(t, mount, cfg)
-		uiDocument(t, env, "")
-	})
 }
 
 // stringPtr is the pointer every optional UISettings member is.

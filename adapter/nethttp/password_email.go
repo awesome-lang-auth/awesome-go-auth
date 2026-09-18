@@ -27,7 +27,7 @@ type forgotPasswordRequest struct {
 
 // linkBase resolves the base an emailed link is built under for this request:
 // the request's Origin or Referer matched against the site URL allowlist, then
-// the mount prefix (and /ui under HTTPConfig.UIEnabled) — the reference's
+// the mount prefix (and /ui under HTTPConfig.UI.Enabled) — the reference's
 // buildUiLink(resolveSiteUrl(req, …), …) pair (auth.router.ts:785-786). Empty
 // when no site URL is configured, which leaves a ready-made mailer on its
 // static BaseURL.
