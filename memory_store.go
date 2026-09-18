@@ -74,6 +74,20 @@ func (s *MemoryUserStore) GetUserByID(_ context.Context, id, tenantID string) (U
 	return u, nil
 }
 
+// FindUserByID makes MemoryUserStore satisfy UserLookupStore: GetUserByID
+// without the tenant comparison. byID is keyed on the id alone and CreateUser
+// refuses an id another tenant already holds, so there is never a second record
+// to choose between.
+func (s *MemoryUserStore) FindUserByID(_ context.Context, id string) (User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u, ok := s.byID[id]
+	if !ok {
+		return User{}, errors.New("user not found")
+	}
+	return u, nil
+}
+
 func (s *MemoryUserStore) UpdateProfile(_ context.Context, userID, tenantID, firstName, lastName string) (User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -323,6 +323,76 @@ type AdminUserStore interface {
 	ListUsers(ctx context.Context, tenantID string, limit, offset int) ([]User, error)
 }
 
+// UserLookupStore resolves a user by id alone, in whichever tenant holds it. It
+// is the reference's IUserStore.findById (user-store.interface.ts:5), which
+// carries no tenant because nothing in the reference's user model has one to
+// carry.
+//
+// # Why it is not GetUserByID
+//
+// UserStore.GetUserByID carries a tenant and reads "" as a literal: the tenant
+// whose id is the empty string. That reading is load-bearing. Its other callers
+// pass a tenant they already hold — the access token's tid on /me and /refresh,
+// the tenant an OAuth state or an IDP code was minted for, the one a request
+// named — and a "" that widened to every tenant there would let a token issued
+// in the empty tenant, or a request that named none, resolve an account in any
+// other. So that reading cannot change, and the one caller that has an id and no
+// tenant needs a method of its own.
+//
+// That caller is the admin console. GET <admin>/api/users lists every user in
+// every tenant, because AdminUserStore.ListUsers is the one method in this file
+// that reads "" as a wildcard. GET <admin>/api/users/:id then has to find the
+// user the listing showed, with no tenant to pass, because the reference's route
+// has none (admin.router.ts:789-800). Through GetUserByID(id, "") the console
+// listed users its own detail route answered 404 for, in exactly the deployment
+// that stores users under a tenant. This interface is how the two routes agree.
+//
+// There is no tenant parameter at all, rather than one that is "" for a
+// wildcard. A third reading of the empty tenant in one file is the ambiguity
+// this interface exists to remove, and a signature with nothing to pass says
+// what it does.
+//
+// # What an implementor owes
+//
+//   - Match on User.ID alone, whatever the record's TenantID is, the empty
+//     tenant included. The returned User carries its own TenantID, which is how
+//     a caller learns where the user lives.
+//   - A user that is not there is an error. As with GetUserByID there is no
+//     sentinel, and the one route consuming this answers 404 for any error.
+//   - Never choose between two records. The method is sound only because a user
+//     id names at most one user across every tenant — the precondition the
+//     reference's findById rests on, and one this package's tenant-less seams
+//     (UserMetadataStore, LinkedAccountStore, TenantStore.GetTenantsForUser)
+//     already assume. MemoryUserStore enforces it at CreateUser, and the ids the
+//     core mints are 128 random bits (newID), but a store keyed on (tenant, id)
+//     can hold one id twice if a host supplied it. Such a store answers an error
+//     for that id rather than either record: an operator shown the wrong
+//     account's detail is worse off than one shown none.
+//
+// # Implementing it on a key-value store
+//
+// The directory index AdminUserStore describes cannot serve this. Its sort key
+// is <tenantID>#<id>, so the id is the suffix, and a key condition matches a
+// sort key only by equality, range or prefix: an id behind an unknown tenant is
+// reachable only by reading the whole directory partition and filtering it,
+// which costs what a Scan costs. What serves it is an item keyed on the id
+// alone. That is either a pointer written beside the profile, the way a store
+// already keeps an email pointer for GetUserByEmail, or an index entry keyed on
+// the user id that the store already writes for another reason —
+// GetTenantsForUser needs one. The second costs no new write, but a lookup
+// through it has that entry's lifecycle: if a membership can be removed while
+// the user stays, the lookup loses the user with it.
+//
+// # Optional, with a fallback
+//
+// A store without it is not refused. The admin route falls back to
+// GetUserByID(id, ""), which is what it did before this interface existed and
+// is the right answer for every single-tenant deployment; see the
+// admin-user-detail-spans-tenants-only-through-a-lookup-store deviation.
+type UserLookupStore interface {
+	FindUserByID(ctx context.Context, id string) (User, error)
+}
+
 // SessionLister lists sessions across all users, for the admin sessions table.
 // It is the reference's ISessionStore.getAllSessions (session-store.interface.ts:91),
 // consumed by GET /admin/api/sessions (admin.router.ts:1086 onwards).

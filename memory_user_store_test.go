@@ -1257,6 +1257,70 @@ func TestMemoryUserStore_ListUsers_FullTableWalkVisitsEachUserOnce(t *testing.T)
 	}
 }
 
+// --- UserLookupStore ------------------------------------------------------
+
+// Every user the unscoped listing shows must resolve by id alone, the
+// untenanted one included — that agreement is the reason the interface exists —
+// and the tenant it reports is the record's own.
+func TestMemoryUserStore_FindUserByID_ResolvesEveryListedUser(t *testing.T) {
+	store := NewMemoryUserStore()
+	seedUsers(t, store,
+		User{ID: "u1", Email: "a@example.com", TenantID: "acme"},
+		User{ID: "u2", Email: "b@example.com", TenantID: "globex"},
+		User{ID: "u3", Email: "c@example.com", TenantID: ""},
+	)
+	ctx := context.Background()
+
+	listed, err := store.ListUsers(ctx, "", 10, 0)
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	if len(listed) != 3 {
+		t.Fatalf("listed %s, want all three users", userIDs(listed))
+	}
+	for _, want := range listed {
+		got, err := store.FindUserByID(ctx, want.ID)
+		if err != nil {
+			t.Fatalf("FindUserByID(%q): %v — the listing showed it", want.ID, err)
+		}
+		if got.ID != want.ID || got.TenantID != want.TenantID || got.Email != want.Email {
+			t.Errorf("FindUserByID(%q) = %+v, want the listed record %+v", want.ID, got, want)
+		}
+	}
+
+	// The contrast that makes the method necessary: GetUserByID reads "" as a
+	// literal, and must go on doing so.
+	if _, err := store.GetUserByID(ctx, "u1", ""); err == nil {
+		t.Error(`GetUserByID("u1", "") found a user stored under "acme"; "" is a literal there`)
+	}
+}
+
+func TestMemoryUserStore_FindUserByID_NotFound(t *testing.T) {
+	store := NewMemoryUserStore()
+	seedUsers(t, store, User{ID: "u1", Email: "a@example.com", TenantID: "acme"})
+	if _, err := store.FindUserByID(context.Background(), "nobody"); err == nil {
+		t.Fatal("expected an error for an unknown id")
+	}
+}
+
+// An id names one user across every tenant here, which is the precondition
+// UserLookupStore leans on: CreateUser refuses the second record rather than
+// leaving the lookup two to choose between.
+func TestMemoryUserStore_UserIDIsUniqueAcrossTenants(t *testing.T) {
+	store := NewMemoryUserStore()
+	ctx := context.Background()
+	seedUsers(t, store, User{ID: "u1", Email: "a@example.com", TenantID: "acme"})
+
+	_, err := store.CreateUser(ctx, User{ID: "u1", Email: "b@example.com", TenantID: "globex"})
+	if !errors.Is(err, ErrUserExists) {
+		t.Fatalf("CreateUser with an id another tenant holds = %v, want ErrUserExists", err)
+	}
+	got, err := store.FindUserByID(ctx, "u1")
+	if err != nil || got.TenantID != "acme" || got.Email != "a@example.com" {
+		t.Fatalf("FindUserByID = %+v, %v; want the first record, untouched", got, err)
+	}
+}
+
 // --- User.IsAdmin ---------------------------------------------------------
 
 // IsAdmin is a stored field, so the only thing a store owes it is that it
