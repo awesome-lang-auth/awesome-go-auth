@@ -256,7 +256,7 @@ func TestUpstreamUIAssetsAccessorsAreHonest(t *testing.T) {
 //     window.__ADMIN_CONFIG__.base; api() at :144), so its literals are spelled
 //     /api/… and /login, /logout — never /admin/… — and are held to
 //     GenerateAdminOpenAPISpec with DefaultAdminPath stripped, or to
-//     adminUndocumentedPaths: the sixteen routes the reference's generator
+//     adminUndocumentedPaths: the fourteen paths the reference's generator
 //     leaves out (openapi_admin_test.go), which the console serves all the same.
 //     That list is a stop-point, not a licence: a literal resolving to it is a
 //     call to a mounted route the document happens not to describe.
@@ -265,23 +265,39 @@ func TestUpstreamUIAssetsAccessorsAreHonest(t *testing.T) {
 //     brings in a /tools literal fails here until that document is wired in.
 //
 // Which surface a literal belongs to is decided by the file it is in, because
-// that is what decides its base — and, within a file, by its first segment,
-// which has to be the first segment of a route that surface has. The segment
-// sets are derived from the documents rather than kept by hand: the hand-kept
-// list this check started with carried "/metadata" for the port's own pre-0.2.0
-// auth.js long after that file stopped calling it, and a derived set cannot
-// hold a fossil. What the filter leaves out is a literal that is not a route at
-// all: window.location.href = '/', the stylesheets, and auth.js's three /ui
-// literals — two pathname string operations (:15-16) and the link to the login
-// page (:21) — which name pages UIHandler serves and no generator describes;
-// ui_pages_test.go pins those.
+// that is what decides its base. Within a file, every path literal is held to
+// the surface unless it is on that surface's list of non-route literals, each
+// entry with its reason — the home URL, a pathname string operation, the login
+// page UIHandler serves, an example prefix in a doc comment. That list is an
+// allow-list, and the direction matters. The check this started with worked
+// the other way round: a hand-kept list of the first segment of every mounted
+// route, and a literal outside it was dropped before anything looked at it.
+// Kept by hand, the list grew a fossil ("/metadata", for the port's own
+// pre-0.2.0 auth.js, long after that file stopped calling it); derived from
+// the documents, as it briefly was, it did something worse, because a route
+// this port has never mounted has no segment in any document, so a re-vendored
+// auth.js calling /totp/setup or /email/verify — the exact rot described at the
+// top — was dropped as "not a route" rather than failed as a call the port does
+// not serve. Inverted, an unlisted literal is a call and has to resolve; a
+// listed literal that no asset carries any more is a fossil and fails too.
 //
-// One rule the port's own assets never needed: a quoted literal preceded by
-// `+` is a fragment of a concatenation, not the start of a path.
-// `'/api/users/' + id + '/metadata'` in admin.js puts the bare literal
-// "/metadata" in the source; read as a path start that is a call to
-// <admin>/metadata, which nothing serves, and read correctly it is the tail of
-// /admin/api/users/:id/metadata (admin.router.ts:855).
+// Two rules about the text before the quote, which the port's own assets never
+// needed:
+//
+//   - A quoted literal preceded by `+` continues an expression rather than
+//     starting one. `'/api/users/' + id + '/metadata'` in admin.js puts the
+//     bare literal "/metadata" in the source; read as a path start that is a
+//     call to <admin>/metadata, which nothing serves, and read correctly it is
+//     the tail of /admin/api/users/:id/metadata (admin.router.ts:855). A tail
+//     is skipped; the head before it is what is held.
+//   - Unless the `+` joins the literal to the asset's own base — BASE and
+//     cfg.base in admin.js (:6-7), defaultPrefix in auth.js (:15-20) — in which
+//     case it is the start of a path under the mount and is held like any
+//     other: cfg.base + '/login' (admin.js:68), fetch(cfg.base + '/logout')
+//     (:110), fetch(BASE + '/api/upload/' + type) (:964), defaultPrefix +
+//     '/ui/login' (auth.js:21). The rule knows the base by name, so it counts
+//     its matches and fails on zero: a re-vendor that renamed the base would
+//     otherwise turn those four calls back into skipped tails without a word.
 
 // assetRoutePattern matches a single-quoted path literal in the embedded JS/HTML.
 var assetRoutePattern = regexp.MustCompile(`'(/[A-Za-z0-9/_.\-{}]*)'`)
@@ -290,20 +306,26 @@ var assetRoutePattern = regexp.MustCompile(`'(/[A-Za-z0-9/_.\-{}]*)'`)
 // that literal continues an expression rather than starting one.
 var concatenatedTail = regexp.MustCompile(`\+\s*$`)
 
+// basePrefixed matches the text immediately before a quoted literal when the
+// `+` it follows joins it to the asset's base variable: the literal is then a
+// path start under the mount, not a tail.
+var basePrefixed = regexp.MustCompile(`\b(?:BASE|cfg\.base|defaultPrefix)\s*\+\s*$`)
+
 // assetSurface is one router's route set as an asset calls it: the paths with
-// the mount stripped, and the first segment of every one of them.
+// the mount stripped, and the literals its assets carry that are not calls,
+// keyed by their normalised form, each with the reason it is not one.
 type assetSurface struct {
-	name  string
-	mount string
-	paths map[string]bool
-	heads map[string]bool
+	name      string
+	mount     string
+	paths     map[string]bool
+	nonRoutes map[string]string
 }
 
 // newAssetSurface strips mount from every documented path and adds the extra
-// relative ones, then derives the segment set from the result.
-func newAssetSurface(t *testing.T, name, mount string, documented map[string]any, extra []string) assetSurface {
+// relative ones.
+func newAssetSurface(t *testing.T, name, mount string, documented map[string]any, extra []string, nonRoutes map[string]string) assetSurface {
 	t.Helper()
-	s := assetSurface{name: name, mount: mount, paths: map[string]bool{}, heads: map[string]bool{}}
+	s := assetSurface{name: name, mount: mount, paths: map[string]bool{}, nonRoutes: nonRoutes}
 	for p := range documented {
 		if !strings.HasPrefix(p, mount) {
 			t.Fatalf("the %s document describes %q, which is not below its mount %q", name, p, mount)
@@ -316,28 +338,35 @@ func newAssetSurface(t *testing.T, name, mount string, documented map[string]any
 	if len(s.paths) == 0 {
 		t.Fatalf("no %s paths: the guard below would pass vacuously", name)
 	}
-	for p := range s.paths {
-		// The console's shell is "/" and has no segment; a head of "/" would
-		// claim every literal, the non-routes included.
-		if segment := strings.SplitN(strings.TrimPrefix(p, "/"), "/", 2)[0]; segment != "" {
-			s.heads["/"+segment] = true
-		}
-	}
 	return s
+}
+
+// authNonRoutes is every literal the pages and auth.js carry that is not a
+// call to the auth router, in normalised form. Four entries; a fifth needs a
+// reason as good as these, and an entry nothing carries any more fails.
+var authNonRoutes = map[string]string{
+	"/": "the home URL — window.location.href = '/' in the pages, homeUrl in auth.js " +
+		"(:22, :361) — and auth.js's default prefix '/auth' (:17), which is the mount " +
+		"itself and normalises to this",
+	"/ui/": "a pathname string operation (auth.js:15-16) that finds the prefix above the UI mount",
+	"/ui/login": "the login page, which UIHandler serves and ui_pages_test.go pins; no generator " +
+		"describes it (auth.js:21)",
+	"/api/auth": "an example prefix in the SDK's doc comment (auth.js:380, :384)",
 }
 
 // authAssetSurface is the auth router with no optional flag set: the routes
 // every mount has. The pages and auth.js call nothing conditional.
 func authAssetSurface(t *testing.T) assetSurface {
 	t.Helper()
-	return newAssetSurface(t, "auth", DefaultAPIPrefix, adminSpecPaths(t, GenerateOpenAPISpec(OpenAPIInfo{})), nil)
+	return newAssetSurface(t, "auth", DefaultAPIPrefix, specPaths(t, GenerateOpenAPISpec(OpenAPIInfo{})), nil, authNonRoutes)
 }
 
 // adminAssetSurface is the admin console at its widest — every flag a wiring
 // can set, so that a tab the SPA shows under any wiring has its routes in the
 // set — plus the routes the reference's generator omits. UI is left off: it is
 // the reference's dead flag, describing two paths the console has never served
-// (openapi_admin.go), and a literal must resolve to something mounted.
+// (openapi_admin.go), and a literal must resolve to something mounted. The SPA
+// carries no non-route literal: every path it spells is a call.
 func adminAssetSurface(t *testing.T) assetSurface {
 	t.Helper()
 	document := GenerateAdminOpenAPISpec(AdminOpenAPIInfo{
@@ -348,7 +377,7 @@ func adminAssetSurface(t *testing.T) assetSurface {
 	for rel := range adminUndocumentedPaths {
 		undocumented = append(undocumented, rel)
 	}
-	return newAssetSurface(t, "admin", DefaultAdminPath, adminSpecPaths(t, document), undocumented)
+	return newAssetSurface(t, "admin", DefaultAdminPath, specPaths(t, document), undocumented, nil)
 }
 
 // normalise strips the query and the mount, so a literal written as
@@ -366,18 +395,6 @@ func (s assetSurface) normalise(literal string) string {
 		clean = strings.TrimPrefix(clean, s.mount)
 	}
 	return clean
-}
-
-// isRoute reports whether a literal's first segment is one this surface has —
-// the filter that separates a call from a non-route literal.
-func (s assetSurface) isRoute(literal string) bool {
-	literal = s.normalise(literal)
-	for head := range s.heads {
-		if literal == head || strings.HasPrefix(literal, head+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 // known reports whether a literal names a route that exists. A literal may be
@@ -409,6 +426,8 @@ func TestVendoredAssetsCallRoutesThatExist(t *testing.T) {
 	embedded := embeddedUpstreamAssets(t)
 
 	checked := map[string]int{}
+	exempted := map[string]map[string]int{authRouter.name: {}, console.name: {}}
+	baseStarts := 0
 	for _, name := range sortedKeys(embedded) {
 		t.Run(name, func(t *testing.T) {
 			surface := authRouter
@@ -421,7 +440,9 @@ func TestVendoredAssetsCallRoutesThatExist(t *testing.T) {
 				// Look back a short way rather than at the whole prefix: the
 				// question is only what token immediately precedes the quote.
 				before := source[max(0, m[0]-40):m[0]]
-				if concatenatedTail.MatchString(before) {
+				if basePrefixed.MatchString(before) {
+					baseStarts++
+				} else if concatenatedTail.MatchString(before) {
 					continue
 				}
 				if literal == DefaultToolsPath || strings.HasPrefix(literal, DefaultToolsPath+"/") {
@@ -430,27 +451,43 @@ func TestVendoredAssetsCallRoutesThatExist(t *testing.T) {
 						"in as a third surface before exempting this.", name, literal)
 					continue
 				}
-				if !surface.isRoute(literal) {
+				clean := surface.normalise(literal)
+				if _, ok := surface.nonRoutes[clean]; ok {
+					exempted[surface.name][clean]++
 					continue
 				}
 				checked[surface.name]++
 				if !surface.known(literal) {
 					t.Errorf("vendored %s calls %q, which the %s router does not mount.\n"+
 						"  the vendored assets are not editable here, so the answer is either a "+
-						"route this port still owes the family, or a literal that needs the "+
-						"concatenation rule above.",
-						name, literal, surface.name)
+						"route this port still owes the family, a literal that needs the "+
+						"concatenation rule above, or — with a reason as good as the ones there — "+
+						"a non-route literal for the %s surface's list.",
+						name, literal, surface.name, surface.name)
 				}
 			}
 		})
 	}
 	// Both surfaces have to have been exercised, or one of the two documents
-	// is being held to nothing and this test is passing on an empty set.
+	// is being held to nothing and this test is passing on an empty set; and
+	// every exemption has to have been used, or it is the fossil the list's
+	// direction exists to refuse.
 	for _, surface := range []assetSurface{authRouter, console} {
 		if checked[surface.name] == 0 {
-			t.Errorf("no %s route literal found in any vendored asset — the extraction regex or the "+
-				"segment filter has stopped matching", surface.name)
+			t.Errorf("no %s route literal found in any vendored asset — the extraction regex "+
+				"has stopped matching", surface.name)
 		}
+		for clean, why := range surface.nonRoutes {
+			if exempted[surface.name][clean] == 0 {
+				t.Errorf("the %s non-route list names %q (%s), which no vendored asset carries any "+
+					"more: delete the entry", surface.name, clean, why)
+			}
+		}
+	}
+	if baseStarts == 0 {
+		t.Error("no literal followed its asset's base variable (BASE, cfg.base, defaultPrefix) — " +
+			"a re-vendor renamed the base, and the calls built on it are being skipped as " +
+			"concatenation tails; teach basePrefixed the new name")
 	}
 }
 

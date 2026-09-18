@@ -2267,11 +2267,12 @@ answer 404.
 #### `RegisterHandlers` — mounting them yourself
 
 `(*IDP).RegisterHandlers(mux, basePath)` mounts the same four handlers, plus
-the JWKS document at `basePath + JWKSPath()`, on a mux you own. Since the adapters mount the four themselves it
-is no longer needed by a host that mounts an adapter; it stays for the host
-that wants the OIDC endpoints somewhere else — under a different base path,
-behind its own middleware — and for the one that uses the `IDP` without
-mounting an adapter at all. `examples/gin-mongodb` is that shape.
+the JWKS document at `basePath + JWKSPath()`, on a mux you own. Since the
+adapters mount the four themselves it is no longer needed by a host that mounts
+an adapter; it stays for the host that wants the OIDC endpoints somewhere else
+— under a different base path, behind its own middleware — and for the one
+that uses the `IDP` without mounting an adapter at all. `examples/gin-mongodb`
+is that shape.
 
 **Do one or the other, not both.** Mounting an adapter *and* calling
 `RegisterHandlers` with the adapter's prefix puts the same endpoints at the
@@ -2960,10 +2961,10 @@ and route it had is unchanged.
 
 ### Embedded assets
 
-The `ui/` directory holds `ui/upstream/assets/` and nothing else; the port's own
-hand-written `auth.html`, `admin.html` and `auth.js`, which nothing served since
-0.9.0, went in v1.0.0 together with `ServeAuthUI()`, `ServeAdminUI()` and
-`ServeAuthJS()`.
+The `ui/` directory holds `ui/upstream/` — the vendored assets and their
+provenance README — and nothing else; the port's own hand-written `auth.html`,
+`admin.html` and `auth.js`, which nothing served since 0.9.0, went in v1.0.0
+together with `ServeAuthUI()`, `ServeAdminUI()` and `ServeAuthJS()`.
 
 `ui/upstream/assets/` holds the reference's own fourteen browser assets, copied
 byte for byte from awesome-node-auth's `src/ui/assets` at `cc01e997` (v1.9.0),

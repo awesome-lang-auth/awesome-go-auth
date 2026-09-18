@@ -24,7 +24,7 @@ func TestAdminOpenAPIPathsFollowTheFlags(t *testing.T) {
 	}
 
 	document := GenerateAdminOpenAPISpec(AdminOpenAPIInfo{})
-	paths := adminSpecPaths(t, document)
+	paths := specPaths(t, document)
 	for _, path := range unconditional {
 		if _, ok := paths[path]; !ok {
 			t.Errorf("a document with no flags omits %q, which is unconditional there", path)
@@ -86,7 +86,7 @@ func TestAdminOpenAPIPathsFollowTheFlags(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := adminSpecPaths(t, GenerateAdminOpenAPISpec(c.info))
+			got := specPaths(t, GenerateAdminOpenAPISpec(c.info))
 			for _, path := range c.adds {
 				if _, ok := got[path]; !ok {
 					t.Errorf("the flag does not add %q", path)
@@ -111,7 +111,7 @@ func TestAdminOpenAPIBasePath(t *testing.T) {
 		if want == "" {
 			want = DefaultAdminPath
 		}
-		for path := range adminSpecPaths(t, document) {
+		for path := range specPaths(t, document) {
 			if !strings.HasPrefix(path, want+"/") {
 				t.Errorf("BasePath %q produced the path %q", base, path)
 			}
@@ -182,7 +182,7 @@ func TestAdminOpenAPIDocumentMatchesTheMount(t *testing.T) {
 	cfg.Admin.Docs.Enabled = true
 	handler := a.AdminHandler(cfg)
 
-	paths := adminSpecPaths(t, GenerateAdminOpenAPISpec(a.AdminOpenAPIInfo(cfg)))
+	paths := specPaths(t, GenerateAdminOpenAPISpec(a.AdminOpenAPIInfo(cfg)))
 	parameter := regexp.MustCompile(`\{[^}]+\}`)
 	for path, item := range paths {
 		operations, ok := item.(map[string]any)
@@ -243,7 +243,7 @@ func TestAdminOpenAPIOmitsWhatTheReferenceOmits(t *testing.T) {
 	a := newAdminOpenAPIAuth(t)
 	cfg := uploadConfig()
 	cfg.Admin.Docs.Enabled = true
-	paths := adminSpecPaths(t, GenerateAdminOpenAPISpec(a.AdminOpenAPIInfo(cfg)))
+	paths := specPaths(t, GenerateAdminOpenAPISpec(a.AdminOpenAPIInfo(cfg)))
 
 	base := cfg.AdminDocsBasePath()
 	for rel, what := range adminUndocumentedPaths {
@@ -289,7 +289,7 @@ func TestAdminDocsRoutesAreUnguarded(t *testing.T) {
 	}
 	// The served document is this mount's, not a default: it carries the flags
 	// the adapter was configured with.
-	if _, ok := adminSpecPaths(t, served)[cfg.AdminDocsBasePath()+AdminSessionsPath]; !ok {
+	if _, ok := specPaths(t, served)[cfg.AdminDocsBasePath()+AdminSessionsPath]; !ok {
 		t.Error("the served document omits the session routes this deployment mounts")
 	}
 
@@ -336,7 +336,7 @@ func TestAdminOpenAPISecurity(t *testing.T) {
 	base := DefaultAdminPath
 	public := map[string]bool{base + AdminOpenAPIPath: true, base + AdminDocsPath: true}
 
-	for path, item := range adminSpecPaths(t, document) {
+	for path, item := range specPaths(t, document) {
 		for method, operation := range item.(map[string]any) {
 			fields, ok := operation.(map[string]any)
 			if !ok {
@@ -457,7 +457,7 @@ func adminDocsGet(handler http.Handler, rel string) *httptest.ResponseRecorder {
 	return rec
 }
 
-func adminSpecPaths(t *testing.T, document map[string]any) map[string]any {
+func specPaths(t *testing.T, document map[string]any) map[string]any {
 	t.Helper()
 	paths, ok := document["paths"].(map[string]any)
 	if !ok {

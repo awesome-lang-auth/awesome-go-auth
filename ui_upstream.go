@@ -11,19 +11,20 @@ import (
 // This file vendors the reference's browser assets and records where they came
 // from.
 //
-// Until now this port served its own hand-written UI: an 18 KB auth.js and two
-// HTML pages someone wrote by reading the reference rather than copying it.
+// Until 0.9.0 this port served its own hand-written UI: an 18 KB auth.js and
+// two HTML pages someone wrote by reading the reference rather than copying it.
 // That was a standing bet that a re-implementation would stay in step with a
 // tree it shared no bytes with, and the bet had already been lost once: the
 // hand-written SDK called three routes — /auth/totp/setup, /auth/email/verify
 // and /auth/metadata — that no adapter has ever mounted (the post-mortem is at
-// the route-coverage check in ui_upstream_test.go). Every later
-// divergence would have been just as silent, because nothing compared the two.
+// the route-coverage check in ui_upstream_test.go). Every later divergence
+// would have been just as silent, because nothing compared the two.
 //
-// So the assets are now copies. The reference's own files, at the revision this
-// port targets, with a sha256 table and a test that re-hashes them on every
-// `go test ./...`. The port cannot drift from the family's UI any more, because
-// it no longer has a UI of its own to drift with; it has the family's.
+// So since 0.9.0 the assets are copies, and since v1.0.0 the copies are the
+// whole of ui/. The reference's own files, at the revision this port targets,
+// with a sha256 table and a test that re-hashes them on every `go test ./...`.
+// The port cannot drift from the family's UI any more, because it no longer
+// has a UI of its own to drift with; it has the family's.
 //
 // # Why the provenance is beside the bytes rather than in them
 //

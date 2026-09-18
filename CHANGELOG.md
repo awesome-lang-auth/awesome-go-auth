@@ -7,13 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The removals promised through the 0.x line, and nothing else. Every symbol under
-Removed carried a `Deprecated:` note naming v1.0.0 as the release it goes in,
-and it goes here, with what a host does instead spelled out symbol by symbol.
-One deprecation stays, and stays on purpose: `AdminOptions.Secret` mirrors the
-reference's own deprecated `adminSecret` (`admin.router.ts:44-56`), so it is a
-reproduction of the reference and not a shim of this port's, and it is kept
-because the reference keeps it.
+The removals promised through the 0.x line, and nothing else. Every removal
+under Removed was announced as going with v1.0.0 — by a `Deprecated:` note on
+the symbol where there was a symbol to carry one, and in every case by the
+`### Deprecated` entry of the release that announced it (0.9.0, 0.7.0, 0.6.0 for
+the `<basePath>/jwks` path, 0.4.0) — and it goes here, with what a host does
+instead spelled out symbol by symbol. One deprecation stays, and stays on
+purpose: `AdminOptions.Secret` mirrors the reference's own deprecated
+`adminSecret` (`admin.router.ts:44-56`), so it is a reproduction of the
+reference and not a shim of this port's, and it is kept because the reference
+keeps it.
 
 Nothing here changes the wire the family's clients speak. Every removed path and
 id was this port's own — the hand-written pages, the PascalCase mail body, the
@@ -22,13 +25,14 @@ a deviation from the reference, so the deviation register is untouched and the
 generated section of README.md is unchanged.
 
 ### Removed
-- **BREAKING — `ServeAuthUI()`, `ServeAdminUI()` and `ServeAuthJS()`**, together
-  with `ui/auth.html`, `ui/admin.html`, `ui/auth.js`, the `uiFS` embed and the
-  `ui_test.go` contract tests written against those three files (deprecated in
-  0.9.0). Nothing inside the module had served the two pages since 0.9.0, and
-  `ServeAuthJS` had been a wrapper over the vendored asset since then. What a
-  host does instead: set `HTTPConfig.UI.Enabled` and the adapter mounts
-  `<prefix>/ui`, where `UIHandler` serves the reference's own pages — login,
+- **BREAKING — `ServeAuthUI()`, `ServeAdminUI()` and `ServeAuthJS()` are
+  removed** (deprecated in 0.9.0), together with `ui/auth.html`,
+  `ui/admin.html`, `ui/auth.js`, the `uiFS` embed and the `ui_test.go` contract
+  tests written against those three files. Nothing inside the module had
+  served the two pages since 0.9.0, and `ServeAuthJS` had been a wrapper over
+  the vendored asset since then. What a host does instead: set
+  `HTTPConfig.UI.Enabled` and the adapter mounts `<prefix>/ui`, where
+  `UIHandler` serves the reference's own pages — login,
   register, forgot-password, reset-password, 2FA, magic-link and the rest — with
   the config injection they expect, and `auth.js` at `<prefix>/ui/auth.js`, the
   path those pages load it from; a host that wants the bytes somewhere else
@@ -37,19 +41,21 @@ generated section of README.md is unchanged.
   adapter mounts the admin console at `Admin.Path` (`/admin`), the reference's
   own admin SPA served from that mount — `examples/chi-postgres`,
   `examples/echo-sqlite` and `examples/gin-mongodb` now do exactly that where
-  they mounted `ServeAdminUI()`. The `ui/` directory holds `ui/upstream/assets/`
-  and nothing else, and the vendored assets themselves are untouched: their git
-  object names are still upstream's and the drift test still pins them.
-- **BREAKING — `HTTPConfig.UIEnabled`** (deprecated in 0.7.0). Set
+  they mounted `ServeAdminUI()`. The `ui/` directory holds `ui/upstream/` — the
+  vendored assets and their provenance README — and nothing else, and the
+  vendored assets themselves are untouched: their git object names are still
+  upstream's and the drift test still pins them.
+- **BREAKING — `HTTPConfig.UIEnabled` is removed** (deprecated in 0.7.0). Set
   `HTTPConfig.UI.Enabled`. It was an alias and not a second switch, so the
   replacement is a rename with nothing behind it: every link `UILink` and
   `LinkBase` built under `UIEnabled` is built the same under `UI.Enabled`, and
   the routes it mounted are mounted the same. `ResolveHTTPConfig` no longer
   copies one field into the other, because there is one field.
-- **BREAKING — `HTTPMailerTransport` and `NewHTTPMailerTransport`** (deprecated
-  in 0.4.0): the 0.3.0 transport that POSTed `MailMessage` as PascalCase JSON —
-  `{"To", "Subject", "Body", "IsHTML"}` — under an `X-Mailer-Secret` header, a
-  request of this port's own that no gateway built for the reference accepts.
+- **BREAKING — `HTTPMailerTransport` and `NewHTTPMailerTransport` are removed**
+  (deprecated in 0.4.0): the 0.3.0 transport that POSTed `MailMessage` as
+  PascalCase JSON — `{"To", "Subject", "Body", "IsHTML"}` — under an
+  `X-Mailer-Secret` header, a request of this port's own that no gateway built
+  for the reference accepts.
   Use `NewGatewayMailerTransport(MailerConfig{…})`, which sends the reference's
   contract: `{to, subject, html, text, from, fromName?, provider?}` under
   `X-API-Key`, delivered on `2xx` alone. **A gateway built against the old body
@@ -59,7 +65,7 @@ generated section of README.md is unchanged.
   else in the package built one. `MailMessage.Text` keeps its `omitempty` tag,
   so a host that encodes a `MailMessage` itself sees the bytes it saw before.
 - **BREAKING — the template ids `reset_password`, `magic_link`, `verify_email`
-  and `email_change`** (deprecated in 0.4.0). They were aliases of
+  and `email_change` are removed** (deprecated in 0.4.0). They were aliases of
   `TemplatePasswordReset`, `TemplateMagicLink` and `TemplateVerifyEmail` —
   `email_change` of `TemplateVerifyEmail` too, since the reference has no
   separate template for that mail — resolved before a store was consulted.
@@ -78,11 +84,12 @@ generated section of README.md is unchanged.
   lookup on purpose: a lookup that tried both spellings would keep the alias
   alive under another name.
 - **BREAKING — the `<basePath>/jwks` alias that `(*IDP).RegisterHandlers`
-  registered beside the canonical JWKS path** (deprecated in 0.6.0, when the
-  well-known path arrived; upstream plan D-13). The path this package published
-  before 0.6.0 answers the mux's 404 now. The four adapters never mounted the
-  alias, so a deployment that mounts an adapter is unaffected; only a host
-  calling `RegisterHandlers` on a mux of its own served it, and its relying
+  registered beside the canonical JWKS path is removed** (deprecated in 0.6.0,
+  when the well-known path arrived; upstream plan D-13). The path this package
+  published before 0.6.0 answers the mux's 404 now. The four adapters never
+  mounted the alias, so a deployment that mounts an adapter is unaffected; only
+  a host calling `RegisterHandlers` on a mux of its own served it, and its
+  relying
   parties are on the canonical path already if they read discovery, since
   `jwks_uri` has pointed there since 0.6.0. One configured by hand against
   `<base>/jwks` is pointed at `<base>/.well-known/jwks.json`
@@ -99,19 +106,26 @@ generated section of README.md is unchanged.
   `BASE + path` with `BASE` the admin mount, so its literals are spelled
   `/api/…` rather than `/admin/…`; each one now has to resolve against
   `GenerateAdminOpenAPISpec` with the mount stripped, or against the hand-kept
-  list of the sixteen routes the reference's generator omits, which
+  list of the fourteen paths the reference's generator omits, which
   `openapi_admin_test.go` already pinned and now shares
   (`adminUndocumentedPaths`). All of them do. Six resolve only through that
   list — `/api/actions`, `/api/settings/ui`, `/api/templates/mail`,
   `/api/templates/ui`, `/api/upload/files` and the `/api/upload/` head — which
   is the SPA calling routes the reference's own document does not describe.
-  The first-segment filter that decides which literals are route calls is now
-  derived from each document rather than kept by hand: the hand-kept list
-  carried `/metadata` from the port's own pre-0.2.0 `auth.js` long after
-  anything called it, and the only `'/metadata'` left in the assets is the tail
-  of a concatenation (`'/api/users/' + id + '/metadata'`), which the
-  concatenation rule already reads correctly. No vendored asset calls the tools
-  router, and the test says so instead of holding an empty set to
+  The filter that decided which literals are route calls is inverted: it was a
+  hand-kept list of the first segment of every mounted route, and a literal
+  outside it was dropped before anything looked at it — which grew a fossil
+  (`/metadata`, from the port's own pre-0.2.0 `auth.js`, long after anything
+  called it) and, worse, would have dropped a re-vendored `auth.js` calling a
+  route this port has never mounted as "not a route" rather than failed it.
+  Now every literal is a call and has to resolve unless it is on a four-entry
+  list of the non-route literals the assets carry, each with its reason, and an
+  entry no asset carries any more fails as a fossil. The concatenation rule
+  stays, and it is what reads `'/api/users/' + id + '/metadata'` correctly; a
+  literal joined to the asset's own base variable (`cfg.base + '/login'`,
+  `BASE + '/api/upload/'`) is a path start and is held like any other, where
+  it used to be skipped as a tail. No vendored asset calls the tools router,
+  and the test says so instead of holding an empty set to
   `GenerateToolsOpenAPISpec`: a `/tools` literal arriving with a re-vendor
   fails until that document is wired in.
 - **The three examples mount the admin console** (`HTTPConfig.Admin.Enabled`
