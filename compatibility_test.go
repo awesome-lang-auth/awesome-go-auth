@@ -62,6 +62,7 @@ var wantDeviationIDs = []string{
 	"admin-unauthenticated-get-serves-only-the-login-form",
 	"admin-upload-base-url-is-derived-from-the-mount",
 	"admin-upload-refusals-answer-the-admin-envelope",
+	"admin-user-detail-spans-tenants-only-through-a-lookup-store",
 	"advertised-2fa-methods-require-store-support",
 	"config-require2fa-is-a-system-policy-term",
 	"cookie-max-age-follows-configured-ttl",
@@ -298,6 +299,18 @@ var wantClaims = map[string][]string{
 		"CreatedAt", "ID ascending", "first-insertion", "APIKeyAdminStore",
 		"WebhookAdminStore", "listAll", "IApiKeyStore", "IWebhookStore",
 		"offset", "revoke", "admin-listings-are-ordered-by-id",
+	},
+	// The seam and the fallback beside it, the literal "" the fallback asks for
+	// and the 404 it costs, the reference's tenant-less findById, and the reason
+	// the empty tenant cannot simply widen — the token's tid — because an entry
+	// that lost that last one reads as a missing convenience rather than a
+	// refusal to widen the auth path's own read. The ambiguity rule is pinned so
+	// the entry cannot be reduced to "it now finds users", and the two writes are
+	// pinned so the gap they still have stays on the record.
+	"admin-user-detail-spans-tenants-only-through-a-lookup-store": {
+		"UserLookupStore", "FindUserByID", "MemoryUserStore", "GetUserByID(id, \"\")",
+		"404", "User not found", "findById", "tid", "501", "two tenants",
+		"<tenantID>#<id>", "DELETE <admin>/api/users/{id}", "method=flag",
 	},
 	// M9's guard, and the one entry of this milestone that declines a reference
 	// default outright. The claims keep the refusal, the three things a mount

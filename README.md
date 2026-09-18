@@ -1329,6 +1329,54 @@ revision the whole contract was extracted from.
   break on receiving one. The cost falls on a store implementor, which is why
   both orders are stated on the interfaces and not only here.
 
+### `GET <admin>/api/users/{id}` reaches a user in another tenant only through `UserLookupStore`
+
+`admin-user-detail-spans-tenants-only-through-a-lookup-store`
+
+- **Surface**: `HTTPConfig.Admin`: `GET <admin>/api/users/{id}`.
+- **This port**: Resolves the id through `auth.UserLookupStore.FindUserByID`
+  when the configured user store implements it — by id alone, across every
+  tenant, which is how `GET <admin>/api/users` lists — and answers the
+  reference's body. `MemoryUserStore` implements it. A store that does not is
+  asked `UserStore.GetUserByID(id, "")`, which reads the empty tenant as a
+  literal, so a user stored under a non-empty tenant is
+  `404 {"error": "User not found"}` although the listing shows it. A store that
+  holds one id under two tenants answers an error for that id rather than either
+  record, and the route answers that `404` too.
+- **The reference**: `findById(id)` is a mandatory `IUserStore` method and
+  carries no tenant (`user-store.interface.ts:5`). The route calls it with the
+  path parameter and answers `404` only for `null` (`admin.router.ts:789-800`).
+  An id is the whole of a user's key there, so the listing and the detail route
+  cannot disagree about which users exist (`user-store.interface.ts:5`,
+  `admin.router.ts:789-800`).
+- **Why**: This port's mandatory by-id read is tenant-scoped, and its empty
+  tenant has to stay a literal: `/me`, `/refresh` and the access-token check
+  hand the token's `tid` to `GetUserByID`, and an empty `tid` that widened to
+  every tenant would resolve an account in any of them. So the tenant-spanning
+  read is a separate, optional seam that only the admin console reaches for.
+  Adding it to `UserStore` would break every store written against 0.11.0 for a
+  route most deployments never mount, and refusing without it would put a `501`
+  on a route whose reference answers none. The fallback is what the route did in
+  0.11.0, and a single-tenant deployment — every user under the empty tenant,
+  which is what the reference's console assumes — sees the reference's answer
+  either way. The ambiguity refusal can only fire on a store that let a host
+  supply an id another tenant already holds; there, showing an operator one of
+  two accounts, picked by the store, is the one answer worse than none.
+- **Matching the reference exactly**: Implement `auth.UserLookupStore` on the
+  user store. A key-value store cannot serve it from the directory index behind
+  `AdminUserStore.ListUsers`: that index sorts on `<tenantID>#<id>`, and a key
+  condition cannot match a suffix. It needs an item keyed on the id alone; the
+  interface's doc comment sets out the two ways to have one.
+- **What this does not cover**: `DELETE <admin>/api/users/{id}` and
+  `POST <admin>/users/{id}/promote` with `method=flag` still pass the empty
+  tenant whatever the store implements, so in a multi-tenant deployment neither
+  reaches a user the listing shows under another tenant. Both are writes, and
+  resolving a write's row through this seam changes which row it reaches;
+  neither has been moved onto it yet. `GET <admin>/api/users/{id}/roles` also
+  passes the empty tenant and is not a case of this at all: its tenant is the
+  scope of a role assignment, and the console's own writers assign in the empty
+  scope.
+
 ### A tools router with no stated access posture is not served at all
 
 `tools-router-requires-an-explicit-guard-decision`

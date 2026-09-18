@@ -87,6 +87,10 @@ type adminSeed struct {
 	require2FA  bool
 	totp        bool
 	createdAt   time.Time
+	// tenantID stores the user under a tenant. Empty for every seed that logs
+	// in, because POST <admin>/login resolves the empty tenant alone; a tenanted
+	// seed exists to be listed and looked up, never to authenticate.
+	tenantID string
 }
 
 // newAdminEnv mounts an adapter with an admin block and a pre-seeded store.
@@ -108,6 +112,7 @@ func newAdminEnv(t *testing.T, mount Mounter, opts adminEnvOptions) *adminEnv {
 		// orders by id and 'first-user' reads the first of that order.
 		created, err := memory.CreateUser(context.Background(), auth.User{
 			ID:              string(rune('a'+i)) + "-user",
+			TenantID:        seed.tenantID,
 			Email:           seed.email,
 			PasswordHash:    string(hash),
 			IsAdmin:         seed.isAdmin,
@@ -1068,6 +1073,57 @@ func testAdminUserDetail(t *testing.T, mount Mounter) {
 
 	rec := env.Do(env.adminRequest(http.MethodGet, auth.AdminUsersPath+"/nobody", ""))
 	AssertError(t, rec, http.StatusNotFound, "User not found", "")
+
+	// The listing spans every tenant, so the detail route must too: a user GET
+	// /api/users shows under another tenant is a user this finds. The reference
+	// cannot disagree with itself here — its findById has no tenant to get
+	// wrong — and this port did, through GetUserByID(id, "").
+	tenanted := []adminSeed{
+		{email: "home@wiretest.example"},
+		{email: "acme@wiretest.example", tenantID: "acme"},
+	}
+
+	t.Run("every listed user resolves, whatever its tenant", func(t *testing.T) {
+		env := newAdminEnv(t, mount, adminEnvOptions{admin: adminOpenOptions(), seeds: tenanted})
+		rows := adminEntries(t, adminGet(t, env, auth.AdminUsersPath, http.StatusOK), "users")
+		if len(rows) != 2 {
+			t.Fatalf("users = %v, want both tenants' users", rows)
+		}
+		for i := range rows {
+			id, _ := adminObject(t, rows, i)["id"].(string)
+			body := adminGet(t, env, auth.AdminUsersPath+"/"+id, http.StatusOK)
+			if body["id"] != id {
+				t.Errorf("GET /api/users/%s = %v, want the listed user", id, body)
+			}
+		}
+	})
+
+	t.Run("without a lookup store the empty tenant is a literal", func(t *testing.T) {
+		// A store that lists and cannot look up. The route falls back to
+		// GetUserByID(id, ""), which is the admin-user-detail-spans-tenants-
+		// only-through-a-lookup-store deviation: the untenanted user resolves
+		// and the listed tenanted one is a 404.
+		env := newAdminEnv(t, mount, adminEnvOptions{
+			admin: adminOpenOptions(), seeds: tenanted,
+			wrapUsers: func(m *auth.MemoryUserStore) auth.UserStore {
+				return testAdminListOnlyStore{testAdminUserStore{inner: m}}
+			},
+		})
+		if rows := adminEntries(t, adminGet(t, env, auth.AdminUsersPath, http.StatusOK), "users"); len(rows) != 2 {
+			t.Fatalf("users = %v, want both tenants' users listed", rows)
+		}
+		adminGet(t, env, auth.AdminUsersPath+"/a-user", http.StatusOK)
+		rec := env.Do(env.adminRequest(http.MethodGet, auth.AdminUsersPath+"/b-user", ""))
+		AssertError(t, rec, http.StatusNotFound, "User not found", "")
+	})
+}
+
+// testAdminListOnlyStore holds the lister and not UserLookupStore, which is the
+// one deployment in which GET /api/users/:id falls back to the empty tenant.
+type testAdminListOnlyStore struct{ testAdminUserStore }
+
+func (s testAdminListOnlyStore) ListUsers(ctx context.Context, tenantID string, limit, offset int) ([]auth.User, error) {
+	return s.inner.ListUsers(ctx, tenantID, limit, offset)
 }
 
 // testAdminUserPanel is the four sub-resources of the user detail panel, each of

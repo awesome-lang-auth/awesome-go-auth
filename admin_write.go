@@ -306,11 +306,13 @@ func (a *Auth) serveAdminWrite(w http.ResponseWriter, r *http.Request, cfg HTTPC
 // satisfy it; that pairing is Service.DeleteAccount's already and is not
 // re-litigated on an admin route.
 //
-// The tenant is "", which is adminGetUser's and for the same reason: the
-// reference's deleteUser(id) carries none. UserStore reads "" as an ordinary
-// tenant value rather than as a wildcard, so in a deployment that stores users
-// under a non-empty tenant this route deletes nothing the listing above it
-// shows — the same gap the detail route has, and the same store-level item.
+// The tenant is "", because the reference's deleteUser(id) carries none, and
+// UserStore reads "" as an ordinary tenant value rather than as a wildcard. So
+// in a deployment that stores users under a non-empty tenant this route deletes
+// nothing the listing above it shows. That is the gap GET /api/users/:id had,
+// and UserLookupStore is the seam that closed it there (adminFindUser). A write
+// that resolves its tenant through it first changes which row the write
+// reaches, which is this file's invariant, and this route does not do that yet.
 func (a *Auth) adminDeleteUser(w http.ResponseWriter, r *http.Request, id string) {
 	store, ok := a.service.users.(UserAccountStore)
 	if !ok {

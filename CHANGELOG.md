@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`UserLookupStore` — find a user by id alone, whatever tenant it is in**
+  (`store.go`). `FindUserByID(ctx, id)` is the reference's `findById(id)`
+  (`user-store.interface.ts:5`): no tenant parameter, not even one where `""`
+  means "all". It is optional, and a store without it still works everywhere.
+  It exists because `GetUserByID` reads `""` as a literal tenant, and has to:
+  `/me` and `/refresh` pass it the access token's `tid`, and an empty `tid`
+  that matched every tenant would find accounts in any of them. The implementor's
+  contract is on the interface. The one rule a store can get wrong is that it
+  must never pick between two records sharing an id. It answers an error
+  instead. `MemoryUserStore` implements it, and its `CreateUser` already
+  refuses an id that another tenant holds.
+
+  A key-value store cannot serve it from the `<tenantID>#<id>` directory index
+  that `AdminUserStore.ListUsers` uses, because the id is the sort key's suffix.
+  It needs an item keyed on the id alone. The interface doc sets out the two
+  ways to have one.
+
+### Fixed
+- **`GET <admin>/api/users/{id}` now finds users that `GET <admin>/api/users`
+  lists under another tenant.** The listing reads `""` as every tenant; the
+  detail route asked `GetUserByID(id, "")`, where `""` is a literal. So a
+  deployment that stored users under a tenant got a console whose table linked
+  to 404s. The route now uses `UserLookupStore` when the store has it. Without
+  it, the route does what it did in 0.11.0. That fallback is recorded as the
+  `admin-user-detail-spans-tenants-only-through-a-lookup-store` deviation,
+  along with what it still leaves open: `DELETE <admin>/api/users/{id}` and
+  `POST <admin>/users/{id}/promote` with `method=flag` still ask for the empty
+  tenant. `GET <admin>/api/users/{id}/roles` is unchanged on purpose. Its
+  tenant is a role assignment's scope, and the console assigns roles in the
+  empty one.
+
 ## [0.11.0] - 2026-09-12
 
 The event plane, and the tools router on top of it. **This release carries the
