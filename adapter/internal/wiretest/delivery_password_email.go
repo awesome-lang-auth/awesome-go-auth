@@ -137,9 +137,9 @@ func runLinkResolutionCases(t *testing.T, mount Mounter, probe linkProbe) {
 		check(t, cfg, site, map[string]string{"Origin": app}, "", app+"/api/auth", "")
 	})
 
-	t.Run("UIEnabled points the base at the static UI", func(t *testing.T) {
+	t.Run("UI.Enabled points the base at the static UI", func(t *testing.T) {
 		cfg := auth.DefaultHTTPConfig()
-		cfg.UIEnabled = true
+		cfg.UI.Enabled = true
 		check(t, cfg, site, map[string]string{"Origin": app}, "", app+"/auth/ui", "")
 	})
 

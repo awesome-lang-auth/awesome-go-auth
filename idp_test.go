@@ -673,7 +673,7 @@ func TestNewIDPKeyIDDefaultAndOverride(t *testing.T) {
 }
 
 // TestIDPInjectedSignerSignsIDTokenOnly walks the code flow with a signer that
-// records its calls: the id_token verifies against the key GET /jwks publishes
+// records its calls: the id_token verifies against the key the JWKS route publishes
 // and was the signer's only work, because the access and refresh tokens /token
 // returns are still the HS256 session pair (reference-issues N35: enabling the
 // IdP changes nothing about what the session routes sign).
@@ -686,17 +686,17 @@ func TestIDPInjectedSignerSignsIDTokenOnly(t *testing.T) {
 		t.Fatalf("POST /token = %d, want 200", status)
 	}
 
-	resp, err := f.client.Get(f.srv.URL + "/oidc/jwks")
+	resp, err := f.client.Get(f.srv.URL + "/oidc" + DefaultJWKSPath)
 	if err != nil {
-		t.Fatalf("GET /jwks: %v", err)
+		t.Fatalf("GET %s: %v", DefaultJWKSPath, err)
 	}
 	defer resp.Body.Close()
 	var doc JWKS
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		t.Fatalf("decode /jwks: %v", err)
+		t.Fatalf("decode %s: %v", DefaultJWKSPath, err)
 	}
 	if len(doc.Keys) != 1 || doc.Keys[0].Kid != "kms-1" {
-		t.Fatalf("/jwks = %+v, want the signer's key under kms-1", doc)
+		t.Fatalf("%s = %+v, want the signer's key under kms-1", DefaultJWKSPath, doc)
 	}
 	pub := jwkPublicKey(t, doc.Keys[0])
 	if !pub.Equal(&rec.key.PublicKey) {
@@ -734,7 +734,7 @@ func TestIDPInjectedSignerSignsIDTokenOnly(t *testing.T) {
 // TestIDPJWKSDocumentShape pins the wire form of the JWKS document to the
 // reference's (jwks.service.ts:168-179, :184-186): the six members in that
 // order, the signer's key first under its kid, then IDPConfig.PublicKeys
-// verbatim, and GET /jwks serving exactly that.
+// verbatim, and the JWKS route serving exactly that.
 func TestIDPJWKSDocumentShape(t *testing.T) {
 	key := idpTestRSAKey(t)
 	old := JWK{Kty: "RSA", Use: "sig", Alg: "RS256", Kid: "provisioner-key-0", N: "AK1uZw", E: "AQAB"}
@@ -751,20 +751,20 @@ func TestIDPJWKSDocumentShape(t *testing.T) {
 		t.Fatalf("JWKS() = %s\nwant      %s", got, want)
 	}
 
-	resp, err := f.client.Get(f.srv.URL + "/oidc/jwks")
+	resp, err := f.client.Get(f.srv.URL + "/oidc" + DefaultJWKSPath)
 	if err != nil {
-		t.Fatalf("GET /jwks: %v", err)
+		t.Fatalf("GET %s: %v", DefaultJWKSPath, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("read /jwks: %v", err)
+		t.Fatalf("read %s: %v", DefaultJWKSPath, err)
 	}
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" {
-		t.Fatalf("GET /jwks = %d %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+		t.Fatalf("GET %s = %d %q", DefaultJWKSPath, resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
 	if strings.TrimSpace(string(raw)) != want {
-		t.Fatalf("GET /jwks body = %s\nwant           %s", raw, want)
+		t.Fatalf("GET %s body = %s\nwant %s", DefaultJWKSPath, raw, want)
 	}
 
 	// Without extras the document is the reference's: exactly one key.

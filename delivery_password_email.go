@@ -438,10 +438,11 @@ func (m *EmailVerificationMailer) Send(ctx context.Context, delivery EmailVerifi
 // change-email confirmation link, which is exactly what the reference does:
 // /change-email/request has no template of its own and calls
 // sendVerificationEmail with its own link (auth.router.ts:1027-1032,
-// mailer.service.ts:200-203). The 0.3.x email_change template is an alias of
-// the same id now (see templateAliases); a deployment that wants different
-// wording for this mail registers it under TemplateVerifyEmail on a separate
-// templater, or stores an override.
+// mailer.service.ts:200-203). There is no email_change id any more — the
+// 0.3.x one was an alias of TemplateVerifyEmail through the 0.x line and went
+// with v1.0.0 — so a deployment that wants different wording for this mail
+// registers it under TemplateVerifyEmail on a separate templater, or stores
+// an override under that id.
 type EmailChangeMailer struct{ TokenMailer }
 
 // NewEmailChangeMailer builds an EmailChangeMailer with the built-in templates.

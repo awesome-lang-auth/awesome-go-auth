@@ -78,8 +78,8 @@ func (t *HTTPSMSTransport) Send(ctx context.Context, phone, message string) erro
 		return fmt.Errorf("auth: sms http send: %w", err)
 	}
 	resp.Body.Close()
-	// 2xx only, as the reference has it. HTTPMailerTransport accepts anything
-	// below 400; the difference is the reference's, not a decision here.
+	// 2xx only, as the reference has it (sms.service.ts:36-39), the same bound
+	// NewGatewayMailerTransport applies (mailer.service.ts:280-284).
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("auth: sms http status %d", resp.StatusCode)
 	}

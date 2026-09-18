@@ -1057,7 +1057,7 @@ that becomes the reference's answer (`auth.router.ts:1346-1355`):
 2. The browser gets a `302` to
    `HTTPConfig.AccountConflictLink(siteURL, provider, email)` —
    `<siteURL><prefix>/account-conflict?provider=<p>&code=OAUTH_ACCOUNT_CONFLICT[&email=<e>]`,
-   or `<siteURL><prefix>/ui/account-conflict?…` under `HTTPConfig.UIEnabled`.
+   or `<siteURL><prefix>/ui/account-conflict?…` under `HTTPConfig.UI.Enabled`.
    `siteURL` is the origin the signed state resolved to, the same value a
    successful login is redirected to. No session is issued and no link is
    written.
@@ -1430,13 +1430,6 @@ type MailerConfig struct {
 }
 ```
 
-### `NewHTTPMailerTransport(endpointURL, secret string) *HTTPMailerTransport` — deprecated
-
-POSTs a JSON-encoded `MailMessage` (PascalCase) to any HTTP endpoint with an
-`X-Mailer-Secret` header — a request of this port's own that no gateway built for
-the reference accepts. Kept unchanged for gateways built against it since 0.3.0 and
-scheduled for removal in v1.0.0; use `NewGatewayMailerTransport`.
-
 ### `NewMailTemplater(appName string) *MailTemplater`
 
 Returns a templater holding the reference's six built-in templates, in **English**
@@ -1454,11 +1447,17 @@ the built-ins mention none.
 | `TemplateEmailChanged` | `email-changed` | `newEmail` | `:206` |
 | `TemplateInvitation` | `invitation` | `link` — no ready-made mailer, and no route in the reference calls its `sendInvitation` either | `:211` |
 
-The 0.3.x ids `reset_password`, `magic_link`, `verify_email` and `email_change` are
-**deprecated aliases**: the first three of the matching constant, `email_change` of
-`TemplateVerifyEmail`, because the reference mails its verification template on
-`/change-email/request` (`auth.router.ts:1027-1032`) and has no separate one. They
-work everywhere an id is accepted and go away in v1.0.0.
+An id is used as given, everywhere one is accepted. The 0.3.x ids
+`reset_password`, `magic_link`, `verify_email` and `email_change` were aliases of
+the constants through the 0.x line — the first three of the matching one,
+`email_change` of `TemplateVerifyEmail`, because the reference mails its
+verification template on `/change-email/request` (`auth.router.ts:1027-1032`) and
+has no separate one — and are not resolved since v1.0.0. That decides what a
+stored row means: a `TemplateStore` is asked for exactly the id the mailer passes,
+so a row stored under `reset_password` is not the row `PasswordResetMailer` reads.
+Rename such a row to the constant (`reset_password` → `password-reset`,
+`magic_link` → `magic-link`, `verify_email` → `verify-email`, `email_change` →
+`verify-email`); there is no fallback lookup.
 
 ### `(*MailTemplater).Register(locale, id, subject, html, text string)`
 
@@ -1467,8 +1466,7 @@ templates over the keys of `MailTemplateData` — `{{.link}}`, `{{.appName}}` �
 `html/template` for the HTML body (contextual escaping applies), `text/template` for
 the subject and the text. This is how a deployment replaces a built-in, adds a
 locale, or adds an id of its own without a store; a part that does not parse is
-reported by the next render of that `(locale, id)`. An alias id registers under the
-id it aliases.
+reported by the next render of that `(locale, id)`.
 
 ### `(*MailTemplater).RenderMail(ctx, locale, id string, data MailTemplateData) (MailRendered, error)`
 
@@ -1758,8 +1756,10 @@ already holds an `email.mailer` block for the reference can decode it and hand i
 over. `DefaultLang` is carried but not read by the transport: which template set a
 mail is rendered from is the mailers' `Locale`.
 
-The older `HTTPMailerTransport` (0.3.0) sends a different body under
-`X-Mailer-Secret` and is deprecated; it keeps working for gateways built against it.
+This is the one HTTP mail transport. The 0.3.0 `HTTPMailerTransport`, which sent
+`MailMessage` as PascalCase JSON under `X-Mailer-Secret` — a body of this port's own
+that no gateway built for the reference accepts — was deprecated in 0.4.0 and
+removed in v1.0.0; a gateway built against it takes the body above instead.
 
 ### Delivery webhook
 
@@ -1861,7 +1861,7 @@ Lang     string // the request's emailLang body field, untouched; "" when omitte
 |------|--------|-----------|
 | The site URL for the request: the `Origin` header if allowlisted, else the `Referer`'s origin if allowlisted, else the default | `(*Auth).ResolveSiteURL(r *http.Request) string` | `resolveSiteUrl`, `auth.router.ts:233-246` |
 | The allowlist: `Config.SiteURLs` then `OAuthWiring.AllowedOrigins`, deduplicated in order; the default: `SiteURLs[0]`, or `OAuthWiring.SiteURL` when that is set | `Config.SiteURLs`, `WithSiteURLs(urls ...string)` | `buildAllowedOrigins` `:213-219`, `getDefaultSiteUrl` `:202-206` |
-| The base under that site URL: `<siteURL><prefix>`, or `<siteURL><prefix>/ui` with `HTTPConfig.UIEnabled` | `(HTTPConfig).LinkBase(siteURL) string`; the general form is `(HTTPConfig).UILink(siteURL, path) string` | `buildUiLink` `:261-271`, `magic-link.strategy.ts:25-27` |
+| The base under that site URL: `<siteURL><prefix>`, or `<siteURL><prefix>/ui` with `HTTPConfig.UI.Enabled` | `(HTTPConfig).LinkBase(siteURL) string`; the general form is `(HTTPConfig).UILink(siteURL, path) string` | `buildUiLink` `:261-271`, `magic-link.strategy.ts:25-27` |
 
 ```go
 a, err := auth.New(
@@ -1869,7 +1869,7 @@ a, err := auth.New(
     auth.WithPasswordResetSender(auth.NewPasswordResetMailer(transport, "Example App", "https://www.example.com/auth").Send),
 )
 cfg := auth.DefaultHTTPConfig()
-cfg.UIEnabled = true // links point at <site>/auth/ui/… instead of <site>/auth/…
+cfg.UI.Enabled = true // links point at <site>/auth/ui/… instead of <site>/auth/…
 nethttp.MountWithConfig(mux, a, cfg)
 ```
 
@@ -2267,12 +2267,12 @@ answer 404.
 #### `RegisterHandlers` — mounting them yourself
 
 `(*IDP).RegisterHandlers(mux, basePath)` mounts the same four handlers, plus
-the JWKS document at `basePath + JWKSPath()` and the deprecated `basePath/jwks`
-alias of it, on a mux you own. Since the adapters mount the four themselves it
-is no longer needed by a host that mounts an adapter; it stays for the host
-that wants the OIDC endpoints somewhere else — under a different base path,
-behind its own middleware — and for the one that uses the `IDP` without
-mounting an adapter at all. `examples/gin-mongodb` is that shape.
+the JWKS document at `basePath + JWKSPath()`, on a mux you own. Since the
+adapters mount the four themselves it is no longer needed by a host that mounts
+an adapter; it stays for the host that wants the OIDC endpoints somewhere else
+— under a different base path, behind its own middleware — and for the one
+that uses the `IDP` without mounting an adapter at all. `examples/gin-mongodb`
+is that shape.
 
 **Do one or the other, not both.** Mounting an adapter *and* calling
 `RegisterHandlers` with the adapter's prefix puts the same endpoints at the
@@ -2309,12 +2309,15 @@ mounted path. Note that `JWKSURL` patches `jwks_uri` only: `authorization_endpoi
 `token_endpoint` and `userinfo_endpoint` have no equivalent override and stay
 derived from `Issuer`.
 
-Relying parties that read discovery follow the move on their own; one configured
-by hand against `<base>/jwks` keeps working through the 0.x line and stops at
-v1.0.0 (upstream plan D-13). Both JWKS patterns are registered `GET`-only, as
-the reference registers the route and as the adapters mount it, so the alias's
-methods narrow with this change: net/http answers `HEAD` from the `GET` pattern
-and 405 to everything else.
+Relying parties that read discovery follow the move on their own. `<base>/jwks`,
+the path this package published before 0.6.0, was served beside the canonical
+path as a deprecated alias through the 0.x line and is gone since v1.0.0
+(upstream plan D-13): a relying party configured by hand against it gets the
+mux's 404 and has to be pointed at `<base>/.well-known/jwks.json` — or the
+deployment sets `IDPConfig.JWKSPath` to `/jwks`, which makes that the one
+canonical path. The JWKS pattern is registered `GET`-only, as the reference
+registers the route and as the adapters mount it: net/http answers `HEAD` from
+the `GET` pattern and 405 to everything else.
 
 ID tokens and IdP token pairs are RS256-signed JWTs built entirely from the
 standard library through `BuildRS256JWT`, under `IDPConfig.Signer` and `KeyID`.
@@ -2948,31 +2951,25 @@ The document as a value, for a host serving its own UI route. `r` supplies the
 return: a failing store produces the reduced document above, exactly as it does
 on the route.
 
-### `HTTPConfig.UI` and `HTTPConfig.UIEnabled`
+### `HTTPConfig.UI`
 
-`UIEnabled` is the deprecated spelling of `UI.Enabled`, from when the flag
-decided nothing but the shape of an emailed link. It is an alias, not a second
-switch: either field enables the UI, `ResolveHTTPConfig` sets both from either,
-and a configuration that only ever set `UIEnabled` keeps the links it had and now
-serves the config route as well. It is kept through the 0.x line.
-
-> **Upgrading.** That last clause is a behaviour change, not only a rename: a
-> deployment that already sets `UIEnabled` begins serving the public,
-> unauthenticated `GET <prefix>/ui/config` after upgrading, with no code change
-> on its side, and the document names its wired OAuth providers, whether 2FA and
-> each delivery path are available, and its branding. Because the two fields are
-> OR-ed, setting `UI.Enabled = false` alongside it does not suppress the route —
-> the only way back to the previous behaviour is to stop setting `UIEnabled` and
-> point the emailed links elsewhere.
+`UI.Enabled` is the one switch: it mounts `<prefix>/ui` and it decides the shape
+of an emailed link (`UILink`). `HTTPConfig.UIEnabled`, the spelling from before
+`UIOptions` existed, was an alias of it through the 0.x line and was removed in
+v1.0.0; a configuration that set it sets `UI.Enabled` instead, and every link
+and route it had is unchanged.
 
 ### Embedded assets
 
-All files are embedded via `//go:embed` from the `ui/` directory.
+The `ui/` directory holds `ui/upstream/` — the vendored assets and their
+provenance README — and nothing else; the port's own hand-written `auth.html`,
+`admin.html` and `auth.js`, which nothing served since 0.9.0, went in v1.0.0
+together with `ServeAuthUI()`, `ServeAdminUI()` and `ServeAuthJS()`.
 
-`ui/upstream/assets/` is different from the rest of that tree: it holds the
-reference's own fourteen browser assets, copied byte for byte from
-awesome-node-auth's `src/ui/assets` at `cc01e997` (v1.9.0), and **nothing in it
-may be edited in this repository**. Each file's upstream path, size and sha256
+`ui/upstream/assets/` holds the reference's own fourteen browser assets, copied
+byte for byte from awesome-node-auth's `src/ui/assets` at `cc01e997` (v1.9.0),
+embedded via `//go:embed`, and **nothing in it may be edited in this
+repository**. Each file's upstream path, size and sha256
 are recorded in `upstreamUIAssetTable` (`ui_upstream.go`) and re-hashed by
 `TestVendoredUIAssetsHaveNotDrifted` on every `go test ./...`, which also fails
 if a file is added to or removed from the set. See `ui/upstream/README.md` for
@@ -2993,54 +2990,25 @@ One vendored asset by base name, returned as a copy.
 The provenance table — name, upstream path, commit, size and sha256 per file —
 freshly built on every call.
 
-### `ServeAdminUI() http.Handler`
+### The served `auth.js`
 
-**Deprecated — removed in v1.0.0.** No replacement until the admin router lands
-in M8: the reference's admin SPA is vendored and served under `<prefix>/ui`, but
-it calls an admin API no adapter mounts yet.
+`UIHandler` serves the **vendored** `auth.js` (`ui/upstream/assets/auth.js`,
+31,277 bytes) at `<prefix>/ui/auth.js`, which is where the vendored pages load
+it from; a host that wants the bytes elsewhere reads `UpstreamUIAssetFS()` or
+`ReadUpstreamUIAsset("auth.js")`. It is the reference's own browser SDK, and a
+page written against the reference's documentation works here unchanged. A page
+written against the SDK this port served before 0.9.0 does not, on two counts:
 
-Serves `ui/admin.html` — this port's own single-page admin dashboard, with
-sections for Users, Sessions, Tenants, Roles, API Keys, Telemetry, and OpenAPI
-reference. Nothing inside the module serves it.
-
-### `ServeAuthUI() http.Handler`
-
-**Deprecated — removed in v1.0.0.** Set `HTTPConfig.UI.Enabled` instead and the
-adapter mounts `<prefix>/ui`, which serves the reference's own login page with
-the branding, the site name, the logo and the config already in the document.
-
-Serves `ui/auth.html` — this port's hand-written auth UI, with Login, Register,
-Magic Link, Forgot Password and TOTP forms — raw, with no injection of any kind.
-The page fetches `<prefix>/ui/config` for itself, so it works, but it flashes
-unstyled and it is not the page the family's deployments show.
-
-### `ServeAuthJS() http.Handler`
-
-**Deprecated — removed in v1.0.0.** Use `UpstreamUIAssetFS()` or
-`ReadUpstreamUIAsset("auth.js")` instead.
-
-Serves the **vendored** `auth.js` (`ui/upstream/assets/auth.js`, 31,277 bytes) —
-the reference's own browser SDK, not this port's hand-written `ui/auth.js`,
-which is still embedded for the contract tests but is no longer served or
-maintained.
-
-Two differences follow from the swap, and a page that drives the SDK has to know
-both:
-
-- **The global changed.** The hand-written client exposed `window.AuthSDK`. The
-  reference's client exposes `window.AuthService` and `window.AwesomeNodeAuth`
+- **The global.** The old client exposed `window.AuthSDK`. The reference's
+  client exposes `window.AuthService` and `window.AwesomeNodeAuth`
   (`auth.js:219`, `auth.js:352`) and no `AuthSDK` at all, and its surface is
   different too — it is a page runtime with `init`, `guardPage`, `guardRole` and
   `checkSession`, not a thin method-per-route wrapper.
-- **Bearer delivery is no longer requested for you.** The hand-written client
-  sent `X-Auth-Strategy: bearer` and exposed the tokens it received; the
-  reference's client is cookie-only and never sends that header. The server
-  still honours `X-Auth-Strategy` from any caller, so a page that wants bearer
-  delivery must send it itself.
-
-This is the point of vendoring: what this port serves is now what the rest of
-the family serves, so a page written against the reference's documentation
-works here unchanged. A page written against this port's old SDK does not.
+- **Bearer delivery is not requested for you.** The old client sent
+  `X-Auth-Strategy: bearer` and exposed the tokens it received; the reference's
+  client is cookie-only and never sends that header. The server still honours
+  `X-Auth-Strategy` from any caller, so a page that wants bearer delivery must
+  send it itself.
 
 **`window.AuthService` methods** (the vendored client's surface; the reference's
 own documentation is authoritative, since these are its bytes):

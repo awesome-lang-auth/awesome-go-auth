@@ -626,14 +626,14 @@ func (idp *IDP) OIDCMounts() []OIDCMount {
 // one; that silent split is the failure this shape rules out.
 //
 // The JWKS document is served at basePath + JWKSPath(), the canonical location
-// the adapters mount and the one the discovery document points at.
-// <basePath>/jwks is kept as a deprecated alias of it, serving the identical
-// bytes and headers, for the relying parties configured against the path this
-// package published before v0.6.0; the alias is kept through the 0.x line and
-// removed in v1.0.0. The deprecated thing is that URL path, not this method:
-// the other four endpoints, and the canonical JWKS path, are current.
+// the adapters mount and the one the discovery document points at, and
+// nowhere else. <basePath>/jwks — the path this package published before
+// v0.6.0 — was served beside it as a deprecated alias through the 0.x line and
+// went with v1.0.0; a relying party configured against it by hand has to be
+// pointed at the canonical path, or at the discovery document, which has
+// always advertised the canonical one.
 //
-// Both JWKS patterns are registered for GET alone, as the reference registers
+// The JWKS pattern is registered for GET alone, as the reference registers
 // the route (router.get, auth.router.ts:490) and as the four adapters mount it.
 // net/http serves HEAD from a "GET " pattern itself, which is Express's own
 // fallback from HEAD to the GET handler; any other method misses the route.
@@ -641,14 +641,7 @@ func (idp *IDP) RegisterHandlers(mux *http.ServeMux, basePath string) {
 	if !strings.HasSuffix(basePath, "/") {
 		basePath += "/"
 	}
-	jwks := idp.JWKSHandler()
-	canonical := basePath + strings.TrimPrefix(idp.JWKSPath(), "/")
-	mux.Handle("GET "+canonical, jwks)
-	// A JWKSPath of "/jwks" makes the alias the canonical path; registering it
-	// twice would panic in ServeMux.
-	if alias := basePath + "jwks"; alias != canonical {
-		mux.Handle("GET "+alias, jwks)
-	}
+	mux.Handle("GET "+basePath+strings.TrimPrefix(idp.JWKSPath(), "/"), idp.JWKSHandler())
 	for _, mount := range idp.OIDCMounts() {
 		mux.Handle(basePath+strings.TrimPrefix(mount.Path, "/"), mount.Handler)
 	}

@@ -30,63 +30,17 @@ type MailMessage struct {
 	// gateway transport sends the HTML in its place, as the reference's
 	// sendCustom does (`text ?? html`, mailer.service.ts:246).
 	//
-	// omitempty keeps the deprecated HTTPMailerTransport's body byte-identical
-	// for the callers that never set it.
+	// omitempty dates from the HTTPMailerTransport removed in v1.0.0, whose
+	// PascalCase body it kept byte-identical for the callers that never set
+	// Text. It stays because the tag is part of the type: a host that encodes a
+	// MailMessage itself, to a queue or a transport of its own, sees the same
+	// bytes it saw before.
 	Text string `json:",omitempty"`
 }
 
 // MailerTransport delivers email messages.
 type MailerTransport interface {
 	Send(ctx context.Context, msg MailMessage) error
-}
-
-// HTTPMailerTransport sends mail via any HTTP endpoint (no SMTP needed).
-//
-// Deprecated: it POSTs MailMessage as PascalCase JSON ({"To", "Subject",
-// "Body", "IsHTML"}) under an X-Mailer-Secret header — a request of this port's
-// own that no gateway built for the reference accepts. NewGatewayMailerTransport
-// sends the reference's contract instead. This type keeps its 0.3.0 behaviour
-// unchanged for the gateways built against it and is scheduled for removal in
-// v1.0.0.
-type HTTPMailerTransport struct {
-	EndpointURL string
-	Secret      string
-	client      *http.Client
-}
-
-// NewHTTPMailerTransport creates a transport that POSTs to a webhook-style HTTP endpoint.
-//
-// Deprecated: use NewGatewayMailerTransport; see HTTPMailerTransport for why.
-func NewHTTPMailerTransport(endpointURL, secret string) *HTTPMailerTransport {
-	return &HTTPMailerTransport{
-		EndpointURL: endpointURL,
-		Secret:      secret,
-		client:      &http.Client{Timeout: 10 * time.Second},
-	}
-}
-
-func (t *HTTPMailerTransport) Send(ctx context.Context, msg MailMessage) error {
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.EndpointURL, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if t.Secret != "" {
-		req.Header.Set("X-Mailer-Secret", t.Secret)
-	}
-	resp, err := t.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("auth: mailer http send: %w", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("auth: mailer http status %d", resp.StatusCode)
-	}
-	return nil
 }
 
 // MailerConfig is the reference's email.mailer block (awesome-node-auth
@@ -116,7 +70,7 @@ type MailerConfig struct {
 	// It is carried so the block decodes as one unit and can be passed on.
 	DefaultLang string `json:"defaultLang,omitempty"`
 	// Client makes the request. Nil means a client with a 10-second timeout,
-	// the same bound HTTPMailerTransport and HTTPSMSTransport use.
+	// the same bound HTTPSMSTransport uses.
 	Client *http.Client `json:"-"`
 }
 
@@ -235,7 +189,16 @@ func (t *gatewayMailerTransport) Send(ctx context.Context, msg MailMessage) erro
 
 // The six template ids the reference renders, as its MailerService names them
 // (mailer.service.ts:186, 191, 196, 201, 206, 211). They are the ids a
-// TemplateStore is asked for and the ids Register, RenderMail and Render take.
+// TemplateStore is asked for and the ids Register, RenderMail and Render take —
+// as given. The ids this port used before it adopted the reference's
+// (reset_password, magic_link, verify_email, email_change) were aliases of the
+// first four through the 0.x line and are not resolved any more: an id is
+// looked up under its own spelling, in the store and among the registered
+// templates alike, so a stored row under an old id is not the row a mailer
+// asks for. There is no email_change template of its own in the reference
+// either: /change-email/request mails the verification template
+// (auth.router.ts:1027-1032, calling sendVerificationEmail), and so does
+// EmailChangeMailer.
 const (
 	TemplatePasswordReset = "password-reset"
 	TemplateMagicLink     = "magic-link"
@@ -244,33 +207,6 @@ const (
 	TemplateEmailChanged  = "email-changed"
 	TemplateInvitation    = "invitation"
 )
-
-// templateAliases maps the ids this port used before it adopted the reference's
-// to the reference id each one is. They keep working everywhere an id is
-// accepted and are resolved before a store is consulted, so a stored
-// "password-reset" also serves a caller still asking for "reset_password".
-//
-// Deprecated: reset_password, magic_link and verify_email are aliases of
-// TemplatePasswordReset, TemplateMagicLink and TemplateVerifyEmail. email_change
-// is an alias of TemplateVerifyEmail too: the reference mails its verification
-// template on /change-email/request (auth.router.ts:1027-1032, calling
-// sendVerificationEmail) and has no confirm-the-new-address template of its
-// own, so the port's stops existing as a separate one — its "valid for 24
-// hours" wording over a one-hour token is the reference's, reproduced. Use the
-// constants; the aliases go with v1.0.0.
-var templateAliases = map[string]string{
-	"reset_password": TemplatePasswordReset,
-	"magic_link":     TemplateMagicLink,
-	"verify_email":   TemplateVerifyEmail,
-	"email_change":   TemplateVerifyEmail,
-}
-
-func canonicalTemplateID(id string) string {
-	if canonical, ok := templateAliases[id]; ok {
-		return canonical
-	}
-	return id
-}
 
 // MailTemplateData holds the variables a template is rendered with.
 //
@@ -404,13 +340,11 @@ func NewMailTemplater(appName string) *MailTemplater {
 // {{.appName}} … — html/template for html, text/template for subject and text.
 // It is what NewMailTemplater fills the built-ins in with, and the way a host
 // replaces one, or adds a locale or an id of its own, without a TemplateStore.
-// An alias id registers under the id it is an alias of.
 //
 // A part that does not parse is kept and reported by RenderMail for that
 // (locale, id) rather than dropped: a typo must surface, and Register has no
 // error return to surface it through.
 func (t *MailTemplater) Register(locale, id, subject, html, text string) {
-	id = canonicalTemplateID(id)
 	entry := &mailTemplate{}
 	var err error
 	if entry.subject, err = texttemplate.New(id + "/subject").Option("missingkey=zero").Parse(subject); err != nil {
@@ -476,9 +410,8 @@ func (t *MailTemplater) storeFor(ctx context.Context) TemplateStore {
 //     with html/template's contextual escaping in the HTML body.
 //
 // locale is used as given; the ready-made mailers pass what resolveLang
-// picked. The four pre-reference ids are accepted as aliases (see
-// templateAliases). An id with neither a usable stored template nor a
-// registered one is an error.
+// picked, and id is used as given too (see the template constants). An id
+// with neither a usable stored template nor a registered one is an error.
 func (t *MailTemplater) RenderMail(ctx context.Context, locale, id string, data MailTemplateData) (MailRendered, error) {
 	if t == nil {
 		return MailRendered{}, errors.New("auth: nil mail templater")
@@ -486,7 +419,6 @@ func (t *MailTemplater) RenderMail(ctx context.Context, locale, id string, data 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	id = canonicalTemplateID(id)
 	data.AppName = t.appName
 	values := data.values(id)
 	registered := t.lookup(locale, id)

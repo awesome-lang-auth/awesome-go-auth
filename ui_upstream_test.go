@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io/fs"
-	"net/http"
-	"net/http/httptest"
 	"path"
 	"regexp"
 	"sort"
@@ -235,79 +233,273 @@ func TestUpstreamUIAssetsAccessorsAreHonest(t *testing.T) {
 	}
 }
 
+// The route-coverage check.
+//
+// The port's own browser assets were the third thing in this repository that
+// nobody executed and that therefore rotted: they called /auth/totp/setup,
+// /auth/email/verify and /auth/metadata, none of which any adapter had ever
+// mounted. ui_test.go pinned them to the routes that exist — asset path
+// literals ⊆ documented paths ⊆ mounted routes, the second link enforced by
+// the wire conformance suite — and when those assets went in v1.0.0 the check
+// stayed, here, over the vendored files, where it is the thing that makes
+// vendoring safe rather than merely tidy: the reference's assets were written
+// against the reference's server, and serving them is only sound if the routes
+// they call are routes this port serves. Nothing but a test can establish that.
+//
+// Three routers, because the vendored set calls three surfaces and each asset
+// builds its URLs from a different base:
+//
+//   - The pages and auth.js call the auth router under the API prefix, so their
+//     literals are held to GenerateOpenAPISpec with DefaultAPIPrefix stripped.
+//   - admin.js calls the admin console. Every request is BASE + path, where BASE
+//     is the admin mount injected at render time (admin.js:6-7, reading
+//     window.__ADMIN_CONFIG__.base; api() at :144), so its literals are spelled
+//     /api/… and /login, /logout — never /admin/… — and are held to
+//     GenerateAdminOpenAPISpec with DefaultAdminPath stripped, or to
+//     adminUndocumentedPaths: the fourteen paths the reference's generator
+//     leaves out (openapi_admin_test.go), which the console serves all the same.
+//     That list is a stop-point, not a licence: a literal resolving to it is a
+//     call to a mounted route the document happens not to describe.
+//   - The tools router: no vendored asset calls it, and the test says so rather
+//     than holding an empty set to GenerateToolsOpenAPISpec. A re-vendor that
+//     brings in a /tools literal fails here until that document is wired in.
+//
+// Which surface a literal belongs to is decided by the file it is in, because
+// that is what decides its base. Within a file, every path literal is held to
+// the surface unless it is on that surface's list of non-route literals, each
+// entry with its reason — the home URL, a pathname string operation, the login
+// page UIHandler serves, an example prefix in a doc comment. That list is an
+// allow-list, and the direction matters. The check this started with worked
+// the other way round: a hand-kept list of the first segment of every mounted
+// route, and a literal outside it was dropped before anything looked at it.
+// Kept by hand, the list grew a fossil ("/metadata", for the port's own
+// pre-0.2.0 auth.js, long after that file stopped calling it); derived from
+// the documents, as it briefly was, it did something worse, because a route
+// this port has never mounted has no segment in any document, so a re-vendored
+// auth.js calling /totp/setup or /email/verify — the exact rot described at the
+// top — was dropped as "not a route" rather than failed as a call the port does
+// not serve. Inverted, an unlisted literal is a call and has to resolve; a
+// listed literal that no asset carries any more is a fossil and fails too.
+//
+// Two rules about the text before the quote, which the port's own assets never
+// needed:
+//
+//   - A quoted literal preceded by `+` continues an expression rather than
+//     starting one. `'/api/users/' + id + '/metadata'` in admin.js puts the
+//     bare literal "/metadata" in the source; read as a path start that is a
+//     call to <admin>/metadata, which nothing serves, and read correctly it is
+//     the tail of /admin/api/users/:id/metadata (admin.router.ts:855). A tail
+//     is skipped; the head before it is what is held.
+//   - Unless the `+` joins the literal to the asset's own base — BASE and
+//     cfg.base in admin.js (:6-7), defaultPrefix in auth.js (:15-20) — in which
+//     case it is the start of a path under the mount and is held like any
+//     other: cfg.base + '/login' (admin.js:68), fetch(cfg.base + '/logout')
+//     (:110), fetch(BASE + '/api/upload/' + type) (:964), defaultPrefix +
+//     '/ui/login' (auth.js:21). The rule knows the base by name, so it counts
+//     its matches and fails on zero: a re-vendor that renamed the base would
+//     otherwise turn those four calls back into skipped tails without a word.
+
+// assetRoutePattern matches a single-quoted path literal in the embedded JS/HTML.
+var assetRoutePattern = regexp.MustCompile(`'(/[A-Za-z0-9/_.\-{}]*)'`)
+
 // concatenatedTail matches the text immediately before a quoted literal when
 // that literal continues an expression rather than starting one.
 var concatenatedTail = regexp.MustCompile(`\+\s*$`)
 
-// TestVendoredAssetsCallRoutesThatExist extends ui_test.go's contract — asset
-// path literals ⊆ GenerateOpenAPISpec paths — to the vendored files.
-//
-// This is the check that makes vendoring safe rather than merely tidy. The two
-// auth.js files were written against two different servers: the port's against
-// this port's routes, the reference's against the reference's. Swapping one for
-// the other is only sound if the reference's SDK calls routes this port
-// actually serves, and nothing but a test can establish that.
-//
-// It holds today: all 41 auth-route literals across the fourteen assets resolve
-// to a documented path. The exemption ui_test.go already grants to /ui/*,
-// /tools/* and /admin/* literals is kept and is what makes this PR possible
-// before M8 and M9 land — the vendored admin SPA calls an admin router that
-// this port will not mount until U16.
-//
-// One rule is added here that ui_test.go does not need: a quoted literal
-// preceded by `+` is a fragment of a concatenation, not the start of a path.
-// The vendored admin.js builds every request as BASE + path, where BASE is the
-// admin mount injected at render time (admin.js:154, reading
-// window.__ADMIN_CONFIG__.base), so `'/api/users/' + id + '/metadata'` puts the
-// bare literal "/metadata" in the source. Read as a path start that is a call
-// to <prefix>/metadata, which this port does not serve and the reference does
-// not have either; read correctly it is the tail of
-// /admin/api/users/:id/metadata (admin.router.ts:855). Six literals in admin.js
-// are fragments of this kind and all six are admin-surface.
+// basePrefixed matches the text immediately before a quoted literal when the
+// `+` it follows joins it to the asset's base variable: the literal is then a
+// path start under the mount, not a tail.
+var basePrefixed = regexp.MustCompile(`\b(?:BASE|cfg\.base|defaultPrefix)\s*\+\s*$`)
+
+// assetSurface is one router's route set as an asset calls it: the paths with
+// the mount stripped, and the literals its assets carry that are not calls,
+// keyed by their normalised form, each with the reason it is not one.
+type assetSurface struct {
+	name      string
+	mount     string
+	paths     map[string]bool
+	nonRoutes map[string]string
+}
+
+// newAssetSurface strips mount from every documented path and adds the extra
+// relative ones.
+func newAssetSurface(t *testing.T, name, mount string, documented map[string]any, extra []string, nonRoutes map[string]string) assetSurface {
+	t.Helper()
+	s := assetSurface{name: name, mount: mount, paths: map[string]bool{}, nonRoutes: nonRoutes}
+	for p := range documented {
+		if !strings.HasPrefix(p, mount) {
+			t.Fatalf("the %s document describes %q, which is not below its mount %q", name, p, mount)
+		}
+		s.paths[strings.TrimPrefix(p, mount)] = true
+	}
+	for _, rel := range extra {
+		s.paths[rel] = true
+	}
+	if len(s.paths) == 0 {
+		t.Fatalf("no %s paths: the guard below would pass vacuously", name)
+	}
+	return s
+}
+
+// authNonRoutes is every literal the pages and auth.js carry that is not a
+// call to the auth router, in normalised form. Four entries; a fifth needs a
+// reason as good as these, and an entry nothing carries any more fails.
+var authNonRoutes = map[string]string{
+	"/": "the home URL — window.location.href = '/' in the pages, homeUrl in auth.js " +
+		"(:22, :361) — and auth.js's default prefix '/auth' (:17), which is the mount " +
+		"itself and normalises to this",
+	"/ui/": "a pathname string operation (auth.js:15-16) that finds the prefix above the UI mount",
+	"/ui/login": "the login page, which UIHandler serves and ui_pages_test.go pins; no generator " +
+		"describes it (auth.js:21)",
+	"/api/auth": "an example prefix in the SDK's doc comment (auth.js:380, :384)",
+}
+
+// authAssetSurface is the auth router with no optional flag set: the routes
+// every mount has. The pages and auth.js call nothing conditional.
+func authAssetSurface(t *testing.T) assetSurface {
+	t.Helper()
+	return newAssetSurface(t, "auth", DefaultAPIPrefix, specPaths(t, GenerateOpenAPISpec(OpenAPIInfo{})), nil, authNonRoutes)
+}
+
+// adminAssetSurface is the admin console at its widest — every flag a wiring
+// can set, so that a tab the SPA shows under any wiring has its routes in the
+// set — plus the routes the reference's generator omits. UI is left off: it is
+// the reference's dead flag, describing two paths the console has never served
+// (openapi_admin.go), and a literal must resolve to something mounted. The SPA
+// carries no non-route literal: every path it spells is a call.
+func adminAssetSurface(t *testing.T) assetSurface {
+	t.Helper()
+	document := GenerateAdminOpenAPISpec(AdminOpenAPIInfo{
+		Sessions: true, Roles: true, Tenants: true, Metadata: true, Settings: true,
+		LinkedAccounts: true, APIKeys: true, Webhooks: true, Docs: true,
+	})
+	undocumented := make([]string, 0, len(adminUndocumentedPaths))
+	for rel := range adminUndocumentedPaths {
+		undocumented = append(undocumented, rel)
+	}
+	return newAssetSurface(t, "admin", DefaultAdminPath, specPaths(t, document), undocumented, nil)
+}
+
+// normalise strips the query and the mount, so a literal written as
+// "/auth/login" (the HTML pages concatenate an origin with the full path) and
+// one written as "/login" (the SDK prepends the prefix itself) compare equal.
+func (s assetSurface) normalise(literal string) string {
+	clean := literal
+	if i := strings.IndexByte(clean, '?'); i >= 0 {
+		clean = clean[:i]
+	}
+	if clean == s.mount {
+		return "/"
+	}
+	if strings.HasPrefix(clean, s.mount+"/") {
+		clean = strings.TrimPrefix(clean, s.mount)
+	}
+	return clean
+}
+
+// known reports whether a literal names a route that exists. A literal may be
+// the whole path, or the constant head of one built by concatenation
+// ("/sessions/" + handle), which has to match a parameterised path.
+func (s assetSurface) known(literal string) bool {
+	clean := s.normalise(literal)
+	if s.paths[clean] {
+		return true
+	}
+	if !strings.HasSuffix(clean, "/") {
+		return false
+	}
+	for p := range s.paths {
+		// "/sessions/" is the head of "/sessions/{handle}".
+		if strings.HasPrefix(p, clean) && strings.Contains(p[len(clean):], "{") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestVendoredAssetsCallRoutesThatExist is the check described above: every
+// route literal in every vendored asset names a route the surface it calls
+// actually has.
 func TestVendoredAssetsCallRoutesThatExist(t *testing.T) {
-	documented := documentedAssetPaths(t)
+	authRouter := authAssetSurface(t)
+	console := adminAssetSurface(t)
 	embedded := embeddedUpstreamAssets(t)
 
-	checked := 0
+	checked := map[string]int{}
+	exempted := map[string]map[string]int{authRouter.name: {}, console.name: {}}
+	baseStarts := 0
 	for _, name := range sortedKeys(embedded) {
 		t.Run(name, func(t *testing.T) {
+			surface := authRouter
+			if name == "admin.js" {
+				surface = console
+			}
 			source := string(embedded[name])
 			for _, m := range assetRoutePattern.FindAllStringSubmatchIndex(source, -1) {
 				literal := source[m[2]:m[3]]
-				if !isAuthRouteLiteral(literal) {
-					continue
-				}
 				// Look back a short way rather than at the whole prefix: the
 				// question is only what token immediately precedes the quote.
 				before := source[max(0, m[0]-40):m[0]]
-				if concatenatedTail.MatchString(before) {
+				if basePrefixed.MatchString(before) {
+					baseStarts++
+				} else if concatenatedTail.MatchString(before) {
 					continue
 				}
-				checked++
-				if !knownAssetPath(literal, documented) {
-					t.Errorf("vendored %s calls %q, which no adapter mounts.\n"+
+				if literal == DefaultToolsPath || strings.HasPrefix(literal, DefaultToolsPath+"/") {
+					t.Errorf("vendored %s calls %q: no vendored asset called the tools router until now, "+
+						"so nothing here holds a literal to GenerateToolsOpenAPISpec. Wire that document "+
+						"in as a third surface before exempting this.", name, literal)
+					continue
+				}
+				clean := surface.normalise(literal)
+				if _, ok := surface.nonRoutes[clean]; ok {
+					exempted[surface.name][clean]++
+					continue
+				}
+				checked[surface.name]++
+				if !surface.known(literal) {
+					t.Errorf("vendored %s calls %q, which the %s router does not mount.\n"+
 						"  the vendored assets are not editable here, so the answer is either a "+
-						"route this port still owes the family, or a literal that needs the "+
-						"concatenation or prefix exemption above.",
-						name, literal)
+						"route this port still owes the family, a literal that needs the "+
+						"concatenation rule above, or — with a reason as good as the ones there — "+
+						"a non-route literal for the %s surface's list.",
+						name, literal, surface.name, surface.name)
 				}
 			}
 		})
 	}
-	if checked == 0 {
-		t.Error("no auth route literals found in any vendored asset — the extraction regex has " +
-			"stopped matching, and this test is now passing on an empty set")
+	// Both surfaces have to have been exercised, or one of the two documents
+	// is being held to nothing and this test is passing on an empty set; and
+	// every exemption has to have been used, or it is the fossil the list's
+	// direction exists to refuse.
+	for _, surface := range []assetSurface{authRouter, console} {
+		if checked[surface.name] == 0 {
+			t.Errorf("no %s route literal found in any vendored asset — the extraction regex "+
+				"has stopped matching", surface.name)
+		}
+		for clean, why := range surface.nonRoutes {
+			if exempted[surface.name][clean] == 0 {
+				t.Errorf("the %s non-route list names %q (%s), which no vendored asset carries any "+
+					"more: delete the entry", surface.name, clean, why)
+			}
+		}
+	}
+	if baseStarts == 0 {
+		t.Error("no literal followed its asset's base variable (BASE, cfg.base, defaultPrefix) — " +
+			"a re-vendor renamed the base, and the calls built on it are being skipped as " +
+			"concatenation tails; teach basePrefixed the new name")
 	}
 }
 
-// TestVendoredAssetsSpeakTheCurrentWire runs ui_test.go's field-shape bans over
-// the vendored files.
+// TestVendoredAssetsSpeakTheCurrentWire runs the field-shape bans the port's
+// own assets were once held to over the vendored files.
 //
 // Every one of those patterns is a mistake the port's own pre-0.2.0 assets made
 // — snake_case bodies, a `tokens` envelope the server stopped returning. The
 // interesting result is that the reference's assets make none of them: the
 // family's UI and this port's wire already agree on camelCase, which is the
-// evidence that the swap in ServeAuthJS is safe rather than merely intended.
+// evidence that serving the reference's files is safe rather than merely
+// intended.
 //
 // Keeping the assertion live matters more than the fact that it passes today.
 // If a future re-vendor brings in an asset that speaks a different wire, this
@@ -345,22 +537,24 @@ func TestVendoredAssetsSpeakTheCurrentWire(t *testing.T) {
 // TestVendoredAuthJSIsAWorkingCookieClient pins the vendored SDK against this
 // port's cookie contract, name for name.
 //
-// ServeAuthJS now serves this file, so these are not trivia: the CSRF cookie
-// names and the session-revoked code are strings the two sides have to spell
-// identically, and a rename on the Go side would otherwise break the served
-// client with nothing failing.
+// UIHandler serves this file at <prefix>/ui/auth.js, so these are not trivia:
+// the CSRF cookie names and the session-revoked code are strings the two sides
+// have to spell identically, and a rename on the Go side would otherwise break
+// the served client with nothing failing.
 //
-// Two facts from TestAuthJSHonoursTheCookieContract are deliberately absent
-// here, and the difference is the one behavioural consequence of the swap.
-// The port's hand-written auth.js sent X-Auth-Strategy: bearer to opt into
-// token delivery. The reference's auth.js never sends that header: it is a
-// cookie-only client, and the header is read by the server (auth.router.ts:391)
-// for callers that choose to send it — the Angular and Flutter clients — rather
-// than by its own SDK. Serving the reference's file therefore removes the
-// bearer opt-in from the *served* SDK while changing nothing about the server,
-// which still honours X-Auth-Strategy from any caller. That is the intended
-// result of vendoring byte for byte and is called out in the CHANGELOG, because
-// a host whose page relied on window.AuthSDK returning tokens has to know.
+// Two facts the port's own auth.js was once held to are deliberately absent
+// here — AuthStrategyHeader and the exact AuthStrategyBearer value — and the
+// difference is the one behavioural consequence of serving the reference's
+// file. The port's hand-written auth.js sent X-Auth-Strategy: bearer to opt
+// into token delivery. The reference's auth.js never sends that header: it is
+// a cookie-only client, and the header is read by the server
+// (auth.router.ts:391) for callers that choose to send it — the Angular and
+// Flutter clients — rather than by its own SDK. Serving the reference's file
+// therefore leaves the bearer opt-in out of the *served* SDK while changing
+// nothing about the server, which still honours X-Auth-Strategy from any
+// caller. That is the intended result of vendoring byte for byte and is called
+// out in the v0.9.0 CHANGELOG entry, because a host whose page relied on
+// window.AuthSDK returning tokens has to know.
 func TestVendoredAuthJSIsAWorkingCookieClient(t *testing.T) {
 	data, err := ReadUpstreamUIAsset("auth.js")
 	if err != nil {
@@ -380,30 +574,6 @@ func TestVendoredAuthJSIsAWorkingCookieClient(t *testing.T) {
 			t.Errorf("vendored auth.js does not mention %q: the served SDK and this port no "+
 				"longer agree on a name they both have to spell", required)
 		}
-	}
-}
-
-// TestServeAuthJSServesTheVendoredAsset pins the deprecation: the exported
-// symbol still works, and what comes out of it is the reference's bytes rather
-// than the port's hand-written ones.
-func TestServeAuthJSServesTheVendoredAsset(t *testing.T) {
-	want, err := ReadUpstreamUIAsset("auth.js")
-	if err != nil {
-		t.Fatalf("ReadUpstreamUIAsset(auth.js): %v", err)
-	}
-
-	rec := httptest.NewRecorder()
-	ServeAuthJS().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth.js", nil))
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("ServeAuthJS returned %d, want %d", rec.Code, http.StatusOK)
-	}
-	if got := rec.Body.Bytes(); !bytes.Equal(got, want) {
-		t.Errorf("ServeAuthJS served %d bytes (sha256 %s), want the vendored asset's %d "+
-			"(sha256 %s)", len(got), sha256Hex(got), len(want), sha256Hex(want))
-	}
-	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/javascript") {
-		t.Errorf("ServeAuthJS Content-Type is %q, want application/javascript", ct)
 	}
 }
 

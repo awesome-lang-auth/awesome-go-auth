@@ -109,9 +109,20 @@ func main() {
 	// UI.Enabled mounts it at /auth/ui: the login, register, forgot-password and
 	// 2FA pages, the config document they boot from, and auth.js beside them.
 	// Branding is optional — with none, the pages render the library's defaults.
+	//
+	// Admin mounts the admin console at /admin — beside the auth mount, not
+	// under it, as the reference's admin router is a sibling of its auth router
+	// — with the reference's own SPA served from the same mount. It mounts only
+	// with an access decision: AdminIsAdminFlag admits a session whose user
+	// carries the IsAdmin flag and nothing else (admin.router.ts:370). Set the
+	// flag on the first administrator through the user store; from inside the
+	// console, POST /admin/users/{id}/promote with {"method": "flag"} grants it
+	// to the next.
 	uiCfg := auth.DefaultHTTPConfig()
 	uiCfg.UI.Enabled = true
 	uiCfg.UI.Branding = auth.UIBranding{SiteName: "Echo + SQLite Example"}
+	uiCfg.Admin.Enabled = true
+	uiCfg.Admin.AccessPolicy = auth.AdminIsAdminFlag()
 	echoAdapter.MountWithConfig(e.Group(""), a, uiCfg)
 
 	// ── 4. OAuth login ────────────────────────────────────────────────────
@@ -149,13 +160,9 @@ func main() {
 		})
 	})
 
-	// ── 5. Embedded UI ────────────────────────────────────────────────────
-	// The hosted pages are at /auth/ui (mounted above), and auth.js with them at
-	// /auth/ui/auth.js, which is where those pages load it from. What is left
-	// here is the admin dashboard: the reference's admin SPA is vendored and
-	// served under /auth/ui, but the admin API it calls is not mounted yet, so
-	// the hand-written page stays until that lands.
-	e.GET("/admin", echo.WrapHandler(auth.ServeAdminUI())) //nolint:staticcheck // no replacement until the admin router lands
+	// Nothing is left to mount by hand for the UI: the hosted pages are at
+	// /auth/ui (mounted above), auth.js with them at /auth/ui/auth.js, which is
+	// where those pages load it from, and the admin console at /admin.
 
 	addr := getEnv("ADDR", ":8080")
 	log.Printf("listening on %s", addr)

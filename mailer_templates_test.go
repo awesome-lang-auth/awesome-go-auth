@@ -140,53 +140,46 @@ func TestMailTemplaterBuiltInsAreTheReferenceTemplates(t *testing.T) {
 	}
 }
 
-// The four 0.3.x ids are aliases: they render the same as the constant each one
-// maps to, Register through one lands on the constant, and a store is asked
-// for the constant.
-func TestMailTemplaterAcceptsTheDeprecatedIDs(t *testing.T) {
+// The four 0.3.x ids were aliases of the reference's through the 0.x line and
+// are plain ids now, resolved nowhere: RenderMail on one finds no built-in, and
+// a stored row under one is not the row TemplatePasswordReset is asked for.
+// That second half is the migration this pins — a deployment whose template
+// store holds "reset_password" renames the row to the constant, because
+// nothing here will read it for the password-reset mail any more.
+func TestMailTemplaterNoLongerResolvesTheOldIDs(t *testing.T) {
 	ctx := context.Background()
 	tm := NewMailTemplater("Example App")
 	data := MailTemplateData{Token: "tok123", URL: testMailLink}
-	aliases := map[string]string{
-		"reset_password": TemplatePasswordReset,
-		"magic_link":     TemplateMagicLink,
-		"verify_email":   TemplateVerifyEmail,
-		// The reference mails its verification template on /change-email/request
-		// (auth.router.ts:1027-1032); there is no separate one to alias.
-		"email_change": TemplateVerifyEmail,
-	}
-	for alias, canonical := range aliases {
-		for _, locale := range []string{"en", "it"} {
-			want, err := tm.RenderMail(ctx, locale, canonical, data)
-			if err != nil {
-				t.Fatalf("%s/%s: %v", locale, canonical, err)
-			}
-			got, err := tm.RenderMail(ctx, locale, alias, data)
-			if err != nil {
-				t.Fatalf("%s/%s: %v", locale, alias, err)
-			}
-			if got != want {
-				t.Errorf("%s/%s rendered differently from %s", locale, alias, canonical)
-			}
+	for _, old := range []string{"reset_password", "magic_link", "verify_email", "email_change"} {
+		if got, err := tm.RenderMail(ctx, "en", old, data); err == nil {
+			t.Errorf("RenderMail(%q) rendered %+v; the old id is not an alias any more and has no built-in", old, got)
 		}
 	}
 
-	tm.Register("en", "magic_link", "Registered through the alias", "<p>{{.link}}</p>", "{{.link}}")
-	got, err := tm.RenderMail(ctx, "en", TemplateMagicLink, data)
-	if err != nil || got.Subject != "Registered through the alias" {
-		t.Errorf("after Register(magic_link) the magic-link id rendered %+v, %v", got, err)
+	// Register under an old id registers exactly that id — it neither replaces
+	// the constant's built-in nor becomes reachable through it.
+	tm.Register("en", "magic_link", "Registered under the old id", "<p>{{.link}}</p>", "{{.link}}")
+	if got, err := tm.RenderMail(ctx, "en", TemplateMagicLink, data); err != nil || got.Subject == "Registered under the old id" {
+		t.Errorf("Register(magic_link) reached the magic-link id: %+v, %v", got, err)
+	}
+	if got, err := tm.RenderMail(ctx, "en", "magic_link", data); err != nil || got.Subject != "Registered under the old id" {
+		t.Errorf("Register(magic_link) did not register magic_link itself: %+v, %v", got, err)
 	}
 
+	// A stored row under the old id is not consulted for the constant.
 	store := NewMemoryTemplateStore()
-	if _, err := store.UpdateMailTemplate(ctx, TemplatePasswordReset, MailTemplatePatch{
+	if _, err := store.UpdateMailTemplate(ctx, "reset_password", MailTemplatePatch{
 		BaseHTML: strPtr("<p>stored {{link}}</p>"), BaseText: strPtr("stored {{link}}"),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	tm.Store = store
-	got, err = tm.RenderMail(ctx, "en", "reset_password", data)
-	if err != nil || got.HTML != "<p>stored "+testMailLink+"</p>" {
-		t.Errorf("reset_password did not reach the stored password-reset template: %+v, %v", got, err)
+	got, err := tm.RenderMail(ctx, "en", TemplatePasswordReset, data)
+	if err != nil {
+		t.Fatalf("%s: %v", TemplatePasswordReset, err)
+	}
+	if got.HTML == "<p>stored "+testMailLink+"</p>" {
+		t.Errorf("the row stored under reset_password served %s: the old id is still being resolved", TemplatePasswordReset)
 	}
 }
 
