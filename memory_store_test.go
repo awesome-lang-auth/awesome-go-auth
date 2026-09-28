@@ -50,14 +50,16 @@ func TestMemorySessionStore_ListRevokeAndCleanup(t *testing.T) {
 	}
 }
 
-// The three admin listers are optional capabilities resolved by type assertion,
-// so nothing fails at build time if an implementation drifts away from its
-// interface — it just stops being found at run time, on a route, in M8. These
-// three lines are what makes that a compile error instead.
+// The three admin listers, and the by-id lookup beside them, are optional
+// capabilities resolved by type assertion, so nothing fails at build time if an
+// implementation drifts away from its interface — it just stops being found at
+// run time, on a route, in M8. These lines are what makes that a compile error
+// instead.
 var (
-	_ AdminUserStore = (*MemoryUserStore)(nil)
-	_ SessionLister  = (*MemorySessionStore)(nil)
-	_ RoleLister     = (*MemoryRolesPermissionsStore)(nil)
+	_ AdminUserStore  = (*MemoryUserStore)(nil)
+	_ UserLookupStore = (*MemoryUserStore)(nil)
+	_ SessionLister   = (*MemorySessionStore)(nil)
+	_ RoleLister      = (*MemoryRolesPermissionsStore)(nil)
 )
 
 func TestMemorySessionStore_GetAllSessions(t *testing.T) {

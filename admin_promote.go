@@ -150,8 +150,9 @@ func matchAdminPromote(method, rel string) (string, bool) {
 // same reason: the reference's update(id, patch) carries none. In a deployment
 // that stores users under a non-empty tenant this route therefore promotes
 // nobody and answers 500 where the row exists under another tenant — the same
-// gap DELETE <admin>/api/users/:id has, and a store-level item rather than a
-// route-level one.
+// gap DELETE <admin>/api/users/:id has. The store-level half of the fix exists
+// now, as UserLookupStore; adminDeleteUser says why neither write resolves
+// through it yet.
 //
 // There is no 404 above the 501 and none below it. The user store is the one
 // store createAdminRouter is always handed, and a row that is not there is

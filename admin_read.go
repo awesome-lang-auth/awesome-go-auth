@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
@@ -383,17 +384,12 @@ func (a *Auth) adminListUsers(w http.ResponseWriter, r *http.Request) {
 
 // adminGetUser is GET <admin>/api/users/:id (:789-800).
 //
-// The tenant passed to the store is "", which is the reference's findById(id):
-// that call carries no tenant, and the console has no tenant notion anywhere in
-// its read half. Unlike AdminUserStore.ListUsers, UserStore.GetUserByID reads ""
-// as an ordinary tenant value and not as a wildcard, so in a deployment that
-// stores users under a non-empty tenant this route resolves nothing the listing
-// above it shows. That gap is the shape of the seam v0.8.0 built — it added a
-// lister and no by-id lookup that spans tenants — and closing it means a new
-// store method, which is not this PR's to add. A single-tenant deployment, which
-// is what the reference's console assumes throughout, is unaffected.
+// The reference's findById(id) carries no tenant, and neither does anything in
+// the console's read half: the listing above this route spans every tenant, so
+// the id is all this route is given. adminFindUser resolves it the way the
+// listing reached it.
 func (a *Auth) adminGetUser(w http.ResponseWriter, r *http.Request, id string) {
-	user, err := a.service.users.GetUserByID(r.Context(), id, "")
+	user, err := a.adminFindUser(r.Context(), id)
 	if err != nil {
 		// findById answers null for a user that is not there and the route
 		// turns that into 404 (:791). UserStore has no not-found sentinel to
@@ -410,6 +406,29 @@ func (a *Auth) adminGetUser(w http.ResponseWriter, r *http.Request, id string) {
 		IsEmailVerified: user.IsEmailVerified,
 		IsTOTPEnabled:   user.IsTOTPEnabled,
 	})
+}
+
+// adminFindUser resolves a user the console names by id alone.
+//
+// A store that implements UserLookupStore is asked across every tenant. That is
+// the reference's findById, and it is what makes the detail route agree with
+// GET <admin>/api/users: a user the listing shows is a user this finds.
+//
+// A store that does not is asked GetUserByID(id, ""), the empty tenant as a
+// literal, which is what this route did before the interface existed. That is
+// still right for every single-tenant deployment. In a multi-tenant one it
+// answers 404 for a user the listing shows under another tenant, and the
+// admin-user-detail-spans-tenants-only-through-a-lookup-store deviation records
+// that rather than a 501 the reference never answers here.
+//
+// The fallback runs when the capability is absent, never after the lookup
+// fails. A store that spans tenants and does not hold the id has already
+// answered for the empty tenant too, so asking again could only disagree with it.
+func (a *Auth) adminFindUser(ctx context.Context, id string) (User, error) {
+	if lookup, ok := a.service.users.(UserLookupStore); ok {
+		return lookup.FindUserByID(ctx, id)
+	}
+	return a.service.users.GetUserByID(ctx, id, "")
 }
 
 // adminGetUserMetadata is GET <admin>/api/users/:id/metadata (:855-863). The
@@ -452,11 +471,21 @@ func (a *Auth) adminGetUserLinkedAccounts(w http.ResponseWriter, r *http.Request
 
 // adminGetUserRoles is GET <admin>/api/users/:id/roles (:893-901).
 //
-// The tenant is "", as in adminGetUser and for the same reason: the reference's
-// getRolesForUser(id) carries none. Where enrichFromStores asks for a user's
-// roles it passes that user's own tenant, but this route never loads the user —
-// the reference does not — so there is no tenant to pass and the untenanted
-// assignments are what it reports.
+// The tenant is "", because the reference's getRolesForUser(id) carries none —
+// and unlike adminGetUser's, this "" is not a gap UserLookupStore closes. The
+// tenant here is RolesPermissionsStore's: the scope of an *assignment*, not the
+// tenant a user record is stored under. The console's own writers assign in the
+// empty scope — POST /api/users/:id/roles with no tenantId, and POST
+// <admin>/users/:id/promote with method=role — so reading "" is what shows an
+// operator the roles the console just gave. Resolving the user and reading
+// under its TenantID instead would hide every one of them in a multi-tenant
+// deployment: the same listed-but-missing mismatch, moved from the user to the
+// role.
+//
+// enrichFromStores reads a user's roles under that user's own tenant, so an
+// assignment made here in the empty scope does not reach the tokens of a user
+// stored under another tenant. That is a question about the RBAC scope rather
+// than about where a user lives, and it is not this route's to settle.
 func (a *Auth) adminGetUserRoles(w http.ResponseWriter, r *http.Request, id string) {
 	if a.service.rbac == nil {
 		writeAdminError(w, http.StatusNotFound, "RBAC store not configured")
