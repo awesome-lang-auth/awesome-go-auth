@@ -1,8 +1,6 @@
 package echo
 
 import (
-	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -18,23 +16,11 @@ import (
 // handlers drop it: putting it in the response body would turn a second factor
 // into no factor at all. The service delivers it through the senders on Config
 // (see delivery.go); the send routes owe that seam only the /sms/send precheck.
-
-// bindStepUpJSON binds a request body and treats an absent one as a body with
-// every field omitted — the reference's behaviour, where express.json() leaves
-// req.body as {} and each route answers for the field it was missing rather than
-// for the body. Malformed JSON is still 400 INVALID_BODY.
 //
-// Echo's binder already returns nil for a zero-length body, so this helper is
-// what makes that explicit and keeps it true if the binder changes; the other
-// three adapters had to be taught the same tolerance to stop disagreeing with
-// this one.
-func bindStepUpJSON(c echo.Context, dst any) bool {
-	if err := c.Bind(dst); err != nil && !errors.Is(err, io.EOF) {
-		auth.WriteHTTPError(c.Response(), auth.HTTPErrInvalidBody)
-		return false
-	}
-	return true
-}
+// Bodies are decoded with auth.DecodeOptionalJSON, the decoder every body-reading
+// route of the four adapters shares, rather than echo's Bind: an absent body is
+// a body with every field omitted, as express.json() leaves req.body as {}, and
+// malformed JSON is 400 INVALID_BODY whatever the Content-Type says.
 
 func (ad *Adapter) magicLinkSend(c echo.Context) error {
 	var req struct {
@@ -44,7 +30,7 @@ func (ad *Adapter) magicLinkSend(c echo.Context) error {
 		TenantID  string `json:"tenantId"`
 		EmailLang string `json:"emailLang"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
 	email, tenantID := req.Email, req.TenantID
@@ -88,7 +74,7 @@ func (ad *Adapter) magicLinkVerify(c echo.Context) error {
 		Mode      string `json:"mode"`
 		TempToken string `json:"tempToken"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
 	in := auth.MagicLinkVerifyInput{Token: req.Token}
@@ -130,7 +116,7 @@ func (ad *Adapter) smsSend(c echo.Context) error {
 		TempToken string `json:"tempToken"`
 		TenantID  string `json:"tenantId"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
 	userID, tenantID := strings.TrimSpace(req.UserID), req.TenantID
@@ -181,7 +167,7 @@ func (ad *Adapter) smsVerify(c echo.Context) error {
 		TempToken string `json:"tempToken"`
 		TenantID  string `json:"tenantId"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
 	userID, tenantID := strings.TrimSpace(req.UserID), req.TenantID
@@ -232,7 +218,7 @@ func (ad *Adapter) twoFactorVerifySetup(c echo.Context) error {
 		Token  string `json:"token"`
 		Secret string `json:"secret"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
 	if err := ad.auth.VerifyTOTPSetup(c.Request().Context(), user.ID, user.TenantID, req.Secret, req.Token); err != nil {
@@ -248,7 +234,7 @@ func (ad *Adapter) twoFactorVerify(c echo.Context) error {
 		TempToken string `json:"tempToken"`
 		TOTPCode  string `json:"totpCode"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
 	// Both arguments are the same envelope: this route has no missing-tempToken

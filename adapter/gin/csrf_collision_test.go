@@ -73,7 +73,7 @@ func TestCSRFEnforcedUnderAPrefixCollidingGroup(t *testing.T) {
 		return bytes.NewReader([]byte(`{"email":"collide@example.com","provider":"acme"}`))
 	}
 
-	// The forgery: nothing on the request, and text/plain because decodeJSON does
+	// The forgery: nothing on the request, and text/plain because auth.DecodeOptionalJSON does
 	// not inspect Content-Type, so a plain <form enctype="text/plain"> reaches it.
 	forged := httptest.NewRequest(http.MethodPost, "/auth/auth/link-request", body())
 	forged.Header.Set("Content-Type", "text/plain")

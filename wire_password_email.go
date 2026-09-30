@@ -248,11 +248,16 @@ func VerifyEmailToken(r *http.Request) string {
 // or empty one, and writes the error envelope when the body is present but
 // malformed.
 //
-// Every route in this group accepts an empty body: the reference runs
-// express.json(), which leaves req.body as {} rather than failing, and the
-// Flutter client posts /send-verification-email with no body at all. Rejecting a
-// malformed body with 400 INVALID_BODY is the port's own convention, already
-// applied by /register and /login.
+// It is the one decoder every body-reading auth route of the four adapters
+// uses — this group, /register, /login, /link-request, /link-verify and the
+// passwordless and TOTP step-up routes — so that they agree with each other and
+// with the reference. The reference runs express.json(), which leaves req.body as
+// {} rather than failing, and since v1.10.5 every route reads `req.body ?? {}`
+// (awesome-node-auth CHANGELOG 1.10.5, issue #21): an absent body reaches each
+// route's own per-field check. The Flutter client posts
+// /send-verification-email with no body at all. A body that is present but is
+// not JSON is refused: express.json() refuses it too, and the port answers with
+// its own 400 INVALID_BODY envelope.
 func DecodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if r == nil || r.Body == nil {
 		return true

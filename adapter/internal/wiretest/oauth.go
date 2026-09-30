@@ -1374,6 +1374,27 @@ func testLinkRequest(t *testing.T, mount Mounter) {
 		AssertError(t, f.Do(req), http.StatusBadRequest, "email is required", auth.CodeEmailRequired)
 	})
 
+	// #34: no body at all is a body with every field omitted, as the reference's
+	// `req.body ?? {}` makes it (auth.router.ts:2220 at v1.10.8), so it lands on
+	// the same EMAIL_REQUIRED as the empty object above rather than on 400
+	// INVALID_BODY. Malformed JSON is still refused as malformed.
+	t.Run("empty body", func(t *testing.T) {
+		f := newOAuthFixture(t, mount, fixtureOptions{})
+		_, tokens := f.Seed("emptybody@example.com")
+		req := f.Request(http.MethodPost, "/link-request", nil)
+		req.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+		AssertError(t, f.Do(req), http.StatusBadRequest, "email is required", auth.CodeEmailRequired)
+	})
+
+	t.Run("malformed body", func(t *testing.T) {
+		f := newOAuthFixture(t, mount, fixtureOptions{})
+		_, tokens := f.Seed("malformed@example.com")
+		req := httptest.NewRequest(http.MethodPost, f.Config.Prefix()+"/link-request", strings.NewReader("{not json"))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+		AssertError(t, f.Do(req), http.StatusBadRequest, "Invalid request body", auth.CodeInvalidBody)
+	})
+
 	// Unauthenticated and nothing stashed: the conflict flow has nothing to
 	// resolve an identity from.
 	t.Run("unauthenticated with no pending link", func(t *testing.T) {
@@ -1430,7 +1451,7 @@ func testLinkRequest(t *testing.T, mount Mounter) {
 	// though no request to it is ever cookie-authenticated.
 	//
 	// An auto-submitting form on an attacker's page carries no Authorization, no
-	// X-CSRF-Token, and no cookie the attacker chose — and because decodeJSON never
+	// X-CSRF-Token, and no cookie the attacker chose — and because auth.DecodeOptionalJSON never
 	// inspects Content-Type, <form enctype="text/plain"> is enough to reach the
 	// handler. There is no auth gate behind this route to stop it: linkRequest
 	// performs no manual check of its own and accepts a stashed pending link in
@@ -1525,6 +1546,21 @@ func testLinkVerify(t *testing.T, mount Mounter) {
 		f := newOAuthFixture(t, mount, fixtureOptions{})
 		rec := f.Do(f.Request(http.MethodPost, "/link-verify", map[string]any{}))
 		AssertError(t, rec, http.StatusBadRequest, "token is required", auth.CodeTokenRequired)
+	})
+
+	// #34: no body at all reaches the same per-field answer as the empty object
+	// above (auth.router.ts:2273-2277 at v1.10.8); malformed JSON does not.
+	t.Run("empty body", func(t *testing.T) {
+		f := newOAuthFixture(t, mount, fixtureOptions{})
+		rec := f.Do(f.Request(http.MethodPost, "/link-verify", nil))
+		AssertError(t, rec, http.StatusBadRequest, "token is required", auth.CodeTokenRequired)
+	})
+
+	t.Run("malformed body", func(t *testing.T) {
+		f := newOAuthFixture(t, mount, fixtureOptions{})
+		req := httptest.NewRequest(http.MethodPost, f.Config.Prefix()+"/link-verify", strings.NewReader("{not json"))
+		req.Header.Set("Content-Type", "application/json")
+		AssertError(t, f.Do(req), http.StatusBadRequest, "Invalid request body", auth.CodeInvalidBody)
 	})
 
 	t.Run("unknown token", func(t *testing.T) {
