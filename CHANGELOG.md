@@ -65,9 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `refresh_token` is present only when the code was granted
     `offline_access`, and it is the grant's opaque token. Before, the
     response always carried the session's own HS256 refresh token, which
-    worked only at `POST <prefix>/refresh`. A relying party that wants a
-    refresh token asks for `offline_access` and redeems it at `token` with
-    `grant_type=refresh_token`.
+    worked only at `POST <prefix>/refresh` and `POST <prefix>/logout`. A
+    relying party that wants a refresh token asks for `offline_access` and
+    redeems it at `token` with `grant_type=refresh_token`. It can no longer
+    end the session itself: there is no revocation endpoint (RFC 7009) yet,
+    so the session ends when it expires or when it is revoked through the
+    session or admin surface, and its refresh tokens with it.
   - `authorize` refuses a `plain` PKCE method, a `code_challenge` with no
     method (RFC 7636 §4.3 reads that as `plain`) and a malformed challenge,
     with the RFC 6749 §4.1.2.1 `error=invalid_request` redirect. They were
