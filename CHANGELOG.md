@@ -26,6 +26,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deployment that predates `RefreshSecret` has the two equal; v1.0.0 will refuse
   it, so a deployment should set `WithRefreshSecret` to a distinct value before
   upgrading to it.
+- **The IdP token endpoint verifies PKCE, accepts `client_secret_basic`, and
+  implements the `refresh_token` grant** (#14). None of it has a counterpart
+  in the reference, whose IdP mode is the JWKS route alone; the rules are the
+  specifications', and the surface is recorded as the
+  `idp-mode-adds-an-oauth-authorization-server` deviation.
+  - **PKCE.** A code issued with an `S256` `code_challenge` is redeemed only
+    with the matching `code_verifier` (RFC 7636 §4.6); a missing or wrong one
+    is `400 invalid_grant` and burns the code. A code issued without a
+    challenge is redeemed as before. Discovery advertises
+    `code_challenge_methods_supported: ["S256"]`.
+  - **`client_secret_basic`** beside `client_secret_post` (RFC 6749 §2.3.1),
+    both advertised in `token_endpoint_auth_methods_supported`. A request
+    using both is `400 invalid_request`. A failed Basic attempt is
+    `401 invalid_client` with `WWW-Authenticate: Basic`. Client secrets are now
+    compared in constant time.
+  - **The `refresh_token` grant.** A refresh token is issued only when the code
+    was granted `offline_access` (OIDC Core §11, now in `scopes_supported`).
+    It is opaque and single use: each refresh returns a new one with a new
+    access token for the same session, and a token presented again, presented
+    by another client, or presented after its session ended is
+    `400 invalid_grant` and revokes every token of that grant (RFC 9700
+    §4.14.2). `scope` narrows and never widens (`400 invalid_scope`). A grant
+    lasts as long as its session, `Config.RefreshTokenTTL`. The state lives in
+    the new `IDPRefreshTokenStore` interface, `IDPConfig.RefreshTokens`, whose
+    doc comment is the implementor's contract; `MemoryIDPRefreshTokenStore` is
+    the in-process default. Discovery advertises `grant_types_supported`.
+
+### Changed
+- **IdP `POST <prefix>/token` and `authorize` answer as RFC 6749 and RFC
+  7636 prescribe, which changes four things** (#14).
+  - Every refusal is the §5.2 JSON body, `{"error":"invalid_grant",
+    "error_description":"…"}`, where it was a plain-text line with the same
+    error code. The status codes are unchanged. `authorize` and `userinfo`
+    still refuse in plain text.
+  - Every answer carries `Cache-Control: no-store` and `Pragma: no-cache`
+    (§5.1, §5.2).
+  - `refresh_token` is present only when the code was granted
+    `offline_access`, and it is the grant's opaque token. Before, the
+    response always carried the session's own HS256 refresh token, which
+    worked only at `POST <prefix>/refresh`. A relying party that wants a
+    refresh token asks for `offline_access` and redeems it at `token` with
+    `grant_type=refresh_token`.
+  - `authorize` refuses a `plain` PKCE method, a `code_challenge` with no
+    method (RFC 7636 §4.3 reads that as `plain`) and a malformed challenge,
+    with the RFC 6749 §4.1.2.1 `error=invalid_request` redirect. They were
+    accepted and never checked.
 
 ## [0.12.0] - 2026-09-30
 

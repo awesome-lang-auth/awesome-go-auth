@@ -71,6 +71,7 @@ var wantDeviationIDs = []string{
 	"event-handler-panic-does-not-fail-the-publisher",
 	"forgot-password-succeeds-on-delivery-failure",
 	"identity-events-are-raised-from-the-development-line",
+	"idp-mode-adds-an-oauth-authorization-server",
 	"inbound-webhook-script-runs-out-of-process",
 	"jwks-cors-wildcard-string-form",
 	"jwks-unknown-kid-refetch-is-rate-limited",
@@ -104,6 +105,10 @@ var wantClaims = map[string][]string{
 		"Access-Control-Allow-Origin", "string | string[]", "corsOrigins === '*'",
 	},
 	"temp-token-is-typed-not-an-access-token": {"access token", "second factor"},
+	"idp-mode-adds-an-oauth-authorization-server": {
+		"S256", "plain", "client_secret_basic", "client_secret_post", "refresh_token", "offline_access",
+		"invalid_grant", "§5.2", "JWKS", "family",
+	},
 	"refresh-secret-falls-back-to-secret": {
 		"Config.RefreshSecret", "Config.Secret", "refreshTokenSecret", "accessTokenSecret",
 		"1.10.3", "session store", "v1.0.0", "typ",

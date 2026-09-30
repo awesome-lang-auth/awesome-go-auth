@@ -1923,6 +1923,7 @@ type IDPConfig struct {
     Logger          func(format string, args ...any) // nil → the Service's
     Codes           AuthCodeStore // nil → NewMemoryAuthCodeStore()
     CodeTTL         time.Duration // 0 → 5 minutes
+    RefreshTokens   IDPRefreshTokenStore // nil → NewMemoryIDPRefreshTokenStore()
     JWKSPath        string        // "" → DefaultJWKSPath, "/.well-known/jwks.json"
     JWKSCORSOrigins []string      // nil → "*"
     JWKSURL         string        // "" → Issuer + JWKSPath, for jwks_uri
@@ -2141,7 +2142,7 @@ type AuthCode struct {
     CodeHash                           string // hashToken of the code the client holds
     UserID, TenantID, ClientID, Nonce  string
     RedirectURI                        string
-    CodeChallenge, CodeChallengeMethod string // recorded, not yet verified
+    CodeChallenge, CodeChallengeMethod string // S256 only; verified against code_verifier
     Scope                              string
     ExpiresAt                          time.Time
 }
@@ -2173,6 +2174,46 @@ process.
 
 `token` also refuses a code redeemed by a `client_id` other than the one it was
 issued to, and consumes it in the process.
+
+### Refresh-token storage
+
+The refresh tokens of the `refresh_token` grant live in an
+`IDPRefreshTokenStore`, `IDPConfig.RefreshTokens`:
+
+```go
+type IDPRefreshToken struct {
+    TokenHash                     string // hashToken of the token the client holds
+    FamilyID                      string // one grant: a code and everything rotated from it
+    ClientID, UserID, TenantID    string
+    SessionID                     string // the session the code exchange opened
+    Scope                         string // the granted scope, kept on every rotation
+    ExpiresAt                     time.Time // the family's absolute end: the session's
+}
+
+type IDPRefreshTokenStore interface {
+    SaveRefreshToken(ctx context.Context, token IDPRefreshToken) error
+    ConsumeRefreshToken(ctx context.Context, tokenHash string) (IDPRefreshToken, error)
+    RevokeRefreshTokenFamily(ctx context.Context, familyID string) error
+}
+```
+
+The contract, in full in the `IDPRefreshTokenStore` doc comment:
+
+- Keyed by `hashToken(token)`, never the token.
+- `ConsumeRefreshToken` is atomic: exactly one call ever gets a nil error for
+  a hash, on any number of processes. It marks the token used and keeps it.
+- A used token consumed again returns its record with
+  `ErrRefreshTokenReused`, which is how `token` learns the family to revoke;
+  so a used token is kept as a tombstone until its `ExpiresAt`.
+- Unknown, expired and revoked-family tokens are absent: `ErrInvalidToken`.
+- `RevokeRefreshTokenFamily` is permanent and covers a member saved after it,
+  because a rotation (consume, then save) can race a concurrent replay.
+
+`IDPConfig.RefreshTokens` left nil selects `NewMemoryIDPRefreshTokenStore()`,
+which, like the code store's default, is correct only in a single process.
+These tokens are not the ones `IDPConfig.RefreshTokenTTL` governs: that is the
+lifetime of the RS256 pair `IssueIdPTokenPair` mints.
+
 
 ### `IDPClient`
 
@@ -2215,7 +2256,7 @@ conformance suite replays all four against all four adapters.
 |------|-------------|
 | `<prefix>/.well-known/openid-configuration` | OIDC discovery document, derived from `Issuer` |
 | `<prefix>/authorize` | Authorization endpoint (GET = sign-in form, POST = credential check → 302 to the registered `redirect_uri` with `code` and `state`) |
-| `<prefix>/token` | Token exchange (`authorization_code` grant, `client_secret_post`) |
+| `<prefix>/token` | Token exchange (`authorization_code` with PKCE `S256`, and `refresh_token`; `client_secret_basic` or `client_secret_post`) |
 | `<prefix>/userinfo` | `Authorization: Bearer` — `sub`, `email`, `name` |
 
 Unlike `IDPConfig.JWKSPath` these paths are not configurable. They have no
@@ -2234,12 +2275,59 @@ handler, not a 405 from the router. This is the one place the IdP surface
 differs from the JWKS route, which is `GET` (and `HEAD`) only because the
 reference registers it that way.
 
-**Refusals are plain text.** These endpoints answer with `http.Error` — a
-single-line `text/plain` body carrying the OAuth 2.0 error identifier
-(`invalid_grant`, `invalid_client`, `unsupported_grant_type`, `unknown
-client`, `redirect_uri not allowed`, `unauthorized`) — not the family's JSON
-`{"error":…,"code":…}` envelope every other route in this library returns. They
-are not routes a family client calls; a relying party is on the other end.
+**Refusals.** `authorize` and `userinfo` answer with `http.Error` — a
+single-line `text/plain` body (`unknown client`, `redirect_uri not allowed`,
+`invalid credentials`, `unauthorized`) — not the family's JSON
+`{"error":…,"code":…}` envelope every other route in this library returns.
+`token` answers every refusal with the OAuth error body of RFC 6749 §5.2,
+`{"error":"invalid_grant","error_description":"…"}` with `Content-Type:
+application/json`, `Cache-Control: no-store` and `Pragma: no-cache` (its 200
+carries the same two cache headers), because that is the body a relying
+party's OAuth library parses. None of these is a route a family client calls;
+a relying party is on the other end.
+
+#### The token endpoint: PKCE, client authentication, refresh tokens
+
+These have no counterpart in the reference, whose IdP mode is the JWKS route
+alone; they follow the OAuth and OIDC specifications.
+
+- **Client authentication** is `client_secret_basic` or `client_secret_post`,
+  both advertised in `token_endpoint_auth_methods_supported`. Basic
+  credentials are form-urlencoded before they are base64-encoded (RFC 6749
+  §2.3.1) and are decoded here. A request carrying both methods is `400
+  invalid_request`, as is a `client_id` in the body that names a different
+  client from the Basic one. A wrong secret is `401 invalid_client`, with
+  `WWW-Authenticate: Basic realm="token"` when Basic was tried. Secrets are
+  compared in constant time.
+- **PKCE** is `S256` only (`code_challenge_methods_supported: ["S256"]`).
+  `authorize` answers `plain`, a challenge with no method (RFC 7636 §4.3
+  reads that as `plain`), a method with no challenge, and a challenge that is
+  not a base64url SHA-256 with the RFC 6749 §4.1.2.1 error redirect:
+  `302` to the registered `redirect_uri` with `error=invalid_request`,
+  `error_description` and `state`. A code issued with a challenge is redeemed
+  only with the matching `code_verifier`; a missing or wrong one is `400
+  invalid_grant` and burns the code. A code issued without a challenge is
+  redeemed as before.
+- **Refresh tokens** are issued only when the code was granted
+  `offline_access` (OIDC Core §11), and are opaque. `grant_type=refresh_token`
+  consumes the presented token and returns a new one with a new access token
+  for the same session. A token presented a second time, presented by another
+  client, or presented after its session was revoked or expired is `400
+  invalid_grant` and revokes every token of its grant (RFC 9700 §4.14.2).
+  `scope` may narrow the granted scope and never widen it (`400
+  invalid_scope`); the answer carries the effective `scope`, and an
+  `id_token`, with no `nonce`, while that scope includes `openid`. The
+  narrowing is visible there only: the access token is the session's HS256
+  token and carries no scope claim. A grant lives as long as the session the
+  code opened, `Config.RefreshTokenTTL`, and rotation does not extend it.
+  The state is kept in `IDPConfig.RefreshTokens`, an `IDPRefreshTokenStore`
+  whose doc comment is the implementor's contract (atomic single-use consume,
+  used tokens kept as tombstones until expiry, family revocation that also
+  covers a token saved after it); the default `MemoryIDPRefreshTokenStore`
+  is in-process only. With a session store that implements neither
+  `SessionLookupStore` nor `SessionAdminStore` no refresh token is issued,
+  since the grant could not check the session.
+
 
 **Resource-server mode gates two of them.** `HTTPConfig.ResourceServer`
 unmounts every route that creates or changes a credential, and

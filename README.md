@@ -204,6 +204,47 @@ revision the whole contract was extracted from.
   every refresh token outstanding at that moment, so every session signs in
   again once.
 
+### IdP mode also serves an OAuth 2.0 / OIDC authorization server
+
+`idp-mode-adds-an-oauth-authorization-server`
+
+- **Surface**: `GET <prefix>/.well-known/openid-configuration`,
+  `<prefix>/authorize`, `POST <prefix>/token` and `GET <prefix>/userinfo`,
+  mounted by `auth.WithIDP`.
+- **This port**: Beside the JWKS route, an `Auth` built `WithIDP` serves the
+  four OIDC endpoints of the authorization-code flow. `authorize` accepts PKCE
+  as `S256` only and refuses `plain` with the RFC 6749 §4.1.2.1
+  `invalid_request` redirect. `token` authenticates the client by
+  `client_secret_basic` or `client_secret_post` — never both — verifies the
+  `code_verifier` of a code issued with a challenge, and implements two grants:
+  `authorization_code`, which returns the HS256 session access token and an
+  RS256 `id_token`, plus a `refresh_token` only when the code was granted
+  `offline_access`; and `refresh_token`, which rotates that opaque token on
+  every use and revokes its whole family when a used one comes back, when
+  another client presents it, or when its session has ended. Every `token`
+  refusal is the RFC 6749 §5.2 JSON body (`invalid_request`, `invalid_client`,
+  `invalid_grant`, `invalid_scope`, `unsupported_grant_type`) with
+  `Cache-Control: no-store`; `authorize` and `userinfo` refuse in plain text.
+- **The reference**: Its IdP mode signs RS256 token pairs
+  (`generateIdProviderTokenPair`) and serves the JWKS document, and nothing
+  more: there is no discovery document, no `/authorize`, no `/token` and no
+  `/userinfo`, so no PKCE, no client authentication and no refresh grant to
+  compare against. The same holds at 1.10.8 (auth.router.ts:927-957 there)
+  (`auth.router.ts:473-503`, `token.service.ts:40-44`).
+- **Why**: The port has carried these four endpoints since its first IdP
+  release, and a relying party that finds an authorization server has to be able
+  to rely on it: a PKCE challenge that was recorded and never checked protected
+  nothing, and a client library speaking plain OAuth expects Basic
+  authentication, the §5.2 error body and a refresh grant. None of it reaches a
+  family client, which never calls these routes, and none of it changes the
+  reference's own IdP surface, the JWKS route, which this port reproduces
+  separately. Every rule is the specification's (RFC 6749, RFC 7636, OIDC Core
+  §11 and §12.2, RFC 9700 §4.14.2), because there is no reference behaviour to
+  follow.
+- **What is still open**: Which token pair `token` returns — the HS256 session
+  pair it returns today or the RS256 pair `IssueIdPTokenPair` mints — is
+  decision D-15 of the upstream plan and is not settled by this entry.
+
 ### `link-request` exempts a bearer credential from CSRF
 
 `link-request-exempts-bearer-from-csrf`
@@ -1851,7 +1892,7 @@ release that closes the gap.
 | OAuth login + account linking | ✅ Implemented | Signed state, PKCE, single-use nonce; Google and GitHub presets, `AdditionalAuthParams` and declarative `ProfileMap`/`MapProfile` for generic providers; `OAuthProvisioning` replaces the reference's abstract `findOrCreateUser` (auto-create, domain allowlist, verified-address demand, `FieldMap`), and the account-conflict flow is complete — stash, the reference's `/account-conflict` redirect, then `/link-request` and `/link-verify`. | — |
 | Dynamic email templates + UI i18n fallback | ✅ Implemented | The reference's six template ids with its en/it built-ins, `TemplateStore` overrides rendered under its `{{T.key}}`/`{{key}}` rule, per-request site-URL links and the old-address notice on `/change-email/confirm`. The `welcome` template renders but `POST /register` does not mail it yet (the reference does, `auth.router.ts:719-724`); UI translations are stored and are read by `GET <prefix>/ui/config`, which serves the `config` page for the requested language with the reference's `en` fallback. | — |
 | Custom token claims | ✅ Implemented | `Config.BuildTokenClaims` hook, plus `StaticClaims`/`UserFieldClaims`/`ChainClaims` and the synchronous `ClaimsWebhook` (this port's extension); the hook runs at mint time and on `/me`, never in the middleware. | — |
-| Identity Provider (IdP) mode (RS256 + JWKS + resource-server validation) | ✅ Implemented | **Not yet an enforcing authorization server: PKCE parameters are recorded with the authorization code and never checked at the token endpoint, and which token pair `token` returns is an open design decision (upstream plan D-15).** The reference ships no OIDC authorization server, so those four endpoints are this port's own surface rather than a parity item; what the ✅ claims is the row's legend — mounted on all four adapters and covered by the wire conformance suite. Discovery, authorize, token and userinfo are mounted by all four adapters; the signing key, `kid` and published keys are injectable (`IDPConfig.Signer`, `KeyID`, `PublicKeys`, with `ParseRSAPrivateKeyPEM` for the reference's PEM form), authorization codes go through `AuthCodeStore`, and `IssueIdPTokenPair` mints the reference's RS256 pair. Both halves of the JWKS contract are in: `auth.WithIDP` makes all four adapters serve the document at `<prefix>/.well-known/jwks.json` (`IDPConfig.JWKSPath`) with the reference's `Cache-Control` and CORS headers, with `<base>/jwks` kept as a deprecated alias through the 0.x line and removed in v1.0.0; and on the consuming side `JWKSClient` caches a remote JWKS with stale-while-revalidate, `VerifyRS256` verifies a bearer token against it (RS256 pinned before the key lookup, `kid` rotation retried once and rate-limited, `iss` checked), `ResourceServerMiddleware` is wired on all four adapters — bearer against the JWKS, cookie against the local HS256 secret, neither path reading a store — and `HTTPConfig.ResourceServer` unmounts the credential routes. The four OIDC endpoints are mounted from that same `auth.WithIDP` switch at `<prefix>/.well-known/openid-configuration`, `<prefix>/authorize`, `<prefix>/token` and `<prefix>/userinfo`, every method reaching the handler as `(*IDP).RegisterHandlers` has always mounted them, and the wiretest suite covers all four on all four adapters; `HTTPConfig.ResourceServer` unmounts `<prefix>/authorize` and `<prefix>/token` along with the other credential routes and leaves discovery, userinfo and the JWKS document public. `RegisterHandlers` stays for a host that would rather serve them on a mux of its own; doing both at once puts the same endpoints at two URLs, and on a single `http.ServeMux` that is a mount-time panic rather than a split endpoint — on a chi, gin or echo host the adapter and the `RegisterHandlers` mux are different routers, so there is no panic and the endpoints simply end up served twice. | — |
+| Identity Provider (IdP) mode (RS256 + JWKS + resource-server validation) | ✅ Implemented | The token endpoint verifies PKCE (`S256` only), authenticates clients by `client_secret_basic` or `client_secret_post`, and implements the `refresh_token` grant — an opaque token issued for `offline_access`, rotated on every use, its whole family revoked on reuse, state in `IDPRefreshTokenStore`. **Which token pair `token` returns is still an open design decision (upstream plan D-15).** The reference ships no OIDC authorization server, so those four endpoints are this port's own surface rather than a parity item; what the ✅ claims is the row's legend — mounted on all four adapters and covered by the wire conformance suite. Discovery, authorize, token and userinfo are mounted by all four adapters; the signing key, `kid` and published keys are injectable (`IDPConfig.Signer`, `KeyID`, `PublicKeys`, with `ParseRSAPrivateKeyPEM` for the reference's PEM form), authorization codes go through `AuthCodeStore`, and `IssueIdPTokenPair` mints the reference's RS256 pair. Both halves of the JWKS contract are in: `auth.WithIDP` makes all four adapters serve the document at `<prefix>/.well-known/jwks.json` (`IDPConfig.JWKSPath`) with the reference's `Cache-Control` and CORS headers, with `<base>/jwks` kept as a deprecated alias through the 0.x line and removed in v1.0.0; and on the consuming side `JWKSClient` caches a remote JWKS with stale-while-revalidate, `VerifyRS256` verifies a bearer token against it (RS256 pinned before the key lookup, `kid` rotation retried once and rate-limited, `iss` checked), `ResourceServerMiddleware` is wired on all four adapters — bearer against the JWKS, cookie against the local HS256 secret, neither path reading a store — and `HTTPConfig.ResourceServer` unmounts the credential routes. The four OIDC endpoints are mounted from that same `auth.WithIDP` switch at `<prefix>/.well-known/openid-configuration`, `<prefix>/authorize`, `<prefix>/token` and `<prefix>/userinfo`, every method reaching the handler as `(*IDP).RegisterHandlers` has always mounted them, and the wiretest suite covers all four on all four adapters; `HTTPConfig.ResourceServer` unmounts `<prefix>/authorize` and `<prefix>/token` along with the other credential routes and leaves discovery, userinfo and the JWKS document public. `RegisterHandlers` stays for a host that would rather serve them on a mux of its own; doing both at once puts the same endpoints at two URLs, and on a single `http.ServeMux` that is a mount-time panic rather than a split endpoint — on a chi, gin or echo host the adapter and the `RegisterHandlers` mux are different routers, so there is no panic and the endpoints simply end up served twice. | — |
 | RBAC | ⚠️ Service-level | `RolesPermissionsStore` and service helpers; no HTTP surface (the admin router is absent). | v0.10.0 |
 | Multi-tenancy | ⚠️ Service-level | `TenantStore` and membership helpers; no HTTP surface. | v0.10.0 |
 | API keys (M2M) | ⚠️ Service-level | `APIKeyService` + `APIKeyMiddleware`; no management routes. | v0.10.0 |

@@ -208,6 +208,46 @@ func CompatibilityNotes() APICompatibilityNotes {
 				}},
 			},
 			{
+				ID:    "idp-mode-adds-an-oauth-authorization-server",
+				Title: "IdP mode also serves an OAuth 2.0 / OIDC authorization server",
+				Surface: "`GET <prefix>/.well-known/openid-configuration`, `<prefix>/authorize`, " +
+					"`POST <prefix>/token` and `GET <prefix>/userinfo`, mounted by `auth.WithIDP`",
+				Behaviour: "Beside the JWKS route, an `Auth` built `WithIDP` serves the four OIDC " +
+					"endpoints of the authorization-code flow. `authorize` accepts PKCE as `S256` only " +
+					"and refuses `plain` with the RFC 6749 §4.1.2.1 `invalid_request` redirect. `token` " +
+					"authenticates the client by `client_secret_basic` or `client_secret_post` — never " +
+					"both — verifies the `code_verifier` of a code issued with a challenge, and " +
+					"implements two grants: `authorization_code`, which returns the HS256 session access " +
+					"token and an RS256 `id_token`, plus a `refresh_token` only when the code was granted " +
+					"`offline_access`; and `refresh_token`, which rotates that opaque token on every use " +
+					"and revokes its whole family when a used one comes back, when another client " +
+					"presents it, or when its session has ended. Every `token` refusal is the RFC 6749 " +
+					"§5.2 JSON body (`invalid_request`, `invalid_client`, `invalid_grant`, " +
+					"`invalid_scope`, `unsupported_grant_type`) with `Cache-Control: no-store`; " +
+					"`authorize` and `userinfo` refuse in plain text.",
+				Reference: "Its IdP mode signs RS256 token pairs (`generateIdProviderTokenPair`) and serves " +
+					"the JWKS document, and nothing more: there is no discovery document, no " +
+					"`/authorize`, no `/token` and no `/userinfo`, so no PKCE, no client authentication " +
+					"and no refresh grant to compare against. The same holds at 1.10.8 " +
+					"(auth.router.ts:927-957 there).",
+				Citations: []string{"auth.router.ts:473-503", "token.service.ts:40-44"},
+				Why: "The port has carried these four endpoints since its first IdP release, and a " +
+					"relying party that finds an authorization server has to be able to rely on it: a " +
+					"PKCE challenge that was recorded and never checked protected nothing, and a " +
+					"client library speaking plain OAuth expects Basic authentication, the §5.2 error " +
+					"body and a refresh grant. None of it reaches a family client, which never calls " +
+					"these routes, and none of it changes the reference's own IdP surface, the JWKS " +
+					"route, which this port reproduces separately. Every rule is the specification's " +
+					"(RFC 6749, RFC 7636, OIDC Core §11 and §12.2, RFC 9700 §4.14.2), because there is " +
+					"no reference behaviour to follow.",
+				Notes: []DeviationNote{{
+					Label: "What is still open",
+					Text: "Which token pair `token` returns — the HS256 session pair it returns today or " +
+						"the RS256 pair `IssueIdPTokenPair` mints — is decision D-15 of the upstream plan " +
+						"and is not settled by this entry.",
+				}},
+			},
+			{
 				ID:      "link-request-exempts-bearer-from-csrf",
 				Title:   "`link-request` exempts a bearer credential from CSRF",
 				Surface: "`POST <prefix>/link-request`",
