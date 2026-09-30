@@ -498,6 +498,42 @@ type AuthCodeStore interface {
 	ConsumeCode(ctx context.Context, codeHash string) (AuthCode, error)
 }
 
+// AuthCodeRedemption is what one redeemed authorization code produced, kept so
+// that a second use of the code can undo it (RFC 6749 §4.1.2: the server
+// SHOULD revoke every token previously issued from a code used twice).
+// SessionID is the session the exchange opened; FamilyID, when not empty, is
+// the refresh-token family it started, which lives until FamilyExpiresAt.
+// ExpiresAt is how long the record is kept: the code's own expiry, after which
+// a replay is refused as an expired code in any case.
+type AuthCodeRedemption struct {
+	CodeHash        string
+	SessionID       string
+	UserID          string
+	TenantID        string
+	FamilyID        string
+	FamilyExpiresAt time.Time
+	ExpiresAt       time.Time
+}
+
+// AuthCodeReplayStore is optional on an AuthCodeStore. With it, /token records
+// what each redeemed code produced, and when a code comes back after it was
+// consumed — a replay, the case RFC 6749 §4.1.2 names — it revokes the session
+// and the refresh-token family that code produced, on top of refusing it.
+// Without it a replay is refused and nothing else happens, which is how every
+// AuthCodeStore behaved before.
+//
+// SaveRedemption stores the record under CodeHash until its ExpiresAt.
+// RedemptionOf returns it, or ErrInvalidCode when there is none or it has
+// expired. Neither needs to be atomic with ConsumeCode; there is a window
+// between a successful consume and the save in which a replay finds no
+// record, and a store that closes it (by writing the redemption in the same
+// conditional write that consumes the code) is welcome to.
+// MemoryAuthCodeStore implements it.
+type AuthCodeReplayStore interface {
+	SaveRedemption(ctx context.Context, redemption AuthCodeRedemption) error
+	RedemptionOf(ctx context.Context, codeHash string) (AuthCodeRedemption, error)
+}
+
 // IDPRefreshToken is one refresh token the IDP's token endpoint issued, as the
 // store holds it. TokenHash is hashToken of the value the client was given; the
 // clear-text token is never persisted.
@@ -536,21 +572,41 @@ type IDPRefreshToken struct {
 //     implementation need not detect a collision; it may overwrite.
 //   - ConsumeRefreshToken is atomic, and exactly one call ever returns a nil
 //     error for a given hash, however many run concurrently and on however many
-//     processes: a conditional update from unused to used, not a read followed
-//     by a write. The token is marked used, not deleted.
+//     processes. The token is marked used, not deleted.
 //   - A second ConsumeRefreshToken of a used token returns the record together
 //     with ErrRefreshTokenReused, so the IDP learns the family to revoke. This
 //     is why a used token has to be kept, as a tombstone, until its ExpiresAt.
 //   - An unknown or expired token, and any token of a revoked family, is
 //     absent: ConsumeRefreshToken returns ErrInvalidToken and no record.
+//     "Expired" is decided by the store against ExpiresAt at the time of the
+//     call, not left to a background sweep: a TTL that deletes rows late must
+//     not make an expired token consumable.
 //   - RevokeRefreshTokenFamily is permanent and covers every member of the
 //     family, including one saved after the revocation. Rotation is a consume
 //     followed by a save, and a concurrent replay can revoke the family between
-//     the two; the token saved afterwards must still be refused. A revoked
-//     family can be forgotten once its ExpiresAt has passed, since every member
-//     is expired by then. Revoking an unknown family is not an error.
+//     the two; the token saved afterwards must still be refused. until is the
+//     family's ExpiresAt, after which every member is expired anyway, so the
+//     revocation may be forgotten then (it is the natural TTL of a revocation
+//     marker). Revoking an unknown family is not an error.
 //   - Errors other than the two sentinels are answered by /token as a 500
-//     server_error; the store is not expected to map them.
+//     server_error, and the IDP revokes nothing on them; the store is not
+//     expected to map them.
+//
+// On a store without multi-item atomicity the consume is where this goes
+// wrong. With DynamoDB, say, the natural layout is one item per token (key
+// the hash; attributes the record, a usedAt, and a TTL at ExpiresAt) and one
+// item per revoked family (key the family id; TTL at until). Consume must
+// then be a single TransactWriteItems of two actions: a ConditionCheck that the
+// family item does not exist, and an Update of the token item conditioned on
+// attribute_exists(pk) AND attribute_not_exists(usedAt) AND ExpiresAt > :now
+// that sets usedAt. A transaction cancelled on the token's condition is then
+// read (a consistent GetItem, or ReturnValuesOnConditionCheckFailure: ALL_OLD)
+// to tell a used token — ErrRefreshTokenReused with the record — from an
+// unknown or expired one; one cancelled on the family check is ErrInvalidToken.
+// Reading the family item first and updating the token second is not
+// equivalent: a revocation can land between the two. Save needs no condition
+// beyond what the key gives; the family check at the next consume covers a
+// member saved into a revoked family.
 //
 // MemoryIDPRefreshTokenStore is the in-process implementation and the default.
 // Like MemoryAuthCodeStore it is correct only while every /token request is
@@ -558,7 +614,7 @@ type IDPRefreshToken struct {
 type IDPRefreshTokenStore interface {
 	SaveRefreshToken(ctx context.Context, token IDPRefreshToken) error
 	ConsumeRefreshToken(ctx context.Context, tokenHash string) (IDPRefreshToken, error)
-	RevokeRefreshTokenFamily(ctx context.Context, familyID string) error
+	RevokeRefreshTokenFamily(ctx context.Context, familyID string, until time.Time) error
 }
 
 // TenantStore manages tenants and user memberships.

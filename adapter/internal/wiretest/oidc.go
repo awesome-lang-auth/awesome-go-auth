@@ -333,9 +333,10 @@ func testOIDC(t *testing.T, mount Mounter) {
 		// RegisterHandlers mounts them with a method-less ServeMux pattern, so
 		// the adapters register every method rather than a list of their own
 		// (auth.OIDCMounts). The handlers do the discrimination themselves —
-		// authorize reads r.Method, token reads the form, userinfo reads the
-		// Authorization header — so each method below is answered by the
-		// handler, not by the router.
+		// authorize reads r.Method, token refuses everything but POST (RFC 6749
+		// §3.2) with its own 405 and JSON body, userinfo reads the Authorization
+		// header — so each method below is answered by the handler, not by the
+		// router.
 		env := newOIDCEnv(t, mount)
 		// All four, so that an adapter narrowing any one of them to its
 		// canonical method fails here rather than passing everything else.
@@ -348,7 +349,11 @@ func testOIDC(t *testing.T, mount Mounter) {
 		for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
 			t.Run(method+" token", func(t *testing.T) {
 				req := httptest.NewRequest(method, env.Config.Prefix()+auth.OIDCTokenPath, nil)
-				assertTokenRefusal(t, env.Do(req), http.StatusBadRequest, "unsupported_grant_type")
+				rec := env.Do(req)
+				assertTokenRefusal(t, rec, http.StatusMethodNotAllowed, "invalid_request")
+				if got := rec.Header().Get("Allow"); got != http.MethodPost {
+					t.Errorf("Allow = %q, want POST", got)
+				}
 			})
 		}
 		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {

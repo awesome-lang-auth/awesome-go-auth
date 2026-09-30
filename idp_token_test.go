@@ -15,6 +15,11 @@ import (
 )
 
 var _ IDPRefreshTokenStore = (*MemoryIDPRefreshTokenStore)(nil)
+var _ AuthCodeReplayStore = (*MemoryAuthCodeStore)(nil)
+
+// dropParam, as the value of an extra form pair, removes that parameter from
+// the request the fixture helpers build instead of setting it.
+const dropParam = "(drop)"
 
 // A code_verifier and its S256 code_challenge, the challenge computed
 // independently of this package:
@@ -50,6 +55,11 @@ func assertTokenError(t *testing.T, status int, body map[string]any, header http
 	t.Helper()
 	if status != wantStatus || body["error"] != wantCode {
 		t.Fatalf("POST /token = %d %v, want %d error=%s", status, body, wantStatus, wantCode)
+	}
+	// Every invalid_grant reads the same, whatever the reason, so that the
+	// description is no oracle for the state of someone else's code or token.
+	if wantCode == "invalid_grant" && body["error_description"] != invalidGrantDescription {
+		t.Errorf("invalid_grant description = %q, want the fixed %q", body["error_description"], invalidGrantDescription)
 	}
 	if header != nil && (header.Get("Cache-Control") != "no-store" || header.Get("Pragma") != "no-cache") {
 		t.Errorf("refusal headers Cache-Control=%q Pragma=%q, want no-store / no-cache",
@@ -95,16 +105,24 @@ func TestIDPTokenPKCE(t *testing.T) {
 		status, body := f.token(t, code, idpTestClient)
 		assertTokenError(t, status, body, nil, http.StatusBadRequest, "invalid_grant")
 	})
-	t.Run("no challenge is unchanged", func(t *testing.T) {
+	t.Run("no challenge and no verifier is unchanged", func(t *testing.T) {
 		f := newIDPFixture(t)
 		code := f.authorize(t, idpTestClient, nil)
 		if status, body := f.token(t, code, idpTestClient); status != http.StatusOK {
 			t.Fatalf("POST /token = %d %v, want 200", status, body)
 		}
+	})
+	t.Run("a verifier for a code issued without a challenge is a downgrade", func(t *testing.T) {
+		// RFC 9700 §2.1.1: a client that sends a verifier sent a challenge, so a
+		// code without one had its challenge stripped or was injected.
+		f := newIDPFixture(t)
+		code := f.authorize(t, idpTestClient, nil)
+		status, body := f.token(t, code, idpTestClient, "code_verifier", idpTestVerifier)
+		assertTokenError(t, status, body, nil, http.StatusBadRequest, "invalid_grant")
+		// Even an empty one: the parameter's presence is the signal.
 		code = f.authorize(t, idpTestClient, nil)
-		if status, body := f.token(t, code, idpTestClient, "code_verifier", idpTestVerifier); status != http.StatusOK {
-			t.Fatalf("POST /token with an unneeded verifier = %d %v, want 200", status, body)
-		}
+		status, body = f.token(t, code, idpTestClient, "code_verifier", "")
+		assertTokenError(t, status, body, nil, http.StatusBadRequest, "invalid_grant")
 	})
 	t.Run("a stored record with another method is refused", func(t *testing.T) {
 		// A code saved before /authorize validated the method, or by a store
@@ -179,7 +197,7 @@ func TestIDPAuthorizeRefusesUnsupportedPKCE(t *testing.T) {
 
 func TestIDPTokenClientSecretBasic(t *testing.T) {
 	codeForm := func(code string) url.Values {
-		return url.Values{"grant_type": {"authorization_code"}, "code": {code}}
+		return url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {idpTestClient.RedirectURIs[0]}}
 	}
 
 	t.Run("basic authenticates", func(t *testing.T) {
@@ -281,6 +299,10 @@ func (f *idpFixture) refresh(t *testing.T, token string, client IDPClient, extra
 		"client_secret": {client.ClientSecret},
 	}
 	for i := 0; i+1 < len(extra); i += 2 {
+		if extra[i+1] == dropParam {
+			form.Del(extra[i])
+			continue
+		}
 		form.Set(extra[i], extra[i+1])
 	}
 	return f.postToken(t, form, nil)
@@ -580,7 +602,7 @@ func TestMemoryIDPRefreshTokenStoreContract(t *testing.T) {
 	if err := s.SaveRefreshToken(ctx, sampleRefreshToken("h2", "fam1", time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RevokeRefreshTokenFamily(ctx, "fam1"); err != nil {
+	if err := s.RevokeRefreshTokenFamily(ctx, "fam1", time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SaveRefreshToken(ctx, sampleRefreshToken("h3", "fam1", time.Hour)); err != nil {
@@ -591,7 +613,7 @@ func TestMemoryIDPRefreshTokenStoreContract(t *testing.T) {
 			t.Fatalf("%s of a revoked family = %v, want ErrInvalidToken", h, err)
 		}
 	}
-	if err := s.RevokeRefreshTokenFamily(ctx, "never-seen"); err != nil {
+	if err := s.RevokeRefreshTokenFamily(ctx, "never-seen", time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("revoking an unknown family: %v", err)
 	}
 

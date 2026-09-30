@@ -197,6 +197,16 @@ func (s *recordingAuthCodeStore) ConsumeCode(ctx context.Context, codeHash strin
 	return s.inner.ConsumeCode(ctx, codeHash)
 }
 
+// The replay half delegates too, so the fixture's store is an
+// AuthCodeReplayStore exactly as the default one is.
+func (s *recordingAuthCodeStore) SaveRedemption(ctx context.Context, r AuthCodeRedemption) error {
+	return s.inner.SaveRedemption(ctx, r)
+}
+
+func (s *recordingAuthCodeStore) RedemptionOf(ctx context.Context, codeHash string) (AuthCodeRedemption, error) {
+	return s.inner.RedemptionOf(ctx, codeHash)
+}
+
 func (s *recordingAuthCodeStore) snapshot() ([]AuthCode, []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -314,8 +324,13 @@ func (f *idpFixture) token(t *testing.T, code string, client IDPClient, extra ..
 		"code":          {code},
 		"client_id":     {client.ClientID},
 		"client_secret": {client.ClientSecret},
+		"redirect_uri":  {client.RedirectURIs[0]},
 	}
 	for i := 0; i+1 < len(extra); i += 2 {
+		if extra[i+1] == dropParam {
+			form.Del(extra[i])
+			continue
+		}
 		form.Set(extra[i], extra[i+1])
 	}
 	status, body, _ := f.postToken(t, form, nil)
@@ -853,7 +868,9 @@ func TestNewIDPEphemeralKeyWarnsOnce(t *testing.T) {
 		lines = nil
 	}
 
-	idp, err := NewIDP(IDPConfig{Logger: logger}, nil)
+	// DisableRefreshTokenGrant keeps the in-memory refresh store warning, which
+	// has a test of its own, out of this count.
+	idp, err := NewIDP(IDPConfig{Logger: logger, DisableRefreshTokenGrant: true}, nil)
 	if err != nil {
 		t.Fatalf("NewIDP: %v", err)
 	}
@@ -875,7 +892,7 @@ func TestNewIDPEphemeralKeyWarnsOnce(t *testing.T) {
 		t.Fatalf("NewService: %v", err)
 	}
 	reset()
-	if _, err := NewIDP(IDPConfig{}, svc); err != nil {
+	if _, err := NewIDP(IDPConfig{DisableRefreshTokenGrant: true}, svc); err != nil {
 		t.Fatalf("NewIDP: %v", err)
 	}
 	if got := logged(); len(got) != 1 || got[0] != want {
@@ -884,7 +901,7 @@ func TestNewIDPEphemeralKeyWarnsOnce(t *testing.T) {
 
 	// An injected signer is silence.
 	reset()
-	if _, err := NewIDP(IDPConfig{Signer: idpTestRSAKey(t), Logger: logger}, svc); err != nil {
+	if _, err := NewIDP(IDPConfig{Signer: idpTestRSAKey(t), Logger: logger, DisableRefreshTokenGrant: true}, svc); err != nil {
 		t.Fatalf("NewIDP: %v", err)
 	}
 	if got := logged(); len(got) != 0 {

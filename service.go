@@ -1249,6 +1249,26 @@ func (s *Service) validateSessionForAccess(ctx context.Context, claims tokenClai
 	return s.validateSessionState(session, claims)
 }
 
+// revokeSession marks one session revoked: through SessionAdminStore when the
+// store has it, and otherwise by looking the session up and writing it back
+// with RevokedAt set. It is what the IdP uses to undo a replayed code's
+// exchange.
+func (s *Service) revokeSession(ctx context.Context, sessionID, userID, tenantID string) error {
+	if admin, ok := s.sessions.(SessionAdminStore); ok {
+		return admin.RevokeSessionByID(ctx, sessionID)
+	}
+	session, supported, err := s.lookupSession(ctx, sessionID, userID, tenantID)
+	if !supported {
+		return ErrFeatureNotSupported
+	}
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	session.RevokedAt = &now
+	return s.sessions.UpdateSession(ctx, session)
+}
+
 // canLookupSessions reports whether the session store can find a session by
 // its id, through either of the two optional interfaces lookupSession tries.
 func (s *Service) canLookupSessions() bool {
@@ -1262,8 +1282,10 @@ func (s *Service) canLookupSessions() bool {
 // lookupSession finds session sessionID of user userID in tenant tenantID:
 // through SessionLookupStore when the store has it, and otherwise by listing
 // the user's sessions through SessionAdminStore. supported is false when the
-// store offers neither, and err is ErrSessionNotFound when it offers one and
-// the session is not there. The caller decides what an unsupported store means:
+// store offers neither. err is ErrSessionNotFound when the session is not
+// there — the store answered ErrSessionNotFound itself, or the listing does
+// not contain it — and the store's own error otherwise, so that a caller can
+// tell a session that is gone from a store that failed. The caller decides what an unsupported store means:
 // the all-calls access check lets the token through with a log line, as it
 // always has, and the IdP's refresh_token grant never issues a token it could
 // not check.
@@ -1271,14 +1293,14 @@ func (s *Service) lookupSession(ctx context.Context, sessionID, userID, tenantID
 	if lookup, ok := s.sessions.(SessionLookupStore); ok {
 		session, err := lookup.GetSessionByID(ctx, sessionID)
 		if err != nil {
-			return Session{}, true, ErrSessionNotFound
+			return Session{}, true, err
 		}
 		return session, true, nil
 	}
 	if admin, ok := s.sessions.(SessionAdminStore); ok {
 		sessions, err := admin.ListSessionsForUser(ctx, userID, tenantID)
 		if err != nil {
-			return Session{}, true, ErrSessionNotFound
+			return Session{}, true, err
 		}
 		for _, session := range sessions {
 			if session.ID == sessionID {

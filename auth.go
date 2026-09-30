@@ -92,6 +92,7 @@ func NewWithConfig(cfg Config, opts ...Option) (*Auth, error) {
 			return nil, errors.New("auth: WithIDP: the IDP is already bound to another Service")
 		}
 		b.idp.authSvc = svc
+		b.idp.warnInMemoryRefreshStore()
 	}
 	return &Auth{
 		service:  svc,
