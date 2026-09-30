@@ -9,11 +9,19 @@ import (
 // MCPServer exposes auth configuration as MCP tools for AI editors.
 // It speaks JSON-RPC 2.0 over HTTP and implements the Model Context Protocol
 // tools/list and tools/call methods.
+//
+// Deprecated: MCPServer has no authorization of any kind: auth_create_tenant,
+// auth_create_role, auth_register and auth_login are callable by anyone who
+// reaches the handler. It is a v0.1 addition outside the parity scope (the
+// reference's MCP server is a separate package, and the family has retired it),
+// and it is removed in v1.0.0. Do not mount it.
 type MCPServer struct {
 	authSvc *Service
 }
 
 // NewMCPServer creates an MCP server wrapping an auth service.
+//
+// Deprecated: see [MCPServer]. It has no authorization and is removed in v1.0.0.
 func NewMCPServer(authSvc *Service) *MCPServer {
 	return &MCPServer{authSvc: authSvc}
 }

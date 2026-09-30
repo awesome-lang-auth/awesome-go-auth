@@ -90,7 +90,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("auth init: %v", err)
 	}
-	svc := a.Service()
 
 	// ── 2. Optional event bus integration ─────────────────────────────────
 	bus := auth.NewEventBus()
@@ -201,10 +200,6 @@ func main() {
 			log.Printf("sse stream for %s ended: %v", user.ID, err)
 		}
 	})
-
-	// MCP tool server
-	mcpSrv := auth.NewMCPServer(svc)
-	r.Post("/mcp", mcpSrv.ServeHTTP)
 
 	// A second copy of the document, at the root and under this app's own name.
 	// The mount already serves one at /auth/openapi.json (see Docs.Enabled

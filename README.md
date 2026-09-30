@@ -1845,7 +1845,8 @@ What is left, and where each row of the table above closes:
 | v0.9.0 | the reference's UI assets vendored byte for byte, with SSR and the page catch-all |
 | v0.10.0 | the admin router, all fifty-one routes |
 | v0.11.0 | the event plane, the reference's outbound-webhook wire format, the `SseManager` protocol and the tools router |
-| v1.0.0 | removal of the shims those releases deprecate, and a final documentation truth pass |
+| v0.12.0 | `UserLookupStore`, so the admin user detail finds a user in any tenant; `MCPServer` deprecated |
+| v1.0.0 | removal of the shims those releases deprecate, the unauthenticated `MCPServer`, and a final documentation truth pass |
 
 v0.11.0 carries the breaking removals (`SseHub`, `WebhookDispatcher`, the
 `X-Signature-SHA256` header, the old `TelemetryEvent` shape), which is why they
