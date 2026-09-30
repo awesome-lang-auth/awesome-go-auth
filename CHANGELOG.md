@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Verify a magic link without opening a session (#32):
+  `Service.ConsumeMagicLink` and `Service.CompleteMagicLinkLogin`**, with
+  `Auth` delegates. `ConsumeMagicLink` verifies the link, burns it and answers
+  its owner — no session, no token, no event, no change to the email-verified
+  flag — so a caller can refuse on a predicate of its own (tenant membership, a
+  device binding, a risk score) before anything is in the store.
+  `CompleteMagicLinkLogin` then opens the session and raises
+  `identity.auth.login.success` with `method: "magic-link"`. This is the
+  reference's order: the strategy verifies and clears the link, and the router
+  decides before it reaches `issueTokens` (`magic-link.strategy.ts:36-52`,
+  `auth.router.ts:1741-1747` at v1.10.8). `VerifyMagicLink` and
+  `VerifyMagicLinkForUser` are now built on the two and answer exactly as
+  before, on every route. The email-verified side effect lives in
+  `VerifyMagicLink`, the login wrapper, and is no longer inferred from whether
+  an owner id was passed, which also settles #33.
+
 ### Fixed
 - **`MemoryLinkedAccounts.Save` no longer leaves a stale link behind when it
   re-points a binding (#37).** Saving a `(provider, providerID)` pair that

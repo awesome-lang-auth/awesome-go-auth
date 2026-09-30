@@ -134,8 +134,24 @@ var ErrMagicLinkOwnerMismatch = errors.New("auth: magic link belongs to another 
 // The link is consumed even on a mismatch, matching the reference, which burns
 // it in the strategy before the router compares ids
 // (magic-link.strategy.ts:50 versus auth.router.ts:1150-1152).
+//
+// It never marks the address verified: a second factor is not proof of address
+// ownership, and the reference's 2fa branch has no such call. It is
+// ConsumeMagicLink, the owner comparison, and CompleteMagicLinkLogin — the
+// general split, with the one predicate the routes need built in.
 func (s *Service) VerifyMagicLinkForUser(ctx context.Context, in MagicLinkVerifyInput, userID string) (User, AuthTokens, error) {
-	return s.verifyMagicLink(ctx, in, userID)
+	user, err := s.ConsumeMagicLink(ctx, in)
+	if err != nil {
+		return User{}, AuthTokens{}, err
+	}
+	if user.ID != userID {
+		return User{}, AuthTokens{}, ErrMagicLinkOwnerMismatch
+	}
+	tokens, err := s.CompleteMagicLinkLogin(ctx, user)
+	if err != nil {
+		return User{}, AuthTokens{}, err
+	}
+	return user, tokens, nil
 }
 
 // tokenTypeTemp marks the step-up token.
@@ -469,6 +485,18 @@ func (a *Auth) VerifyMagicLink(ctx context.Context, in MagicLinkVerifyInput) (Us
 // another user is refused before a session exists.
 func (a *Auth) VerifyMagicLinkForUser(ctx context.Context, in MagicLinkVerifyInput, userID string) (User, AuthTokens, error) {
 	return a.service.VerifyMagicLinkForUser(ctx, in, userID)
+}
+
+// ConsumeMagicLink delegates to Service.ConsumeMagicLink: verify and burn the
+// link, issue nothing, so the caller can refuse before a session exists.
+func (a *Auth) ConsumeMagicLink(ctx context.Context, in MagicLinkVerifyInput) (User, error) {
+	return a.service.ConsumeMagicLink(ctx, in)
+}
+
+// CompleteMagicLinkLogin delegates to Service.CompleteMagicLinkLogin: open the
+// session for a user ConsumeMagicLink returned, once the caller has decided to.
+func (a *Auth) CompleteMagicLinkLogin(ctx context.Context, user User) (AuthTokens, error) {
+	return a.service.CompleteMagicLinkLogin(ctx, user)
 }
 
 // SendSMSCode delegates to Service.SendSMSCode.
