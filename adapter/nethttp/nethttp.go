@@ -2,7 +2,6 @@ package nethttp
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 
 	auth "github.com/nik2208/awesome-go-auth"
@@ -272,7 +271,7 @@ type loginRequest struct {
 // Register handles POST <prefix>/register.
 func (a *Adapter) Register(w http.ResponseWriter, r *http.Request) {
 	var req registerRequest
-	if !decodeJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	user, tokens, err := a.auth.Register(r.Context(), auth.RegisterInput{Email: req.Email, Password: req.Password, TenantID: req.TenantID})
@@ -286,7 +285,11 @@ func (a *Adapter) Register(w http.ResponseWriter, r *http.Request) {
 // Login handles POST <prefix>/login.
 func (a *Adapter) Login(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
-	if !decodeJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
+		return
+	}
+	if req.Email == "" || req.Password == "" {
+		auth.WriteHTTPError(w, auth.HTTPErrLoginCredentialsRequired)
 		return
 	}
 	result, err := a.auth.LoginWithChallenge(r.Context(), auth.LoginInput{Email: req.Email, Password: req.Password, TenantID: req.TenantID})
@@ -348,17 +351,4 @@ func (a *Adapter) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auth.WriteJSON(w, http.StatusOK, auth.NewPublicUser(user))
-}
-
-func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	if r.Body == nil {
-		auth.WriteHTTPError(w, auth.HTTPErrInvalidBody)
-		return false
-	}
-	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		auth.WriteHTTPError(w, auth.HTTPErrInvalidBody)
-		return false
-	}
-	return true
 }

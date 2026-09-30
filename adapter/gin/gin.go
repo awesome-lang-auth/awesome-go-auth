@@ -323,8 +323,7 @@ func (ad *Adapter) register(c *gin.Context) {
 		Password string `json:"password"`
 		TenantID string `json:"tenantId"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		auth.WriteHTTPError(c.Writer, auth.HTTPErrInvalidBody)
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
 	user, tokens, err := ad.auth.Register(c.Request.Context(), auth.RegisterInput{Email: req.Email, Password: req.Password, TenantID: req.TenantID})
@@ -341,8 +340,11 @@ func (ad *Adapter) login(c *gin.Context) {
 		Password string `json:"password"`
 		TenantID string `json:"tenantId"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		auth.WriteHTTPError(c.Writer, auth.HTTPErrInvalidBody)
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
+		return
+	}
+	if req.Email == "" || req.Password == "" {
+		auth.WriteHTTPError(c.Writer, auth.HTTPErrLoginCredentialsRequired)
 		return
 	}
 	result, err := ad.auth.LoginWithChallenge(c.Request.Context(), auth.LoginInput{Email: req.Email, Password: req.Password, TenantID: req.TenantID})

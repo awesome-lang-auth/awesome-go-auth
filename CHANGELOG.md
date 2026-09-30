@@ -25,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an owner id was passed, which also settles #33.
 
 ### Fixed
+- **An empty request body is no longer `400 INVALID_BODY` on `/register`,
+  `/login`, `/link-request` and `/link-verify` (#34).** The reference reads
+  `req.body ?? {}` on every route since v1.10.5, so a bodyless request reaches
+  each route's own per-field check. The port now does the same on all four
+  adapters: `/register` answers `400 INVALID_INPUT`, `/link-request`
+  `400 EMAIL_REQUIRED`, `/link-verify` `400 TOKEN_REQUIRED`. The adapters used
+  to disagree, since echo's binder tolerated a zero-length body and the other
+  three did not. Every body-reading auth route now decodes through the one
+  shared `auth.DecodeOptionalJSON`, and the per-adapter step-up helpers are
+  gone. Malformed JSON is still `400 INVALID_BODY` everywhere.
+
+  `/login` also gains the reference's presence check. A body with no email or
+  no password, an empty body included, now answers
+  `400 {"error":"Email and password are required"}` with no code, where it
+  used to answer `401 INVALID_CREDENTIALS` (`auth.router.ts:996-1000` at
+  v1.10.8). The check runs in the route before the service, so it raises no
+  `identity.auth.login.failed` event, as in the reference. `Service.Login`
+  itself is unchanged.
 - **`MemoryLinkedAccounts.Save` no longer leaves a stale link behind when it
   re-points a binding (#37).** Saving a `(provider, providerID)` pair that
   another user held, under a new id, overwrote the pair's lookup but left the
