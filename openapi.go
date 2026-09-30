@@ -420,7 +420,8 @@ func openAPIOIDCPaths() map[string]any {
 					"challenge, or a challenge that is not an unpadded base64url SHA-256 is answered with " +
 					"the RFC 6749 §4.1.2.1 error redirect to the registered `redirect_uri`, carrying " +
 					"`error=invalid_request`, `error_description` and `state`. `offline_access` in `scope` " +
-					"is what makes the token endpoint issue a refresh token. Mounted only when the `Auth` " +
+					"is what makes the token endpoint issue a refresh token. A public client (registered with " +
+					"no secret) must send an `S256` challenge, or it gets the same redirect. Mounted only when the `Auth` " +
 					"was built with `WithIDP`.",
 				"operationId": "oidcAuthorize",
 				"tags":        []string{"IdP"},
@@ -450,26 +451,37 @@ func openAPIOIDCPaths() map[string]any {
 		OIDCTokenPath: map[string]any{
 			"post": map[string]any{
 				"summary": "Token endpoint: redeem an authorization code or a refresh token",
-				"description": "Public, and authenticated by the client's own credentials, by exactly one of " +
-					"the two methods the discovery document advertises: `client_secret_basic` " +
-					"(`Authorization: Basic`, id and secret each form-urlencoded first, RFC 6749 §2.3.1) " +
-					"or `client_secret_post` (`client_id` and `client_secret` in the body). Both at once is " +
-					"`invalid_request`. The body is `application/x-www-form-urlencoded`.\n\n" +
+				"description": "Public, and authenticated by the client's own credentials, by exactly one " +
+					"method: `client_secret_basic` (`Authorization: Basic`, id and secret each " +
+					"form-urlencoded first, RFC 6749 §2.3.1), `client_secret_post` (`client_id` and " +
+					"`client_secret` in the body), or, for a public client registered with no secret, " +
+					"`none` (`client_id` alone; any secret it presents, even an empty one, is refused). Both " +
+					"Basic and `client_secret` at once is `invalid_request`. `POST` only, any other method " +
+					"is `405` with `Allow: POST`; the body is `application/x-www-form-urlencoded`, and a " +
+					"`client_id`, `client_secret`, `code`, `code_verifier` or `refresh_token` in the URL " +
+					"query is `invalid_request` (RFC 6749 §2.3.1, §3.2).\n\n" +
 					"`grant_type=authorization_code` redeems `code`: single use, across processes when " +
-					"`IDPConfig.Codes` is a shared store, and issued to the same client. A code issued with " +
-					"an `S256` `code_challenge` needs the matching `code_verifier` (RFC 7636 §4.6); one " +
-					"issued without needs none. `access_token` is the HS256 session access token and " +
-					"`expires_in` its lifetime, `Config.AccessTokenTTL`; `id_token` is the RS256 ID token, " +
-					"signed with `IDPConfig.Signer` under `KeyID`. `refresh_token` is present only when the " +
-					"code was granted `offline_access` (OIDC Core §11), and it is an opaque token for the " +
-					"grant below, not the session's own.\n\n" +
-					"`grant_type=refresh_token` redeems `refresh_token` for a new access token of the same " +
-					"session and a new refresh token: every token is single use, and one presented again, " +
-					"or by another client, or once the session has ended, revokes every token of its grant. " +
-					"`scope` may narrow the granted scope and not widen it; the answer carries the " +
-					"effective `scope`, and an `id_token` while that scope includes `openid`. The family " +
-					"lives as long as the session, `Config.RefreshTokenTTL`, and rotation does not extend it.\n\n" +
-					"Every answer carries `Cache-Control: no-store` and `Pragma: no-cache`. " +
+					"`IDPConfig.Codes` is a shared store, issued to the same client, and with `redirect_uri` " +
+					"identical to the authorization request's (RFC 6749 §4.1.3). A code issued with an " +
+					"`S256` `code_challenge` needs the matching `code_verifier` (RFC 7636 §4.6); a " +
+					"`code_verifier` sent for a code issued without one is refused as a PKCE downgrade " +
+					"(RFC 9700 §2.1.1). A code presented a second time also revokes the session and refresh " +
+					"tokens it produced when the code store is an `AuthCodeReplayStore` (RFC 6749 §4.1.2). " +
+					"`access_token` is the HS256 session access token and `expires_in` its lifetime, " +
+					"`Config.AccessTokenTTL`; `id_token` is the RS256 ID token, signed with " +
+					"`IDPConfig.Signer` under `KeyID`. `refresh_token` is present only when the code was " +
+					"granted `offline_access` (OIDC Core §11) and the grant is served, and it is an opaque " +
+					"token for the grant below, not the session's own.\n\n" +
+					"`grant_type=refresh_token` — served unless `IDPConfig.DisableRefreshTokenGrant` is set " +
+					"or the session store cannot look sessions up, and advertised in discovery exactly then — " +
+					"redeems `refresh_token` for a new access token of the same session and a new refresh " +
+					"token: every token is single use, and one presented again, or by another client, or " +
+					"once the session has ended, revokes every token of its grant. `scope` may narrow the " +
+					"granted scope and not widen it; the answer carries the effective `scope`, and an " +
+					"`id_token` while that scope includes `openid`. The family lives as long as the session, " +
+					"`Config.RefreshTokenTTL`, and rotation does not extend it.\n\n" +
+					"Every answer carries `Cache-Control: no-store` and `Pragma: no-cache`, and every " +
+					"`invalid_grant` the same `error_description`, whatever the reason. " +
 					"Mounted only when the `Auth` was built with `WithIDP`.",
 				"operationId": "oidcToken",
 				"tags":        []string{"IdP"},
@@ -485,6 +497,7 @@ func openAPIOIDCPaths() map[string]any {
 										"enum": []string{"authorization_code", "refresh_token"}},
 									"code":          str,
 									"code_verifier": str,
+									"redirect_uri":  str,
 									"refresh_token": str,
 									"scope":         str,
 									"client_id":     str,
@@ -507,13 +520,15 @@ func openAPIOIDCPaths() map[string]any {
 						})),
 					},
 					"400": oauthError("`unsupported_grant_type`; `invalid_request` — both client " +
-						"authentication methods at once, a `client_id` that contradicts the Basic one, or no " +
-						"`refresh_token`; `invalid_grant` — a code or refresh token that was never issued, was " +
-						"already used, has expired, belongs to another client, or whose `code_verifier` is " +
-						"missing or wrong, or whose session has ended; `invalid_scope` — a refresh `scope` " +
+						"authentication methods at once, a `client_id` that contradicts the Basic one, a credential " +
+						"or token in the URL query, or no `refresh_token`; `invalid_grant` — a code or refresh " +
+						"token that was never issued, was already used, has expired, belongs to another client, " +
+						"was redeemed with another `redirect_uri`, whose `code_verifier` is missing, wrong or " +
+						"unexpected, or whose session has ended; `invalid_scope` — a refresh `scope` " +
 						"beyond the granted one"),
 					"401": oauthError("`invalid_client`, with `WWW-Authenticate: Basic` when the client " +
 						"tried `client_secret_basic`"),
+					"405": oauthError("`invalid_request` — any method but `POST`; `Allow: POST`"),
 					"500": oauthError("`server_error`"),
 				},
 			},
