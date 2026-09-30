@@ -62,6 +62,12 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 	if cfg.BcryptCost != 0 && cfg.BcryptCost < bcrypt.DefaultCost {
 		svc.logf("auth: bcrypt cost %d is below the default %d; password hashes will be cheaper to crack", cfg.BcryptCost, bcrypt.DefaultCost)
 	}
+	// Both are legal together, and the gate wins (see registerIssuesSession),
+	// so a deployment that expected registration to log people in is told once
+	// why it does not.
+	if cfg.IssueSessionOnRegister && svc.emailVerificationMode() == EmailVerificationModeStrict {
+		svc.logf("auth: IssueSessionOnRegister is on, but EmailVerificationMode is strict: POST /register issues no session for an unverified account; it logs in after verifying the address")
+	}
 	return svc, nil
 }
 
@@ -69,7 +75,8 @@ func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-// Register creates a user and opens a session for them.
+// Register creates a user and, when Config.IssueSessionOnRegister allows it,
+// opens a session for them.
 //
 // The two fields are required, and their absence is refused before any store is
 // touched — the order the default register handler on the private dev line
@@ -90,8 +97,12 @@ func normalizeEmail(email string) string {
 // it can only refuse a request the dev line would have turned into an account
 // with no usable address.
 //
-// A successful call also opens a session, which the published reference does
-// not: see the register-issues-a-session entry in CompatibilityNotes.
+// Whether a successful call also opens a session is the instance's choice,
+// Config.IssueSessionOnRegister — on by default in 0.x, off from v1.0.0 and in
+// the reference — and even when it is on, the account must be one POST /login
+// would log straight in (see registerIssuesSession). When no session is opened
+// the returned AuthTokens is the zero value. See the register-issues-a-session
+// entry in CompatibilityNotes.
 func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTokens, error) {
 	var zeroTokens AuthTokens
 	in.Email = normalizeEmail(in.Email)
@@ -127,18 +138,11 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTok
 	if err != nil {
 		return User{}, zeroTokens, fmt.Errorf("auth: create user: %w", err)
 	}
-
-	tokens, err := s.newSessionTokens(ctx, created)
-	if err != nil {
-		return User{}, zeroTokens, err
-	}
-	// node-auth auth.router.ts:813, the last thing POST /register does before it
-	// answers 201. Publishing here rather than straight after CreateUser keeps
-	// the dev line's rule that only the success path raises: there, anything
-	// that throws between the register handler and the publish leaves the
-	// account created and the event unraised — the welcome mail is the one
-	// candidate — and here the extra session this port opens is (see the
-	// register-issues-a-session deviation).
+	// node-auth auth.router.ts:813: identity.user.created, once the account
+	// exists. It comes before the session, in the order the family's
+	// implementation of the option in awesome-node-auth takes (publishRouterEvent,
+	// then completeLocalLogin): a session that fails to open leaves the account
+	// created and announced, and the error returned.
 	s.publish(ctx, func() Event {
 		return Event{
 			Name:   EventUserCreated,
@@ -146,7 +150,36 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTok
 			Data:   map[string]any{"email": created.Email, "method": registerMethodDefault},
 		}
 	})
+	if !s.registerIssuesSession(created) {
+		return created, zeroTokens, nil
+	}
+	// The login's own tail: the same session row and the same
+	// identity.auth.login.success with method "local" a password login raises.
+	tokens, err := s.completeLocalLogin(ctx, created)
+	if err != nil {
+		return User{}, zeroTokens, err
+	}
 	return created, tokens, nil
+}
+
+// registerIssuesSession reports whether Register opens a session for the
+// account it has just created: Config.IssueSessionOnRegister is on, and
+// POST /login would log this account straight in — its email-verification
+// gate lets it through and no second factor is required of it. The two
+// predicates are loginPassword's own, so the registration can never be more
+// permissive than the login (#21, the family spec's "email verification wins").
+func (s *Service) registerIssuesSession(user User) bool {
+	if !s.cfg.IssueSessionOnRegister {
+		return false
+	}
+	return !s.emailVerificationBlocksLogin(user) && !s.requiresTwoFactor(user)
+}
+
+// emailVerificationBlocksLogin is the login's email-verification gate: an
+// unverified address may log in only under EmailVerificationModeLazy. It is
+// shared by loginPassword and registerIssuesSession so the two cannot drift.
+func (s *Service) emailVerificationBlocksLogin(user User) bool {
+	return !user.IsEmailVerified && s.emailVerificationMode() != EmailVerificationModeLazy
 }
 
 // Login verifies a password and issues a session, reporting a 2FA-gated account

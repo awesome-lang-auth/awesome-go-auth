@@ -141,7 +141,7 @@ func (s *Service) loginPassword(ctx context.Context, in LoginInput) (User, bool,
 			return User{}, false, s.loginFailed(ctx, submitted, err)
 		}
 	}
-	if !user.IsEmailVerified && s.emailVerificationMode() != EmailVerificationModeLazy {
+	if s.emailVerificationBlocksLogin(user) {
 		return User{}, false, s.loginFailed(ctx, submitted, ErrEmailNotVerified)
 	}
 	return user, s.requiresTwoFactor(user), nil

@@ -333,7 +333,7 @@ func (ad *Adapter) register(c *gin.Context) {
 		auth.WriteServiceError(c.Writer, err)
 		return
 	}
-	ad.cfg.WriteTokens(c.Writer, c.Request, http.StatusCreated, tokens, map[string]any{"userId": user.ID})
+	ad.cfg.WriteRegistration(c.Writer, c.Request, user.ID, tokens)
 }
 
 func (ad *Adapter) login(c *gin.Context) {

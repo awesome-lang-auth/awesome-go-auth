@@ -865,6 +865,25 @@ func (c HTTPConfig) WriteTokens(w http.ResponseWriter, r *http.Request, status i
 	WriteJSON(w, status, body)
 }
 
+// WriteRegistration writes the answer to a successful POST <prefix>/register,
+// the one body the four adapters share for it.
+//
+// Without a session — Config.IssueSessionOnRegister off, or an account the
+// login would not let straight in — it is the reference's answer and nothing
+// else: 201 {"success":true,"userId":"…"}, no cookie, no token
+// (auth.router.ts:1259 at v1.10.8). With one, it is the same status and the
+// same two fields plus the session, delivered by WriteTokens exactly as a
+// successful POST <prefix>/login delivers it: the access and refresh cookies in
+// cookie mode, top-level accessToken and refreshToken fields in bearer mode.
+func (c HTTPConfig) WriteRegistration(w http.ResponseWriter, r *http.Request, userID string, tokens AuthTokens) {
+	extra := map[string]any{"userId": userID}
+	if tokens.AccessToken == "" {
+		WriteSuccess(w, http.StatusCreated, extra)
+		return
+	}
+	c.WriteTokens(w, r, http.StatusCreated, tokens, extra)
+}
+
 // LogoutRequest ends the session the caller presents, best effort, and is the
 // single logout revocation path all four adapters call.
 //

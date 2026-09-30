@@ -298,25 +298,8 @@ func TestEmailVerificationModeStrictRefusesExternallyCreatedUnverifiedUser(t *te
 	}
 }
 
-// Register hands out a working session even under strict, so the mode gates
-// Login only. This is a known gap tracked in #21; the test pins today's
-// behaviour on purpose, so that closing the gap means deleting this test rather
-// than wondering whether something broke.
-func TestEmailVerificationModeStrictRegisterStillIssuesUsableTokens(t *testing.T) {
-	svc := testServiceWithEmailVerificationMode(t, EmailVerificationModeStrict)
-	ctx := context.Background()
-
-	_, tokens, err := svc.Register(ctx, RegisterInput{Email: "strict-tokens@example.com", Password: "password1", TenantID: "t1"})
-	if err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	if tokens.AccessToken == "" || tokens.RefreshToken == "" {
-		t.Fatal("register should still return a token pair under strict")
-	}
-	if _, err := svc.Me(ctx, tokens.AccessToken); err != nil {
-		t.Fatalf("access token from register is usable today: %v", err)
-	}
-}
+// The strict-mode register gap this file used to pin (#21) is closed: see
+// TestRegister_StrictVerificationWinsOverTheOption in register_session_test.go.
 
 func TestTOTPFlow(t *testing.T) {
 	svc := testService(t)

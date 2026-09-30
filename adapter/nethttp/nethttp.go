@@ -283,7 +283,7 @@ func (a *Adapter) Register(w http.ResponseWriter, r *http.Request) {
 		auth.WriteServiceError(w, err)
 		return
 	}
-	a.cfg.WriteTokens(w, r, http.StatusCreated, tokens, map[string]any{"userId": user.ID})
+	a.cfg.WriteRegistration(w, r, user.ID, tokens)
 }
 
 // Login handles POST <prefix>/login.

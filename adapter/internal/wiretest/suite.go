@@ -54,6 +54,7 @@ const (
 // Run executes the wire-contract conformance suite against one adapter.
 func Run(t *testing.T, mount Mounter) {
 	t.Run("Register", func(t *testing.T) { testRegister(t, mount) })
+	t.Run("RegisterSession", func(t *testing.T) { testRegisterSession(t, mount) })
 	t.Run("Login", func(t *testing.T) { testLogin(t, mount) })
 	t.Run("Refresh", func(t *testing.T) { testRefresh(t, mount) })
 	t.Run("Logout", func(t *testing.T) { testLogout(t, mount) })

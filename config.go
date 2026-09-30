@@ -59,7 +59,30 @@ type Config struct {
 	EmailVerificationMode string
 	EmailChangeTTL        time.Duration
 	TempTokenTTL          time.Duration
-	Require2FA            bool
+	// IssueSessionOnRegister decides whether POST <prefix>/register — and
+	// Service.Register — also logs the new account in: when true, a successful
+	// registration opens a session exactly as a successful POST <prefix>/login
+	// does (the same cookies in cookie mode, the same accessToken and
+	// refreshToken body fields in bearer mode, the same session row, the same
+	// identity.auth.login.success event); when false, the registration answers
+	// 201 {"success":true,"userId":"…"} and nothing else, and the client logs
+	// in afterwards. It is the family's instance-admin option of that name
+	// (awesome-go-auth #21); the reference's own default is false.
+	//
+	// DefaultConfig sets it to true for every 0.x release, because this port
+	// always opened a session on registration and nothing may change for a
+	// deployment that does not touch it; the default flips to false at v1.0.0.
+	// A Config built without DefaultConfig starts from the zero value, false.
+	//
+	// Even when true, no session is issued to an account POST <prefix>/login
+	// would not log straight in: an unverified address under
+	// EmailVerificationModeStrict (the verification gate wins; NewService logs
+	// once when both are configured), or an account a second factor is
+	// required of (Require2FA, for a new account). The registration then
+	// answers the plain 201 and the account logs in through the login's own
+	// gates. WithIssueSessionOnRegister sets it.
+	IssueSessionOnRegister bool
+	Require2FA             bool
 	// TwoFactorAppName is the issuer an authenticator app files a TOTP
 	// enrolment under: the `issuer` of the otpauth:// URI POST <prefix>/2fa/setup
 	// returns, and the prefix of its label. It is the reference's
@@ -211,6 +234,9 @@ func DefaultConfig(secret string) Config {
 		EmailVerificationMode: EmailVerificationModeNone,
 		EmailChangeTTL:        1 * time.Hour,
 		TempTokenTTL:          5 * time.Minute,
+		// On for 0.x, as this port has always behaved; off from v1.0.0, the
+		// reference's default. See Config.IssueSessionOnRegister.
+		IssueSessionOnRegister: true,
 	}
 }
 
