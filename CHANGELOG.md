@@ -54,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that raises no conflict of its own (`linked-accounts-store.interface.ts:58-63`
   at v1.10.8). The contract is now written on `LinkedAccountStore`, so a host
   store knows it keys on the pair.
+- **Profile names and the phone number are stored as sent (#35).**
+  `Service.UpdateProfile` trimmed `firstName` and `lastName`, and
+  `Service.UpdatePhoneNumber` trimmed the number, so `PATCH /profile` and
+  `POST /add-phone` stored something other than what the client sent. The
+  reference passes both to its store untouched (`auth.router.ts:1214-1215` and
+  `:1229-1234` at v1.10.8), and now so does the port. One consequence is
+  visible: a phone number of only whitespace used to be trimmed to the empty
+  string and so cleared the number; it is now stored as sent, as in the
+  reference, where only `null` clears. A store that wants normalised values
+  normalises them itself.
 
 ## [0.12.0] - 2026-09-30
 
