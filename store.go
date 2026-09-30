@@ -446,10 +446,12 @@ type RoleLister interface {
 // /authorize and /token. CodeHash is hashToken of the value the client was
 // given; the clear-text code is never persisted. RedirectURI is the canonical
 // entry from IDPClient.RedirectURIs that the authorization request matched.
-// CodeChallenge, CodeChallengeMethod and Scope are recorded from the
-// authorization request as plain data: this package does not verify them yet,
-// but carrying them now means a store written today needs no schema change
-// when /token starts to.
+// CodeChallenge and CodeChallengeMethod are the PKCE pair of the
+// authorization request (RFC 7636), which /authorize accepts only as S256 and
+// /token verifies against the code_verifier when a challenge was recorded.
+// Scope is the requested scope, space-separated: offline_access in it is what
+// makes /token issue a refresh token, and the refresh_token grant narrows
+// within it.
 type AuthCode struct {
 	CodeHash            string
 	UserID              string
@@ -494,6 +496,69 @@ type AuthCode struct {
 type AuthCodeStore interface {
 	SaveCode(ctx context.Context, code AuthCode) error
 	ConsumeCode(ctx context.Context, codeHash string) (AuthCode, error)
+}
+
+// IDPRefreshToken is one refresh token the IDP's token endpoint issued, as the
+// store holds it. TokenHash is hashToken of the value the client was given; the
+// clear-text token is never persisted.
+//
+// Every token minted by rotating another shares its FamilyID, ClientID,
+// UserID, TenantID, SessionID, Scope and ExpiresAt, so a family is one grant:
+// one authorization code redeemed with offline_access, and everything rotated
+// from it. SessionID is the session that redemption opened, whose access
+// tokens every refresh mints. Scope is the scope the code was granted, which
+// RFC 6749 §6 keeps on every rotated token even when a refresh request narrows
+// the access token's. ExpiresAt is the family's absolute end — the session's
+// expiry — and rotation never extends it.
+type IDPRefreshToken struct {
+	TokenHash string
+	FamilyID  string
+	ClientID  string
+	UserID    string
+	TenantID  string
+	SessionID string
+	Scope     string
+	ExpiresAt time.Time
+}
+
+// IDPRefreshTokenStore persists the refresh tokens of the IDP's refresh_token
+// grant. It is a separate store from AuthCodeStore and from the SessionStore:
+// the token is opaque, single-use, and rotated on every use, and a family is
+// revoked as a whole when a used token comes back (RFC 6819 §5.2.2.3, RFC 9700
+// §4.14.2).
+//
+// What an implementation must guarantee — the handler relies on each point and
+// checks none of them twice, except the expiry:
+//
+//   - Keyed by hashToken(token), never by the token. A dump of the table must
+//     not be redeemable.
+//   - SaveRefreshToken stores a new, unused token. Hashes are random, so an
+//     implementation need not detect a collision; it may overwrite.
+//   - ConsumeRefreshToken is atomic, and exactly one call ever returns a nil
+//     error for a given hash, however many run concurrently and on however many
+//     processes: a conditional update from unused to used, not a read followed
+//     by a write. The token is marked used, not deleted.
+//   - A second ConsumeRefreshToken of a used token returns the record together
+//     with ErrRefreshTokenReused, so the IDP learns the family to revoke. This
+//     is why a used token has to be kept, as a tombstone, until its ExpiresAt.
+//   - An unknown or expired token, and any token of a revoked family, is
+//     absent: ConsumeRefreshToken returns ErrInvalidToken and no record.
+//   - RevokeRefreshTokenFamily is permanent and covers every member of the
+//     family, including one saved after the revocation. Rotation is a consume
+//     followed by a save, and a concurrent replay can revoke the family between
+//     the two; the token saved afterwards must still be refused. A revoked
+//     family can be forgotten once its ExpiresAt has passed, since every member
+//     is expired by then. Revoking an unknown family is not an error.
+//   - Errors other than the two sentinels are answered by /token as a 500
+//     server_error; the store is not expected to map them.
+//
+// MemoryIDPRefreshTokenStore is the in-process implementation and the default.
+// Like MemoryAuthCodeStore it is correct only while every /token request is
+// served by the same process.
+type IDPRefreshTokenStore interface {
+	SaveRefreshToken(ctx context.Context, token IDPRefreshToken) error
+	ConsumeRefreshToken(ctx context.Context, tokenHash string) (IDPRefreshToken, error)
+	RevokeRefreshTokenFamily(ctx context.Context, familyID string) error
 }
 
 // TenantStore manages tenants and user memberships.

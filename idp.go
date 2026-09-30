@@ -136,6 +136,17 @@ type IDPConfig struct {
 	// minted by a sibling process. See AuthCodeStore for the contract.
 	Codes AuthCodeStore
 
+	// RefreshTokens holds the refresh tokens of the /token endpoint's
+	// refresh_token grant: the opaque, single-use tokens /token issues when a code
+	// was granted the offline_access scope. Nil selects
+	// NewMemoryIDPRefreshTokenStore, which, like the Codes default, is correct
+	// only while every /token request reaches the same process. See
+	// IDPRefreshTokenStore for the contract. These are not the tokens
+	// RefreshTokenTTL above governs: that is the lifetime of the RS256 pair
+	// IssueIdPTokenPair mints, and the grant's family lives as long as the
+	// session the code opened, Config.RefreshTokenTTL.
+	RefreshTokens IDPRefreshTokenStore
+
 	// CodeTTL bounds how long a code issued by /authorize can be redeemed at
 	// /token. Zero (or negative) resolves to defaultAuthCodeTTL, five minutes.
 	CodeTTL time.Duration
@@ -214,7 +225,9 @@ type IDP struct {
 	// code or its record after the handler returns, which is what lets
 	// /authorize and /token run on different processes.
 	codes AuthCodeStore
-	now   func() time.Time
+	// refreshTokens is cfg.RefreshTokens with the nil default resolved.
+	refreshTokens IDPRefreshTokenStore
+	now           func() time.Time
 }
 
 // NewIDP creates a new OIDC IDP backed by the given auth service.
@@ -261,6 +274,10 @@ func NewIDP(cfg IDPConfig, authSvc *Service, clients ...IDPClient) (*IDP, error)
 	idp.codes = cfg.Codes
 	if idp.codes == nil {
 		idp.codes = NewMemoryAuthCodeStore()
+	}
+	idp.refreshTokens = cfg.RefreshTokens
+	if idp.refreshTokens == nil {
+		idp.refreshTokens = NewMemoryIDPRefreshTokenStore()
 	}
 	return idp, nil
 }
@@ -665,8 +682,10 @@ func (idp *IDP) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"RS256"},
-		"scopes_supported":                      []string{"openid", "email", "profile"},
-		"token_endpoint_auth_methods_supported": []string{"client_secret_post"},
+		"scopes_supported":                      []string{"openid", "email", "profile", oidcScopeOfflineAccess},
+		"grant_types_supported":                 []string{grantTypeAuthorizationCode, grantTypeRefreshToken},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
+		"code_challenge_methods_supported":      []string{pkceMethodS256},
 		"claims_supported":                      []string{"sub", "email", "name", "iat", "exp", "iss", "aud", "nonce"},
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -692,6 +711,18 @@ func (idp *IDP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The PKCE parameters are checked before the form is served or the
+	// credentials are, since neither is worth doing for a request whose code
+	// could never be redeemed. The client and the redirect_uri are known good by
+	// now, so the refusal is the authorization error response of RFC 6749
+	// §4.1.2.1 — a redirect back to the client carrying error and state — which
+	// is what RFC 7636 §4.4.1 prescribes for a transformation the server does
+	// not support.
+	if description := pkceAuthorizeError(q.Get("code_challenge"), q.Get("code_challenge_method")); description != "" {
+		redirectAuthorizeError(w, r, canonicalRedirect, state, "invalid_request", description)
+		return
+	}
+
 	if r.Method == http.MethodPost {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -711,8 +742,9 @@ func (idp *IDP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// The client gets the random code; the store gets only its hash, so
-		// a leaked store dump cannot be redeemed at /token. The PKCE and
-		// scope parameters are recorded as data for a later PR to verify.
+		// a leaked store dump cannot be redeemed at /token. The PKCE pair is
+		// what /token verifies the code_verifier against, and the scope is
+		// what decides whether it issues a refresh token.
 		err = idp.codes.SaveCode(r.Context(), AuthCode{
 			CodeHash:            hashToken(code),
 			UserID:              user.ID,
@@ -754,76 +786,6 @@ func (idp *IDP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 <input name="tenant_id" placeholder="Tenant ID" value="">
 <button type="submit">Sign In</button>
 </form></body></html>`)
-}
-
-func (idp *IDP) handleToken(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	grantType := r.FormValue("grant_type")
-	if grantType != "authorization_code" {
-		http.Error(w, "unsupported_grant_type", http.StatusBadRequest)
-		return
-	}
-	code := r.FormValue("code")
-	clientID := r.FormValue("client_id")
-	clientSecret := r.FormValue("client_secret")
-
-	client, ok := idp.clients[clientID]
-	if !ok || client.ClientSecret != clientSecret {
-		http.Error(w, "invalid_client", http.StatusUnauthorized)
-		return
-	}
-
-	// ConsumeCode is destructive: whichever request reaches the store first
-	// gets the record and every later one, on any process, gets ErrInvalidCode.
-	// That is the whole single-use guarantee, so nothing is cached here. The
-	// expiry re-check is belt and braces against a store that does not honour
-	// the "expired is absent" clause of the AuthCodeStore contract.
-	meta, err := idp.codes.ConsumeCode(r.Context(), hashToken(code))
-	if err != nil || idp.now().After(meta.ExpiresAt) {
-		http.Error(w, "invalid_grant", http.StatusBadRequest)
-		return
-	}
-	// RFC 6749 §4.1.3: the code must have been issued to the client now
-	// redeeming it. The map never checked this; the record carries ClientID
-	// precisely so the store can be asked.
-	if meta.ClientID != clientID {
-		http.Error(w, "invalid_grant", http.StatusBadRequest)
-		return
-	}
-
-	user, err := idp.authSvc.users.GetUserByID(r.Context(), meta.UserID, meta.TenantID)
-	if err != nil {
-		http.Error(w, "server_error", http.StatusInternalServerError)
-		return
-	}
-	// The session pair, HS256. Which pair /token returns is decision D-15 of
-	// the upstream plan and is not settled here; IssueIdPTokenPair exists for
-	// a host that wants the RS256 pair now. expires_in below is this pair's
-	// access lifetime, Config.AccessTokenTTL: the lifetime of the token in the
-	// body, not IDPConfig.AccessTokenTTL, which governs only the IdP pair.
-	tokens, err := idp.authSvc.newSessionTokens(r.Context(), user)
-	if err != nil {
-		http.Error(w, "server_error", http.StatusInternalServerError)
-		return
-	}
-
-	idTok, err := idp.buildIDToken(user, clientID, meta.Nonce)
-	if err != nil {
-		http.Error(w, "server_error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-		"access_token":  tokens.AccessToken,
-		"refresh_token": tokens.RefreshToken,
-		"id_token":      idTok,
-		"token_type":    "Bearer",
-		"expires_in":    int(tokens.ExpiresIn.Seconds()),
-	})
 }
 
 func (idp *IDP) handleUserInfo(w http.ResponseWriter, r *http.Request) {
