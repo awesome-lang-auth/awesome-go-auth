@@ -114,6 +114,8 @@ func ResetPasswordHTTPError(err error) HTTPError {
 // in between is not.
 func ChangePasswordHTTPError(err error) HTTPError {
 	switch {
+	case errors.Is(err, ErrNewPasswordRequired):
+		return HTTPErrNewPasswordRequired
 	case errors.Is(err, ErrInvalidCredentials):
 		return HTTPErrCurrentPasswordIncorrect
 	case errors.Is(err, ErrWeakPassword):
@@ -200,11 +202,15 @@ func ChangeEmailConfirmHTTPError(err error) HTTPError {
 	}
 }
 
-// ChangePasswordInlineError reproduces the reference's inline validation on
-// /change-password: an account with no stored password that submits neither
-// field gets 400 "New password is required" (auth.router.ts:922-925). An account
-// that does have a password never reaches it — a missing current password fails
-// the comparison instead.
+// ChangePasswordInlineError reproduces the inline validation /change-password
+// had at awesome-node-auth@cc01e997: an account with no stored password that
+// submits neither field gets 400 "New password is required".
+//
+// Deprecated: Service.ChangePassword now makes this check itself, in the
+// reference's v1.10.8 order — after the user lookup and for every account, not
+// only a passwordless one (auth.router.ts:1471-1479) — and answers it as
+// ErrNewPasswordRequired, which ChangePasswordHTTPError maps to the same 400.
+// The adapters no longer call this.
 func ChangePasswordInlineError(user User, currentPassword, newPassword string) (HTTPError, bool) {
 	if user.PasswordHash == "" && currentPassword == "" && newPassword == "" {
 		return HTTPErrNewPasswordRequired, true
@@ -322,52 +328,14 @@ func (a *Auth) ResetPassword(ctx context.Context, in ResetPasswordInput) error {
 	return a.service.ResetPassword(ctx, in)
 }
 
-// ChangePassword performs POST /change-password.
-//
-// A passwordless account — OAuth-only, or magic-link-only — skips the
-// current-password comparison entirely and may set an initial password by
-// supplying newPassword alone: in the reference the compare sits inside
-// `if (user.password)` and the `else if` only fires when *both* fields are
-// falsy, so such a caller falls through to the hash-and-store (wire-contract §2
-// "Passwordless-account path", auth.router.ts:916-928). It is the only way an
-// account with no password ever acquires one.
-//
-// Service.ChangePassword compares unconditionally (service.go:276), and
-// verifyPassword("", "") is a bcrypt error, so delegating the passwordless case
-// to it reports a password the account does not have as incorrect. The
-// passwordless half is therefore handled here rather than by widening
-// Service.ChangePassword: a library consumer calling the service directly may
-// deliberately not want a caller setting a password without presenting one, and
-// this PR's contract is the HTTP surface. The service-level divergence is filed
-// upstream.
+// ChangePassword performs POST /change-password. It delegates to
+// Service.ChangePassword, which since #30 lets a passwordless account —
+// OAuth-only, or magic-link-only — set its first password without presenting
+// one, as the reference does (auth.router.ts:1480-1489 at v1.10.8). This method
+// used to carry that half itself, and it raised no
+// identity.user.password.changed for it; the service raises it for both.
 func (a *Auth) ChangePassword(ctx context.Context, in ChangePasswordInput) error {
-	s := a.service
-	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
-	if err != nil {
-		// The sentinel Service.ChangePassword returns for an unresolvable user;
-		// ChangePasswordHTTPError turns it into the reference's 401. Unreachable
-		// behind the auth gate, which resolves the same row a moment earlier.
-		return ErrInvalidCredentials
-	}
-	if user.PasswordHash != "" {
-		return s.ChangePassword(ctx, in)
-	}
-	if len(in.NewPassword) < s.cfg.MinPasswordLen {
-		// Port-only policy, exactly as in Service.ChangePassword; the reference
-		// applies none on this route.
-		return ErrWeakPassword
-	}
-	ps, ok := s.users.(UserPasswordStore)
-	if !ok {
-		// 500 "Internal server error", which is what the reference's unguarded
-		// call to a missing updatePassword produces too.
-		return ErrFeatureNotSupported
-	}
-	pwHash, err := hashPassword(in.NewPassword, s.cfg.BcryptCost)
-	if err != nil {
-		return err
-	}
-	return ps.UpdatePassword(ctx, user.ID, user.TenantID, pwHash)
+	return a.service.ChangePassword(ctx, in)
 }
 
 // SendVerificationEmailToken delegates to Service.SendVerificationEmailToken. An

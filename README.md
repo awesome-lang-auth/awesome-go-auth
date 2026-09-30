@@ -197,8 +197,10 @@ revision the whole contract was extracted from.
 - **Surface**: `POST <prefix>/reset-password` and
   `POST <prefix>/change-password`.
 - **This port**: Rejects a new password shorter than `Config.MinPasswordLen`
-  with `400 {"error": "Password is too weak", "code": "WEAK_PASSWORD"}`, checked
-  before the current-password comparison on `/change-password`.
+  with `400 {"error": "Password is too weak", "code": "WEAK_PASSWORD"}`. On
+  `/change-password` it is checked last, after every refusal the reference
+  itself makes there — a missing user, a missing `newPassword`, a missing or
+  wrong current password — so it never outranks one of them.
 - **The reference**: Applies no strength check on either route — the password
   goes straight to `passwordService.hash`. Its own OpenAPI document declares
   `minLength: 8` on both bodies and nothing enforces it
@@ -207,8 +209,7 @@ revision the whole contract was extracted from.
   reached with a mailed token, which silently undoes whatever policy the host
   applied at registration. `WEAK_PASSWORD` has no reference counterpart, so a
   client that does not know the code still sees a `400` it must show the user
-  either way. The check order differs too: the reference would report a wrong
-  current password first.
+  either way.
 
 ### `2fa/setup` omits the QR code
 

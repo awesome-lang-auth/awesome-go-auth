@@ -91,10 +91,6 @@ func (ad *Adapter) changePassword(c *gin.Context) {
 	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
-	if httpErr, invalid := auth.ChangePasswordInlineError(user, req.CurrentPassword, req.NewPassword); invalid {
-		auth.WriteHTTPError(c.Writer, httpErr)
-		return
-	}
 	in := auth.ChangePasswordInput{
 		UserID:          user.ID,
 		TenantID:        user.TenantID,

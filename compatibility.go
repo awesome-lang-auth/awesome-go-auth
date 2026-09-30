@@ -200,8 +200,10 @@ func CompatibilityNotes() APICompatibilityNotes {
 				Title:   "A password policy on `reset-password` and `change-password`",
 				Surface: "`POST <prefix>/reset-password` and `POST <prefix>/change-password`",
 				Behaviour: "Rejects a new password shorter than `Config.MinPasswordLen` with " +
-					"`400 {\"error\": \"Password is too weak\", \"code\": \"WEAK_PASSWORD\"}`, checked " +
-					"before the current-password comparison on `/change-password`.",
+					"`400 {\"error\": \"Password is too weak\", \"code\": \"WEAK_PASSWORD\"}`. On " +
+					"`/change-password` it is checked last, after every refusal the reference " +
+					"itself makes there — a missing user, a missing `newPassword`, a missing or " +
+					"wrong current password — so it never outranks one of them.",
 				Reference: "Applies no strength check on either route — the password goes " +
 					"straight to `passwordService.hash`. Its own OpenAPI document declares " +
 					"`minLength: 8` on both bodies and nothing enforces it.",
@@ -210,8 +212,7 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"reached with a mailed token, which silently undoes whatever policy the host " +
 					"applied at registration. `WEAK_PASSWORD` has no reference counterpart, so a " +
 					"client that does not know the code still sees a `400` it must show the user " +
-					"either way. The check order differs too: the reference would report a wrong " +
-					"current password first.",
+					"either way.",
 			},
 			{
 				ID:        "totp-setup-omits-qrcode",
