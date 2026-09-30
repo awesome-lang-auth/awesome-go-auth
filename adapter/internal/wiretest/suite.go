@@ -56,6 +56,7 @@ func Run(t *testing.T, mount Mounter) {
 	t.Run("Register", func(t *testing.T) { testRegister(t, mount) })
 	t.Run("Login", func(t *testing.T) { testLogin(t, mount) })
 	t.Run("Refresh", func(t *testing.T) { testRefresh(t, mount) })
+	t.Run("RefreshSecret", func(t *testing.T) { testRefreshSecret(t, mount) })
 	t.Run("Logout", func(t *testing.T) { testLogout(t, mount) })
 	t.Run("Me", func(t *testing.T) { testMe(t, mount) })
 	t.Run("Claims", func(t *testing.T) { testClaims(t, mount) })

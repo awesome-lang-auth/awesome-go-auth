@@ -171,6 +171,39 @@ revision the whole contract was extracted from.
   `tempToken` in a `2FA_SETUP_REQUIRED` answer cannot reach the enrolment
   routes, which sit behind the access-token gate.
 
+### The refresh-token secret is optional and may equal the access-token secret
+
+`refresh-secret-falls-back-to-secret`
+
+- **Surface**: `auth.Config.RefreshSecret` / `auth.WithRefreshSecret`, and every
+  refresh token `POST <prefix>/login`, `POST <prefix>/register` and
+  `POST <prefix>/refresh` mint.
+- **This port**: Signs and verifies refresh tokens with `Config.RefreshSecret`
+  when it is set, and with `Config.Secret` — the access-token secret — when it
+  is empty, which is the default. Construction succeeds whether the two are
+  different, equal, or the refresh one is unset, with or without a session
+  store. When they coincide the refresh token is still refused as an access
+  credential, by its `typ` claim.
+- **The reference**: `refreshTokenSecret` is a required member of `AuthConfig`,
+  separate from `accessTokenSecret`, and signs and verifies every refresh token.
+  Since 1.10.3 the router also refuses to be constructed when
+  `refreshTokenSecret === accessTokenSecret` and a session store is configured,
+  throwing
+  `refreshTokenSecret must differ from accessTokenSecret when a sessionStore is configured`
+  (auth.router.ts:843-844 at 1.10.8) (`auth-config.model.ts:147-148`,
+  `token.service.ts:25-29`, `token.service.ts:154`).
+- **Why**: Until `RefreshSecret` existed this port signed both tokens with
+  `Config.Secret`, so every deployment running it today has the two secrets
+  equal and a session store configured. The reference's refusal would stop every
+  one of them from starting on an upgrade within `0.x`. The fallback keeps them
+  running unchanged, while a deployment that sets `RefreshSecret` gets the
+  reference's separation of the two trust domains. The refusal is planned for
+  v1.0.0, where a breaking change of configuration belongs.
+- **Matching the reference exactly**: Set `WithRefreshSecret` to a value
+  different from `WithSecret`'s. Doing so on a running deployment invalidates
+  every refresh token outstanding at that moment, so every session signs in
+  again once.
+
 ### `link-request` exempts a bearer credential from CSRF
 
 `link-request-exempts-bearer-from-csrf`
@@ -1152,10 +1185,11 @@ revision the whole contract was extracted from.
   token is signed with `config.refreshTokenSecret` there
   (token.service.ts:25-29) and is therefore a second admin credential only in a
   deployment that sets both secrets to one value — where it is one for seven
-  days rather than five minutes. This port has a single Config.Secret, so
-  refusing it here is not hypothetical. A payload carrying `isRoot: true`
-  short-circuits the user-store lookup and the policy together, whatever minted
-  it (`admin.router.ts:76-79`, `admin.router.ts:300`, `admin.router.ts:343-352`,
+  days rather than five minutes. This port signs both with Config.Secret unless
+  `Config.RefreshSecret` is set, and leaves it unset by default, so refusing it
+  here is not hypothetical. A payload carrying `isRoot: true` short-circuits the
+  user-store lookup and the policy together, whatever minted it
+  (`admin.router.ts:76-79`, `admin.router.ts:300`, `admin.router.ts:343-352`,
   `admin.router.ts:585`).
 - **Why**: This port already types its tokens and already refuses an untyped
   one: `typ` is a reserved claim `issueToken` writes after the

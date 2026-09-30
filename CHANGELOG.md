@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Config.RefreshSecret` and `WithRefreshSecret` — a signing key of its own
+  for refresh tokens** (#25). It is the reference's `refreshTokenSecret`
+  (`auth-config.model.ts:148`, `token.service.ts:25-29`): set, it signs and
+  verifies every refresh token, while access tokens and the 2FA step-up token
+  stay on `Config.Secret`. A component holding the access secret can then no
+  longer mint refresh tokens, and rotating the refresh secret alone signs every
+  session out while access tokens already issued run to their expiry. Empty
+  means `Config.Secret`, which is how refresh tokens were signed until now, so
+  a deployment that does not set it sees no change. Setting it on a running
+  deployment invalidates every outstanding refresh token once. Recorded as the
+  `refresh-secret-falls-back-to-secret` deviation.
+
+  **Planned for v1.0.0:** node 1.10.3 refuses to construct its router when
+  `refreshTokenSecret === accessTokenSecret` and a session store is configured
+  (`auth.router.ts:843-844` at 1.10.8). This release does not, because every
+  deployment that predates `RefreshSecret` has the two equal; v1.0.0 will refuse
+  it, so a deployment should set `WithRefreshSecret` to a distinct value before
+  upgrading to it.
+
 ## [0.12.0] - 2026-09-30
 
 The admin user detail across tenants, and the deprecation of the one exported

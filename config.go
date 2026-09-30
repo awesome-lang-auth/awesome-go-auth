@@ -35,7 +35,31 @@ const (
 
 // Config contains security and token settings for the auth service.
 type Config struct {
-	Secret          string
+	// Secret is the HS256 key of the access token and of the 2FA step-up
+	// token: the reference's accessTokenSecret (auth-config.model.ts:147), with
+	// which it signs both (token.service.ts:20-24). It is also the key of every
+	// refresh token while RefreshSecret is empty. At least 32 characters.
+	Secret string
+	// RefreshSecret is the HS256 key of the refresh token: the reference's
+	// refreshTokenSecret (auth-config.model.ts:148, token.service.ts:25-29 and
+	// :154). Keeping it apart from Secret separates the two trust domains the
+	// reference keeps apart: a component given Secret to verify access tokens
+	// can no longer mint refresh tokens, and rotating RefreshSecret alone forces
+	// every session to sign in again while access tokens already handed out run
+	// to their expiry.
+	//
+	// Empty means unset, and unset means Secret, which is how every refresh
+	// token was signed before this field existed; so a deployment that never
+	// sets it sees no change. Setting it on a running deployment is that
+	// rotation: every refresh token outstanding at that moment stops verifying.
+	// When set it must be at least 32 characters, as Secret must.
+	//
+	// The reference, since 1.10.3, refuses to construct its router when the two
+	// secrets are equal and a session store is configured (auth.router.ts:843-844
+	// at 1.10.8). This port does not refuse it yet, because the fallback makes
+	// the two equal in every deployment that predates this field; that refusal
+	// is planned for v1.0.0. WithRefreshSecret sets it.
+	RefreshSecret   string
 	Issuer          string
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
@@ -224,9 +248,24 @@ func (c Config) totpIssuer() string {
 	return c.Issuer
 }
 
+// secretFor is the HS256 key a token of tokenType is signed and verified with:
+// RefreshSecret for a refresh token when it is set, Secret for everything else
+// and for a refresh token when it is not. The step-up token stays on Secret
+// because the reference's is an access token (generateTokenPair(...).accessToken,
+// signed with accessTokenSecret).
+func (c Config) secretFor(tokenType string) string {
+	if tokenType == "refresh" && c.RefreshSecret != "" {
+		return c.RefreshSecret
+	}
+	return c.Secret
+}
+
 func (c Config) validate() error {
 	if len(c.Secret) < 32 {
 		return errors.New("auth: secret must be at least 32 chars")
+	}
+	if c.RefreshSecret != "" && len(c.RefreshSecret) < 32 {
+		return errors.New("auth: refresh secret must be at least 32 chars, or empty to use the secret")
 	}
 	if c.AccessTokenTTL <= 0 {
 		return errors.New("auth: access token ttl must be > 0")

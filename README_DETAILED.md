@@ -171,7 +171,8 @@ lands the behaviour changes and the entry is retired.
 
 ```go
 type Config struct {
-    Secret                string                        // HMAC secret (min 32 bytes)
+    Secret                string                        // HMAC secret of access and step-up tokens (min 32 bytes)
+    RefreshSecret         string                        // HMAC secret of refresh tokens (min 32 bytes); empty = Secret
     Issuer                string
     AccessTokenTTL        time.Duration                 // default: 15m
     RefreshTokenTTL       time.Duration                 // default: 7d
@@ -623,7 +624,8 @@ Pass to `auth.New(...)`:
 
 | Option | Description |
 |--------|-------------|
-| `WithSecret(s string)` | JWT signing secret (min 32 bytes) |
+| `WithSecret(s string)` | JWT signing secret (min 32 bytes); also signs refresh tokens unless `WithRefreshSecret` is given |
+| `WithRefreshSecret(s string)` | Separate signing secret for refresh tokens, the reference's `refreshTokenSecret` (min 32 bytes). Omitted, refresh tokens are signed with `WithSecret`'s; setting or changing it invalidates every outstanding refresh token |
 | `WithIssuer(s string)` | Token issuer claim |
 | `WithTokenTTLs(access, refresh time.Duration)` | Token lifetimes |
 | `WithUserStore(UserStore)` | Custom user store |
@@ -2474,8 +2476,9 @@ Two consequences, both the reference's:
 The signature, the `HS256` allow-list, `iss`, `typ` and `exp` are all still
 checked, so a refresh token, a token signed with another secret and a tampered
 token are refused. (`typ` is checked where the reference relies on a second
-secret: it signs refresh tokens with `refreshTokenSecret`, this port signs both
-with `Config.Secret` and tells them apart by `typ`.)
+secret: it signs refresh tokens with `refreshTokenSecret`; this port does too
+when `Config.RefreshSecret` is set, and otherwise signs both with
+`Config.Secret` and tells them apart by `typ` alone.)
 
 **Which credential is used is decided by the header prefix**, not by what
 follows it, exactly as the reference decides it (`startsWith('Bearer ')`,
