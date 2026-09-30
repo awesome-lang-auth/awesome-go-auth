@@ -3313,12 +3313,13 @@ has `Config()`, which returns the resolved `HTTPConfig`, and the methods
 
 Only `nethttp.Adapter` exports the individual route handlers (`Register`,
 `Login`, `Refresh`, `Logout`, `Me`, `ForgotPassword`, `MagicLinkSend`,
-`TwoFactorSetup`, `Sessions`, … and the `…Handler()` constructors). The gin and
-echo adapters keep theirs unexported. These are the bare handlers. `Mount` wraps
-each route in the event-context carrier, the rate-limiter slot and the CSRF
-middleware, and adds the access-token middleware where the route needs it. A
-handler mounted by hand gets none of these, so `Mount` is the supported way to
-serve the routes.
+`TwoFactorSetup`, `Sessions`, …) and the `…Handler()` constructors
+(`OAuthAuthorizeHandler`, `UIHandler`, `AdminHandler`, …). The gin and echo
+adapters keep theirs unexported. The handler methods are bare. `Mount` wraps
+each of their routes in the event-context carrier, the rate-limiter slot and
+the CSRF middleware, and adds the access-token middleware where the route needs
+it. A handler method mounted by hand gets none of these, so `Mount` is the
+supported way to serve the routes.
 
 ### `HTTPConfig.RateLimiter` — the rate-limiter slot
 
