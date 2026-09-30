@@ -335,10 +335,11 @@ func openAPIPathsFor(info OpenAPIInfo) map[string]any {
 //
 // The endpoints have no counterpart in the reference, which ships no OIDC
 // authorization server, so nothing here is cited: it describes what idp.go's
-// handlers do. That includes the unhappy paths, which are the standard
-// library's http.Error — a plain-text line, not the family's JSON error
-// envelope — and are documented as the text/plain bodies they are rather than
-// as the envelope every other route in this document returns.
+// handlers do. That includes the unhappy paths. Those of authorize and
+// userinfo are the standard library's http.Error — a plain-text line, not the
+// family's JSON error envelope — and are documented as the text/plain bodies
+// they are. Those of the token endpoint are the OAuth error body of RFC 6749
+// §5.2, and are documented as that.
 func openAPIOIDCPaths() map[string]any {
 	jsonContent := func(s map[string]any) map[string]any {
 		return map[string]any{"application/json": map[string]any{"schema": s}}
@@ -358,6 +359,20 @@ func openAPIOIDCPaths() map[string]any {
 	}
 	str := map[string]any{"type": "string"}
 	strs := map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+	// oauthError is one refusal of the token endpoint: the RFC 6749 §5.2 body.
+	oauthError := func(description string) map[string]any {
+		return map[string]any{
+			"description": description,
+			"content": jsonContent(map[string]any{
+				"type":     "object",
+				"required": []string{"error"},
+				"properties": map[string]any{
+					"error":             str,
+					"error_description": str,
+				},
+			}),
+		}
+	}
 
 	return map[string]any{
 		OIDCDiscoveryPath: map[string]any{
@@ -382,7 +397,9 @@ func openAPIOIDCPaths() map[string]any {
 							"subject_types_supported":               strs,
 							"id_token_signing_alg_values_supported": strs,
 							"scopes_supported":                      strs,
+							"grant_types_supported":                 strs,
 							"token_endpoint_auth_methods_supported": strs,
+							"code_challenge_methods_supported":      strs,
 							"claims_supported":                      strs,
 						})),
 					},
@@ -398,8 +415,13 @@ func openAPIOIDCPaths() map[string]any {
 					"`code` and the echoed `state`. Both refuse an unregistered `client_id` and a " +
 					"`redirect_uri` that is not exactly one of that client's registered URIs. `code`, " +
 					"`state`, `nonce`, `scope`, `code_challenge` and `code_challenge_method` are " +
-					"recorded with the authorization code; the PKCE pair is stored and not yet verified " +
-					"at the token endpoint. Mounted only when the `Auth` was built with `WithIDP`.",
+					"recorded with the authorization code. PKCE is `S256` only: a `plain` method, a " +
+					"challenge without a method (RFC 7636 §4.3 reads that as `plain`), a method without a " +
+					"challenge, or a challenge that is not an unpadded base64url SHA-256 is answered with " +
+					"the RFC 6749 §4.1.2.1 error redirect to the registered `redirect_uri`, carrying " +
+					"`error=invalid_request`, `error_description` and `state`. `offline_access` in `scope` " +
+					"is what makes the token endpoint issue a refresh token. Mounted only when the `Auth` " +
+					"was built with `WithIDP`.",
 				"operationId": "oidcAuthorize",
 				"tags":        []string{"IdP"},
 				"parameters": []map[string]any{
@@ -418,22 +440,36 @@ func openAPIOIDCPaths() map[string]any {
 							"text/html": map[string]any{"schema": map[string]any{"type": "string"}},
 						},
 					},
+					"302": map[string]any{"description": "`POST`: to the registered `redirect_uri` with `code` and `state`. " +
+						"`GET` or `POST` with unsupported PKCE parameters: to the same URI with `error=invalid_request`, " +
+						"`error_description` and `state`."},
 					"400": text("`unknown client`, or `redirect_uri not allowed`"),
 				},
 			},
 		},
 		OIDCTokenPath: map[string]any{
 			"post": map[string]any{
-				"summary": "Token endpoint: redeem an authorization code",
-				"description": "Public, and authenticated by the client's own credentials: " +
-					"`client_secret_post`, the one method the discovery document advertises. The body " +
-					"is `application/x-www-form-urlencoded` with `grant_type=authorization_code`, " +
-					"`code`, `client_id` and `client_secret`. The code is consumed — single use, " +
-					"across processes when `IDPConfig.Codes` is a shared store — and must have been " +
-					"issued to the same `client_id`. `access_token` and `refresh_token` are the HS256 " +
-					"session pair and `expires_in` is that access token's lifetime, " +
-					"`Config.AccessTokenTTL`; `id_token` is the RS256 ID token, signed with " +
-					"`IDPConfig.Signer` under `KeyID` and verifiable against the JWKS document. " +
+				"summary": "Token endpoint: redeem an authorization code or a refresh token",
+				"description": "Public, and authenticated by the client's own credentials, by exactly one of " +
+					"the two methods the discovery document advertises: `client_secret_basic` " +
+					"(`Authorization: Basic`, id and secret each form-urlencoded first, RFC 6749 §2.3.1) " +
+					"or `client_secret_post` (`client_id` and `client_secret` in the body). Both at once is " +
+					"`invalid_request`. The body is `application/x-www-form-urlencoded`.\n\n" +
+					"`grant_type=authorization_code` redeems `code`: single use, across processes when " +
+					"`IDPConfig.Codes` is a shared store, and issued to the same client. A code issued with " +
+					"an `S256` `code_challenge` needs the matching `code_verifier` (RFC 7636 §4.6); one " +
+					"issued without needs none. `access_token` is the HS256 session access token and " +
+					"`expires_in` its lifetime, `Config.AccessTokenTTL`; `id_token` is the RS256 ID token, " +
+					"signed with `IDPConfig.Signer` under `KeyID`. `refresh_token` is present only when the " +
+					"code was granted `offline_access` (OIDC Core §11), and it is an opaque token for the " +
+					"grant below, not the session's own.\n\n" +
+					"`grant_type=refresh_token` redeems `refresh_token` for a new access token of the same " +
+					"session and a new refresh token: every token is single use, and one presented again, " +
+					"or by another client, or once the session has ended, revokes every token of its grant. " +
+					"`scope` may narrow the granted scope and not widen it; the answer carries the " +
+					"effective `scope`, and an `id_token` while that scope includes `openid`. The family " +
+					"lives as long as the session, `Config.RefreshTokenTTL`, and rotation does not extend it.\n\n" +
+					"Every answer carries `Cache-Control: no-store` and `Pragma: no-cache`. " +
 					"Mounted only when the `Auth` was built with `WithIDP`.",
 				"operationId": "oidcToken",
 				"tags":        []string{"IdP"},
@@ -443,10 +479,14 @@ func openAPIOIDCPaths() map[string]any {
 						"application/x-www-form-urlencoded": map[string]any{
 							"schema": map[string]any{
 								"type":     "object",
-								"required": []string{"grant_type", "code", "client_id", "client_secret"},
+								"required": []string{"grant_type"},
 								"properties": map[string]any{
-									"grant_type":    map[string]any{"type": "string", "enum": []string{"authorization_code"}},
+									"grant_type": map[string]any{"type": "string",
+										"enum": []string{"authorization_code", "refresh_token"}},
 									"code":          str,
+									"code_verifier": str,
+									"refresh_token": str,
+									"scope":         str,
 									"client_id":     str,
 									"client_secret": str,
 								},
@@ -463,12 +503,18 @@ func openAPIOIDCPaths() map[string]any {
 							"id_token":      str,
 							"token_type":    map[string]any{"type": "string", "enum": []string{"Bearer"}},
 							"expires_in":    map[string]any{"type": "integer"},
+							"scope":         str,
 						})),
 					},
-					"400": text("`unsupported_grant_type`, or `invalid_grant` — a code that was never " +
-						"issued, was already redeemed, has expired, or belongs to another client"),
-					"401": text("`invalid_client`"),
-					"500": text("`server_error`"),
+					"400": oauthError("`unsupported_grant_type`; `invalid_request` — both client " +
+						"authentication methods at once, a `client_id` that contradicts the Basic one, or no " +
+						"`refresh_token`; `invalid_grant` — a code or refresh token that was never issued, was " +
+						"already used, has expired, belongs to another client, or whose `code_verifier` is " +
+						"missing or wrong, or whose session has ended; `invalid_scope` — a refresh `scope` " +
+						"beyond the granted one"),
+					"401": oauthError("`invalid_client`, with `WWW-Authenticate: Basic` when the client " +
+						"tried `client_secret_basic`"),
+					"500": oauthError("`server_error`"),
 				},
 			},
 		},
