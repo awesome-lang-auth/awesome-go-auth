@@ -24,6 +24,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VerifyMagicLink`, the login wrapper, and is no longer inferred from whether
   an owner id was passed, which also settles #33.
 
+### Changed
+- **`Service.ChangePassword` lets an account with no password set one (#30).**
+  An OAuth-only or magic-link-only account used to get
+  `ErrInvalidCredentials` from the service whatever it sent, because the
+  current password was compared unconditionally. The service now follows the
+  reference's `/change-password` (`auth.router.ts:1465-1500` at v1.10.8): the
+  comparison runs only when the account has a password, and an account
+  without one sets its first password with `NewPassword` alone. An account
+  that has a password keeps the check, and an absent current password is
+  refused like a wrong one. `(*Auth).ChangePassword`, which used to carry the
+  passwordless half for the HTTP route only, is now a plain delegate, and the
+  passwordless path now raises `identity.user.password.changed` as the
+  reference does.
+
+  **Security consequence, the reference's own:** whoever holds a valid access
+  token of a passwordless account can now give that account a password
+  through the service, as they already could through the HTTP route. An
+  embedder that calls `Service.ChangePassword` directly and wants a stronger
+  proof for that case has to ask for it before the call.
+
+  The route also takes the reference's v1.10.8 order: an absent `newPassword`
+  is `400 {"error":"New password is required"}` for every account, before the
+  current password is looked at (the service returns the new
+  `ErrNewPasswordRequired`). An account with a password used to get the
+  port-only `400 WEAK_PASSWORD` there, or `401` with a wrong current password.
+  The port's password policy now runs last, so a wrong current password is
+  `401` even when the new one is too short.
+
+### Deprecated
+- **`ChangePasswordInlineError` (#30).** `Service.ChangePassword` makes the
+  check itself now, for every account and in the reference's order, and the
+  adapters no longer call it.
+
 ### Fixed
 - **An empty request body is no longer `400 INVALID_BODY` on `/register`,
   `/login`, `/link-request` and `/link-verify` (#34).** The reference reads

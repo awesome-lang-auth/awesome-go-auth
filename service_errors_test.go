@@ -362,6 +362,74 @@ func TestChangePassword_UserNotFound(t *testing.T) {
 	}
 }
 
+// #30: the service itself lets an account with no password set its first one
+// without presenting a current password, as the reference's /change-password
+// does (auth.router.ts:1480-1489 at v1.10.8), and raises the same event it
+// raises for a change. A current password the account does not have is
+// ignored, not compared.
+func TestChangePassword_PasswordlessAccountSetsItsFirstPassword(t *testing.T) {
+	for _, current := range []string{"", "not-a-password"} {
+		t.Run("currentPassword "+current, func(t *testing.T) {
+			cfg := testConfig("errtest12345678901234567890123456")
+			bus := NewEventBus()
+			cfg.Events = bus
+			var changed []string
+			bus.Subscribe(EventUserPasswordChanged, func(e Event) { changed = append(changed, e.UserID) })
+			store := NewMemoryUserStore()
+			svc, err := NewService(cfg, store, NewMemorySessionStore())
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			ctx := context.Background()
+			user, _ := registerUser(t, svc, "passwordless@example.com", "t1")
+			if err := store.UpdatePassword(ctx, user.ID, "t1", ""); err != nil {
+				t.Fatalf("drop password: %v", err)
+			}
+
+			if err := svc.ChangePassword(ctx, ChangePasswordInput{
+				UserID: user.ID, TenantID: "t1", CurrentPassword: current, NewPassword: "initialpw1",
+			}); err != nil {
+				t.Fatalf("ChangePassword: %v, want the first password set", err)
+			}
+			if _, _, err := svc.Login(ctx, LoginInput{Email: user.Email, Password: "initialpw1", TenantID: "t1"}); err != nil {
+				t.Fatalf("login with the new password: %v", err)
+			}
+			if len(changed) != 1 || changed[0] != user.ID {
+				t.Fatalf("identity.user.password.changed = %v, want one for %s", changed, user.ID)
+			}
+		})
+	}
+}
+
+// An account that has a password keeps the check: an absent current password
+// is refused like a wrong one (auth.router.ts:1480-1483 at v1.10.8).
+func TestChangePassword_MissingCurrentPassword(t *testing.T) {
+	svc := newTestSvc(t)
+	user, _ := registerUser(t, svc, "nocurrent@example.com", "t1")
+	err := svc.ChangePassword(context.Background(), ChangePasswordInput{
+		UserID: user.ID, TenantID: "t1", NewPassword: "newpassword1",
+	})
+	if err != ErrInvalidCredentials {
+		t.Fatalf("expected ErrInvalidCredentials, got %v", err)
+	}
+}
+
+// An empty new password is refused before the comparison and for every
+// account, with its own sentinel rather than ErrWeakPassword
+// (auth.router.ts:1476-1479 at v1.10.8).
+func TestChangePassword_NewPasswordRequired(t *testing.T) {
+	svc := newTestSvc(t)
+	user, _ := registerUser(t, svc, "nonew@example.com", "t1")
+	for _, current := range []string{"password1", "wrongold", ""} {
+		err := svc.ChangePassword(context.Background(), ChangePasswordInput{
+			UserID: user.ID, TenantID: "t1", CurrentPassword: current,
+		})
+		if err != ErrNewPasswordRequired {
+			t.Fatalf("currentPassword %q: expected ErrNewPasswordRequired, got %v", current, err)
+		}
+	}
+}
+
 func TestChangePassword_Success(t *testing.T) {
 	svc := newTestSvc(t)
 	ctx := context.Background()

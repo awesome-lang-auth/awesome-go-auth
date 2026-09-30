@@ -548,16 +548,40 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 	return ps.ClearResetToken(ctx, user.ID, user.TenantID)
 }
 
+// ChangePassword replaces a user's password, or sets the first one of an
+// account that has none — the reference's POST /change-password
+// (awesome-node-auth v1.10.8 auth.router.ts:1465-1500), in its order:
+//
+//  1. the user is looked up; a missing one is ErrInvalidCredentials;
+//  2. an empty NewPassword is ErrNewPasswordRequired, whatever the account;
+//  3. only an account that has a password must present it: an empty or wrong
+//     CurrentPassword is ErrInvalidCredentials. An account with no stored
+//     password — OAuth-only, magic-link-only — skips the comparison and sets
+//     its first password with NewPassword alone, because the reference's
+//     compare sits inside `if (user.password)`. CurrentPassword is then
+//     ignored, not compared;
+//  4. the port's password policy, which the reference does not have (the
+//     password-policy-on-reset-and-change deviation): a NewPassword shorter
+//     than Config.MinPasswordLen is ErrWeakPassword. It runs last so that it
+//     never outranks an answer the reference gives.
+//
+// Step 3 is a posture, and it is the reference's: whoever holds a valid access
+// token of a passwordless account can give that account a password. A caller
+// that wants a stronger proof for that case has to ask for it before calling
+// here (#30).
 func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) error {
-	if len(in.NewPassword) < s.cfg.MinPasswordLen {
-		return ErrWeakPassword
-	}
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
 		return ErrInvalidCredentials
 	}
-	if !verifyPassword(in.CurrentPassword, user.PasswordHash) {
+	if in.NewPassword == "" {
+		return ErrNewPasswordRequired
+	}
+	if user.PasswordHash != "" && !verifyPassword(in.CurrentPassword, user.PasswordHash) {
 		return ErrInvalidCredentials
+	}
+	if len(in.NewPassword) < s.cfg.MinPasswordLen {
+		return ErrWeakPassword
 	}
 	ps, ok := s.users.(UserPasswordStore)
 	if !ok {

@@ -302,7 +302,9 @@ func testChangePassword(t *testing.T, mount Mounter) {
 	// The passwordless fall-through, and the reason this route exists for an
 	// OAuth-only account: with no stored password the current-password comparison
 	// is skipped entirely and newPassword alone sets the initial password
-	// (wire-contract §2 "Passwordless-account path", auth.router.ts:916-928).
+	// (wire-contract §2 "Passwordless-account path"; the compare sits inside
+	// `if (user.password)`, auth.router.ts:1480-1489 at v1.10.8). Since #30 this
+	// is Service.ChangePassword's own behaviour rather than an HTTP-layer detour.
 	// Answering 401 "Current password is incorrect" here — reporting a password the
 	// account does not have as wrong — makes the flow impossible, so the 200 is
 	// pinned along with the stored effect.
@@ -323,7 +325,7 @@ func testChangePassword(t *testing.T, mount Mounter) {
 		AssertStatus(t, fresh, http.StatusOK)
 
 		// A currentPassword sent by a passwordless account is ignored rather than
-		// compared: the reference's guard fires only when *both* fields are falsy,
+		// compared: the reference compares only when the account has a password,
 		// so this too is a 200.
 		other, otherTokens := env.Seed("changepwinitial2@example.com")
 		dropPassword(t, store, other)
@@ -332,8 +334,9 @@ func testChangePassword(t *testing.T, mount Mounter) {
 	})
 
 	// Port-only, as on /reset-password: the reference has no password policy on
-	// this route, and its check order would report the current-password failure
-	// first. Pinned as the divergence it is.
+	// this route. Pinned as the divergence it is. The check runs after the
+	// reference's own refusals, so a wrong current password with a weak new one
+	// is the reference's 401, pinned below.
 	t.Run("a too short new password gets 400 WEAK_PASSWORD (port-only)", func(t *testing.T) {
 		env, _ := storeEnv(t, mount, auth.DefaultHTTPConfig())
 		_, tokens := env.Seed("changepwweak@example.com")
@@ -358,6 +361,15 @@ func testChangePassword(t *testing.T, mount Mounter) {
 		env, _ := storeEnv(t, mount, auth.DefaultHTTPConfig())
 		_, tokens := env.Seed("changepwbad@example.com")
 		req := env.Request(http.MethodPost, "/change-password", map[string]string{"currentPassword": "wrongpassword", "newPassword": "newpassword1"})
+		AssertError(t, env.Do(bearer(req, tokens)), http.StatusUnauthorized, "Current password is incorrect", "")
+	})
+
+	// The port's policy never outranks the reference's own answer: a wrong
+	// current password is 401 even when the new one is too short.
+	t.Run("a wrong current password outranks a weak new one", func(t *testing.T) {
+		env, _ := storeEnv(t, mount, auth.DefaultHTTPConfig())
+		_, tokens := env.Seed("changepwbadweak@example.com")
+		req := env.Request(http.MethodPost, "/change-password", map[string]string{"currentPassword": "wrongpassword", "newPassword": "xy"})
 		AssertError(t, env.Do(bearer(req, tokens)), http.StatusUnauthorized, "Current password is incorrect", "")
 	})
 
@@ -397,6 +409,33 @@ func testChangePassword(t *testing.T, mount Mounter) {
 		dropPassword(t, store, user)
 		req := httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/change-password", nil)
 		AssertError(t, env.Do(bearer(req, tokens)), http.StatusBadRequest, "New password is required", "")
+	})
+
+	// At v1.10.8 the missing-newPassword refusal is unconditional: it runs before
+	// the comparison and for an account with a password too
+	// (auth.router.ts:1476-1479). The port used to answer that account's request
+	// with the port-only 400 WEAK_PASSWORD, or with 401 when the current
+	// password was wrong as well.
+	for _, current := range []string{"password1", "wrongpassword"} {
+		t.Run("an absent newPassword gets 400 whatever the current password: "+current, func(t *testing.T) {
+			env, _ := storeEnv(t, mount, auth.DefaultHTTPConfig())
+			_, tokens := env.Seed("changepwnonew@example.com")
+			req := env.Request(http.MethodPost, "/change-password", map[string]string{"currentPassword": current})
+			AssertError(t, env.Do(bearer(req, tokens)), http.StatusBadRequest, "New password is required", "")
+		})
+	}
+
+	// An account that has a password must present it: an absent current password
+	// is the same 401 as a wrong one (auth.router.ts:1480-1483 at v1.10.8), and
+	// nothing is written.
+	t.Run("an account with a password and no currentPassword gets 401", func(t *testing.T) {
+		env, _ := storeEnv(t, mount, auth.DefaultHTTPConfig())
+		_, tokens := env.Seed("changepwnocurrent@example.com")
+		req := env.Request(http.MethodPost, "/change-password", map[string]string{"newPassword": "newpassword1"})
+		AssertError(t, env.Do(bearer(req, tokens)), http.StatusUnauthorized, "Current password is incorrect", "")
+
+		stale := env.Do(env.Request(http.MethodPost, "/login", map[string]string{"email": "changepwnocurrent@example.com", "password": "newpassword1", "tenantId": "t1"}))
+		AssertStatus(t, stale, http.StatusUnauthorized)
 	})
 
 	// This route sits behind the auth middleware, so unlike /reset-password it is

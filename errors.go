@@ -28,6 +28,14 @@ var (
 	// Service.Register.
 	ErrInvalidInput = errors.New("auth: email and password are required")
 
+	// ErrNewPasswordRequired is a password change that names no new password.
+	// It is refused before anything else is looked at, for an account with a
+	// password and for one without alike, which is the reference's order
+	// (awesome-node-auth v1.10.8 auth.router.ts:1476-1479). It is deliberately
+	// not ErrWeakPassword: an absent password is not a rejected one. See
+	// Service.ChangePassword.
+	ErrNewPasswordRequired = errors.New("auth: new password is required")
+
 	// ErrEmailNotConfigured and ErrSMSNotConfigured mean the deployment has no
 	// way to deliver the credential a send route just asked for. They are
 	// deliberately not ErrFeatureNotSupported: that one says the configured
