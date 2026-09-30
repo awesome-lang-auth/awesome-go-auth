@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-30
+
+The admin user detail across tenants, and the deprecation of the one exported
+surface this library ships with no authorization at all. The last `0.x` release
+before v1.0.0 will carry the module-path notice; this one does not.
+
 ### Added
 - **`UserLookupStore` — find a user by id alone, whatever tenant it is in**
   (`store.go`). `FindUserByID(ctx, id)` is the reference's `findById(id)`
@@ -38,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tenant. `GET <admin>/api/users/{id}/roles` is unchanged on purpose. Its
   tenant is a role assignment's scope, and the console assigns roles in the
   empty one.
+
+### Deprecated
+- **`MCPServer` and `NewMCPServer`** (`mcp.go`). The handler has no
+  authorization of any kind: `auth_create_tenant`, `auth_create_role`,
+  `auth_register` and `auth_login` answer anyone who reaches it. It is a v0.1
+  addition outside the parity scope: the reference's MCP server is a separate
+  package, and the family has retired it. The `examples/chi-postgres` app no
+  longer mounts it on `/mcp`. It is removed in v1.0.0. A host that mounted it
+  should remove the route now.
 
 ## [0.11.0] - 2026-09-12
 
