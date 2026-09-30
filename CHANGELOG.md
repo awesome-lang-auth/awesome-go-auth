@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`MemoryLinkedAccounts.Save` no longer leaves a stale link behind when it
+  re-points a binding (#37).** Saving a `(provider, providerID)` pair that
+  another user held, under a new id, overwrote the pair's lookup but left the
+  old owner's `ListForUser` entry in place, where no id could reach or delete
+  it. `Save` is now an upsert on the pair: whatever it supersedes — the link
+  that held the pair, or the previous version of the same id — is gone from
+  `FindByProvider`, `ListForUser` and `Delete` alike. It still does not refuse
+  the re-point, because the reference's `linkAccount` is an idempotent upsert
+  that raises no conflict of its own (`linked-accounts-store.interface.ts:58-63`
+  at v1.10.8). The contract is now written on `LinkedAccountStore`, so a host
+  store knows it keys on the pair.
+
 ## [0.12.0] - 2026-09-30
 
 The admin user detail across tenants, and the deprecation of the one exported
