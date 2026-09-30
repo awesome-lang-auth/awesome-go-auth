@@ -143,12 +143,18 @@ func (s *MemoryUserStore) UpdatePhoneNumber(_ context.Context, userID, tenantID,
 }
 
 // UpdatePhoneNumber sets or clears a user's phone number.
+//
+// The number is stored exactly as submitted, as the reference stores it: its
+// route passes the body value to userStore.updatePhoneNumber untouched
+// (awesome-node-auth v1.10.8 auth.router.ts:1229-1234). A number of only
+// whitespace is therefore stored as sent and is not a clear; the empty string
+// is the clear, and it is what a JSON null decodes to over HTTP (#35).
 func (s *Service) UpdatePhoneNumber(ctx context.Context, in AddPhoneInput) (User, error) {
 	phoneStore, ok := s.users.(UserPhoneStore)
 	if !ok {
 		return User{}, ErrFeatureNotSupported
 	}
-	updated, err := phoneStore.UpdatePhoneNumber(ctx, in.UserID, in.TenantID, strings.TrimSpace(in.PhoneNumber))
+	updated, err := phoneStore.UpdatePhoneNumber(ctx, in.UserID, in.TenantID, in.PhoneNumber)
 	if err != nil {
 		return User{}, fmt.Errorf("auth: update phone number: %w", err)
 	}

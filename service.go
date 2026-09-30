@@ -1157,6 +1157,12 @@ func (s *Service) ListAllRoles(ctx context.Context) ([]string, error) {
 // atomic needs a store-level patch primitive, which is a breaking interface
 // change and its own item; silently erasing a field on every single partial call
 // is the failure this closes.
+//
+// Both names are stored exactly as submitted: nothing is trimmed. The reference
+// hands the parsed body to userStore.updateProfile untouched (awesome-node-auth
+// v1.10.8 auth.router.ts:1214-1215), so a name sent with surrounding whitespace
+// keeps it and GET /me answers it back as sent. A store that wants normalised
+// names normalises them itself (#35).
 func (s *Service) UpdateProfile(ctx context.Context, in UpdateProfileInput) (User, error) {
 	accountStore, ok := s.users.(UserAccountStore)
 	if !ok {
@@ -1175,7 +1181,7 @@ func (s *Service) UpdateProfile(ctx context.Context, in UpdateProfileInput) (Use
 			lastName = &current.LastName
 		}
 	}
-	updated, err := accountStore.UpdateProfile(ctx, in.UserID, in.TenantID, strings.TrimSpace(*firstName), strings.TrimSpace(*lastName))
+	updated, err := accountStore.UpdateProfile(ctx, in.UserID, in.TenantID, *firstName, *lastName)
 	if err != nil {
 		return User{}, fmt.Errorf("auth: update profile: %w", err)
 	}
