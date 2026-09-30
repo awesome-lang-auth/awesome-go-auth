@@ -112,7 +112,7 @@ func assertTokenSuccess(t *testing.T, rec *httptest.ResponseRecorder) map[string
 }
 
 func codeGrant(code string) url.Values {
-	return url.Values{"grant_type": {"authorization_code"}, "code": {code}}
+	return url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {testOIDCRedirectURI}}
 }
 
 func refreshGrant(token string) url.Values {
@@ -295,5 +295,124 @@ func testOIDCToken(t *testing.T, mount Mounter) {
 			assertTokenRefusal(t, oidcToken(env, refreshGrant("never-issued"), testOIDCClientID, testOIDCClientSecret),
 				http.StatusBadRequest, "invalid_grant")
 		})
+	})
+
+	t.Run("hardening", func(t *testing.T) {
+		env := newOIDCEnv(t, mount)
+		env.Seed("hard@example.com")
+
+		t.Run("a verifier for a code without a challenge is a downgrade", func(t *testing.T) {
+			// RFC 9700 §2.1.1.
+			form := codeGrant(oidcIssueCode(t, env, "hard@example.com", nil))
+			form.Set("code_verifier", testPKCEVerifier)
+			assertTokenRefusal(t, oidcToken(env, form, testOIDCClientID, testOIDCClientSecret),
+				http.StatusBadRequest, "invalid_grant")
+		})
+		t.Run("redirect_uri must match the authorization request", func(t *testing.T) {
+			// RFC 6749 §4.1.3.
+			form := codeGrant(oidcIssueCode(t, env, "hard@example.com", nil))
+			form.Del("redirect_uri")
+			assertTokenRefusal(t, oidcToken(env, form, testOIDCClientID, testOIDCClientSecret),
+				http.StatusBadRequest, "invalid_grant")
+			form = codeGrant(oidcIssueCode(t, env, "hard@example.com", nil))
+			form.Set("redirect_uri", "https://rp.example.com/elsewhere")
+			assertTokenRefusal(t, oidcToken(env, form, testOIDCClientID, testOIDCClientSecret),
+				http.StatusBadRequest, "invalid_grant")
+		})
+		t.Run("credentials in the query string are refused", func(t *testing.T) {
+			// RFC 6749 §2.3.1 and §3.2: body parameters only.
+			form := codeGrant(oidcIssueCode(t, env, "hard@example.com", nil))
+			form.Set("client_id", testOIDCClientID)
+			req := httptest.NewRequest(http.MethodPost, env.Config.Prefix()+auth.OIDCTokenPath+"?"+
+				url.Values{"client_secret": {testOIDCClientSecret}}.Encode(), strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			assertTokenRefusal(t, env.Do(req), http.StatusBadRequest, "invalid_request")
+		})
+		t.Run("a replayed code revokes the grant it produced", func(t *testing.T) {
+			// RFC 6749 §4.1.2.
+			code := oidcIssueCode(t, env, "hard@example.com", url.Values{"scope": {"openid offline_access"}})
+			body := assertTokenSuccess(t, oidcToken(env, codeGrant(code), testOIDCClientID, testOIDCClientSecret))
+			refresh, _ := body["refresh_token"].(string)
+			assertTokenRefusal(t, oidcToken(env, codeGrant(code), testOIDCClientID, testOIDCClientSecret),
+				http.StatusBadRequest, "invalid_grant")
+			assertTokenRefusal(t, oidcToken(env, refreshGrant(refresh), testOIDCClientID, testOIDCClientSecret),
+				http.StatusBadRequest, "invalid_grant")
+		})
+	})
+
+	t.Run("public client", func(t *testing.T) {
+		idp, err := auth.NewIDP(
+			auth.IDPConfig{Issuer: testIDPIssuer, Signer: testIDPKey(), KeyID: testIDPKeyID},
+			nil,
+			auth.IDPClient{ClientID: "wiretest-spa", RedirectURIs: []string{testOIDCRedirectURI}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithIDP(idp))
+		env.Seed("spa@example.com")
+		issue := func(t *testing.T, extra url.Values) string {
+			t.Helper()
+			q := url.Values{"client_id": {"wiretest-spa"}, "redirect_uri": {testOIDCRedirectURI}, "state": {"s"}}
+			for k, v := range extra {
+				q[k] = v
+			}
+			form := url.Values{"email": {"spa@example.com"}, "password": {"password1"}, "tenant_id": {"t1"}}
+			req := httptest.NewRequest(http.MethodPost, env.Config.Prefix()+auth.OIDCAuthorizePath+"?"+q.Encode(),
+				strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			rec := env.Do(req)
+			AssertStatus(t, rec, http.StatusFound)
+			loc, _ := url.Parse(rec.Header().Get("Location"))
+			return loc.Query().Get("code")
+		}
+
+		t.Run("authorize requires PKCE", func(t *testing.T) {
+			if code := issue(t, nil); code != "" {
+				t.Fatalf("a public client got a code without a code_challenge")
+			}
+		})
+		t.Run("client_id alone with PKCE authenticates", func(t *testing.T) {
+			form := codeGrant(issue(t, pkce))
+			form.Set("client_id", "wiretest-spa")
+			form.Set("code_verifier", testPKCEVerifier)
+			assertTokenSuccess(t, env.Do(oidcForm(env, auth.OIDCTokenPath, form)))
+		})
+		t.Run("an empty secret is not a credential", func(t *testing.T) {
+			form := codeGrant(issue(t, pkce))
+			form.Set("code_verifier", testPKCEVerifier)
+			assertTokenRefusal(t, oidcToken(env, form, "wiretest-spa", ""), http.StatusUnauthorized, "invalid_client")
+		})
+		t.Run("discovery advertises none", func(t *testing.T) {
+			doc := assertOIDCDiscoveryDocument(t,
+				env.Do(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+auth.OIDCDiscoveryPath, nil)))
+			assertOIDCStringList(t, doc, "token_endpoint_auth_methods_supported",
+				"client_secret_basic", "client_secret_post", "none")
+		})
+	})
+
+	t.Run("the refresh grant can be switched off", func(t *testing.T) {
+		idp, err := auth.NewIDP(
+			auth.IDPConfig{Issuer: testIDPIssuer, Signer: testIDPKey(), KeyID: testIDPKeyID, DisableRefreshTokenGrant: true},
+			nil,
+			auth.IDPClient{ClientID: testOIDCClientID, ClientSecret: testOIDCClientSecret, RedirectURIs: []string{testOIDCRedirectURI}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithIDP(idp))
+		env.Seed("off@example.com")
+		body := assertTokenSuccess(t, oidcToken(env,
+			codeGrant(oidcIssueCode(t, env, "off@example.com", url.Values{"scope": {"openid offline_access"}})),
+			testOIDCClientID, testOIDCClientSecret))
+		if _, ok := body["refresh_token"]; ok {
+			t.Fatalf("a refresh token was issued with the grant off: %v", body)
+		}
+		assertTokenRefusal(t, oidcToken(env, refreshGrant("x"), testOIDCClientID, testOIDCClientSecret),
+			http.StatusBadRequest, "unsupported_grant_type")
+		doc := assertOIDCDiscoveryDocument(t,
+			env.Do(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+auth.OIDCDiscoveryPath, nil)))
+		assertOIDCStringList(t, doc, "grant_types_supported", "authorization_code")
+		assertOIDCStringList(t, doc, "scopes_supported", "openid", "email", "profile")
 	})
 }

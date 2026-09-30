@@ -18,10 +18,36 @@ import (
 type MemoryAuthCodeStore struct {
 	mu    sync.Mutex
 	codes map[string]AuthCode
+	// redemptions is the AuthCodeReplayStore half: what each redeemed code
+	// produced, until the code's own expiry.
+	redemptions map[string]AuthCodeRedemption
 }
 
 func NewMemoryAuthCodeStore() *MemoryAuthCodeStore {
-	return &MemoryAuthCodeStore{codes: make(map[string]AuthCode)}
+	return &MemoryAuthCodeStore{codes: make(map[string]AuthCode), redemptions: make(map[string]AuthCodeRedemption)}
+}
+
+func (s *MemoryAuthCodeStore) SaveRedemption(_ context.Context, redemption AuthCodeRedemption) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for hash, existing := range s.redemptions {
+		if now.After(existing.ExpiresAt) {
+			delete(s.redemptions, hash)
+		}
+	}
+	s.redemptions[redemption.CodeHash] = redemption
+	return nil
+}
+
+func (s *MemoryAuthCodeStore) RedemptionOf(_ context.Context, codeHash string) (AuthCodeRedemption, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	redemption, ok := s.redemptions[codeHash]
+	if !ok || time.Now().After(redemption.ExpiresAt) {
+		return AuthCodeRedemption{}, ErrInvalidCode
+	}
+	return redemption, nil
 }
 
 func (s *MemoryAuthCodeStore) SaveCode(_ context.Context, code AuthCode) error {
@@ -122,10 +148,12 @@ func (s *MemoryIDPRefreshTokenStore) ConsumeRefreshToken(_ context.Context, toke
 	return entry.token, nil
 }
 
-func (s *MemoryIDPRefreshTokenStore) RevokeRefreshTokenFamily(_ context.Context, familyID string) error {
+func (s *MemoryIDPRefreshTokenStore) RevokeRefreshTokenFamily(_ context.Context, familyID string, until time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	until := s.revoked[familyID]
+	if previous := s.revoked[familyID]; previous.After(until) {
+		until = previous
+	}
 	for _, entry := range s.tokens {
 		if entry.token.FamilyID == familyID && entry.token.ExpiresAt.After(until) {
 			until = entry.token.ExpiresAt

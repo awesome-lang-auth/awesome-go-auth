@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // The token endpoint, <prefix>/token.
@@ -18,16 +19,26 @@ import (
 // :927-957 at 1.10.8): it ships no authorization server. The rules below are
 // therefore the OAuth and OIDC specifications', and each is cited to them.
 //
+//   - POST only, parameters from the body only (RFC 6749 §3.2): a client
+//     credential, code or token in the URL query is refused rather than read,
+//     since a URL ends up in access logs, proxies and browser history.
 //   - Client authentication is client_secret_basic or client_secret_post
-//     (RFC 6749 §2.3.1), never both in one request, compared in constant time.
-//   - authorization_code verifies the PKCE code_verifier when the code was
-//     issued with a challenge (RFC 7636 §4.6) and issues a refresh token only
-//     when the code was granted offline_access (OIDC Core §11).
+//     (RFC 6749 §2.3.1), never both in one request, compared in constant time;
+//     a public client (no ClientSecret) authenticates by client_id alone.
+//   - authorization_code checks redirect_uri against the authorization request
+//     (RFC 6749 §4.1.3), verifies the PKCE code_verifier when the code was
+//     issued with a challenge and refuses one when it was not (RFC 7636 §4.6,
+//     RFC 9700 §2.1.1), and issues a refresh token only when the code was
+//     granted offline_access (OIDC Core §11). A replayed code revokes what the
+//     code produced when the code store can remember it (RFC 6749 §4.1.2).
 //   - refresh_token rotates: every use consumes the presented token and issues
 //     a new one, and a consumed token presented again revokes its whole family
 //     (RFC 6819 §5.2.2.3, RFC 9700 §4.14.2).
 //   - Every answer, success or refusal, is JSON with Cache-Control: no-store
 //     and Pragma: no-cache, and every refusal is the RFC 6749 §5.2 error body.
+//     An invalid_grant carries one fixed description whatever the reason, so
+//     that a client holding someone else's code or token learns nothing about
+//     its state; the reason goes to the log.
 
 // The grant types and the one PKCE method the endpoint implements, as the
 // discovery document advertises them.
@@ -43,6 +54,15 @@ const (
 // client_secret_basic attempt is answered with (RFC 6749 §5.2, RFC 7617).
 const tokenBasicRealm = `Basic realm="token"`
 
+// invalidGrantDescription is the one error_description every invalid_grant
+// carries.
+const invalidGrantDescription = "the grant is invalid, expired, revoked, or was issued to another client"
+
+// tokenQueryForbidden are the parameters RFC 6749 §2.3.1 and §3.2 keep out of
+// the request URI: the client's credentials, and the code, verifier and
+// refresh token that stand in for the user.
+var tokenQueryForbidden = []string{"client_id", "client_secret", "code", "code_verifier", "refresh_token"}
+
 // tokenError is one RFC 6749 §5.2 refusal. basicChallenge adds the
 // WWW-Authenticate header the RFC requires on a 401 after the client tried the
 // Authorization header.
@@ -57,8 +77,10 @@ func invalidRequest(description string) *tokenError {
 	return &tokenError{status: http.StatusBadRequest, code: "invalid_request", description: description}
 }
 
-func invalidGrant(description string) *tokenError {
-	return &tokenError{status: http.StatusBadRequest, code: "invalid_grant", description: description}
+// invalidGrant refuses with the fixed description and logs the reason.
+func (idp *IDP) invalidGrant(reason string) *tokenError {
+	idp.logf("auth: idp: token: invalid_grant: %s", reason)
+	return &tokenError{status: http.StatusBadRequest, code: "invalid_grant", description: invalidGrantDescription}
 }
 
 func tokenServerError() *tokenError {
@@ -87,18 +109,35 @@ func writeTokenError(w http.ResponseWriter, e *tokenError) {
 }
 
 func (idp *IDP) handleToken(w http.ResponseWriter, r *http.Request) {
+	// RFC 6749 §3.2: the client MUST use POST. The adapters route every method
+	// here (see OIDCMounts), so the refusal is the handler's: a 405 naming the
+	// one method, in the same JSON body as every other refusal.
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeTokenError(w, &tokenError{status: http.StatusMethodNotAllowed, code: "invalid_request",
+			description: "the token endpoint accepts POST only"})
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		writeTokenError(w, invalidRequest("the request body is not a form"))
 		return
 	}
+	query := r.URL.Query()
+	for _, name := range tokenQueryForbidden {
+		if _, present := query[name]; present {
+			writeTokenError(w, invalidRequest(name+" must be sent in the request body, not the URL"))
+			return
+		}
+	}
 	// The grant type is read before the client is authenticated, as it always
-	// was here: a request for a grant this endpoint does not implement is
-	// unsupported_grant_type whoever sends it, including a request with no form
-	// at all.
-	grantType := r.FormValue("grant_type")
-	if grantType != grantTypeAuthorizationCode && grantType != grantTypeRefreshToken {
+	// was here: a request for a grant this endpoint does not serve is
+	// unsupported_grant_type whoever sends it. The refresh grant is not served
+	// when it is disabled or the session store cannot back it, which is also
+	// when discovery does not advertise it.
+	grantType := r.PostFormValue("grant_type")
+	if grantType != grantTypeAuthorizationCode && (grantType != grantTypeRefreshToken || !idp.refreshGrantServable()) {
 		writeTokenError(w, &tokenError{status: http.StatusBadRequest, code: "unsupported_grant_type",
-			description: "grant_type must be authorization_code or refresh_token"})
+			description: "grant_type is not one this endpoint serves"})
 		return
 	}
 	client, terr := idp.authenticateClient(r)
@@ -120,28 +159,33 @@ func (idp *IDP) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // authenticateClient resolves the client a token request authenticates as, by
-// exactly one of the two methods the discovery document advertises
-// (RFC 6749 §2.3.1):
+// exactly one method (RFC 6749 §2.3.1), reading the request body only:
 //
 //   - client_secret_basic: Authorization: Basic base64(id ":" secret), where id
 //     and secret are each form-urlencoded before they are joined, so both are
 //     decoded here. A client_id form parameter alongside it is allowed only
 //     when it names the same client.
 //   - client_secret_post: client_id and client_secret form parameters.
+//   - none, for a public client (IDPClient.ClientSecret empty): client_id in
+//     the body and no secret of any kind. A public client that presents a
+//     client_secret parameter, even an empty one, or a Basic header, is
+//     refused: an empty secret is not a credential, and accepting one would
+//     let a request pass for authenticated when it is not.
 //
-// A request using both is refused as invalid_request: §2.3 says a client MUST
-// NOT use more than one method per request. A failed Basic attempt is the 401
-// with a WWW-Authenticate challenge §5.2 requires; a failed post attempt stays
-// the 401 it has always been. An unknown client and a wrong secret are the same
-// refusal. The secret is compared in constant time, over digests so that its
-// length does not leak either.
+// A request using both Basic and client_secret is refused as invalid_request:
+// §2.3 says a client MUST NOT use more than one method per request. A failed
+// Basic attempt is the 401 with a WWW-Authenticate challenge §5.2 requires; a
+// failed post attempt stays the 401 it has always been. An unknown client and
+// a wrong secret are the same refusal. The secret is compared in constant
+// time, over digests so that its length does not leak either.
 func (idp *IDP) authenticateClient(r *http.Request) (IDPClient, *tokenError) {
 	invalidClient := func(basic bool) *tokenError {
 		return &tokenError{status: http.StatusUnauthorized, code: "invalid_client",
 			description: "client authentication failed", basicChallenge: basic}
 	}
+	_, postSecret := r.PostForm["client_secret"]
 	if header := r.Header.Get("Authorization"); len(header) >= 6 && strings.EqualFold(header[:6], "Basic ") {
-		if _, both := r.Form["client_secret"]; both {
+		if postSecret {
 			return IDPClient{}, invalidRequest("the client authenticated with both client_secret_basic and client_secret_post")
 		}
 		rawID, rawSecret, ok := r.BasicAuth()
@@ -156,17 +200,26 @@ func (idp *IDP) authenticateClient(r *http.Request) (IDPClient, *tokenError) {
 		if err != nil {
 			return IDPClient{}, invalidClient(true)
 		}
-		if formID, present := r.Form["client_id"]; present && (len(formID) != 1 || formID[0] != clientID) {
+		if formID, present := r.PostForm["client_id"]; present && (len(formID) != 1 || formID[0] != clientID) {
 			return IDPClient{}, invalidRequest("client_id does not match the client in the Authorization header")
 		}
 		client, ok := idp.clients[clientID]
-		if !ok || !clientSecretMatches(client, secret) {
+		if !ok || client.ClientSecret == "" || !clientSecretMatches(client, secret) {
 			return IDPClient{}, invalidClient(true)
 		}
 		return client, nil
 	}
-	client, ok := idp.clients[r.FormValue("client_id")]
-	if !ok || !clientSecretMatches(client, r.FormValue("client_secret")) {
+	client, ok := idp.clients[r.PostFormValue("client_id")]
+	if !ok {
+		return IDPClient{}, invalidClient(false)
+	}
+	if client.ClientSecret == "" {
+		if postSecret {
+			return IDPClient{}, invalidClient(false)
+		}
+		return client, nil
+	}
+	if !clientSecretMatches(client, r.PostFormValue("client_secret")) {
 		return IDPClient{}, invalidClient(false)
 	}
 	return client, nil
@@ -181,35 +234,56 @@ func clientSecretMatches(client IDPClient, presented string) bool {
 
 // authorizationCodeGrant redeems a code (RFC 6749 §4.1.3).
 func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, client IDPClient) (map[string]any, *tokenError) {
+	codeHash := hashToken(r.PostFormValue("code"))
 	// ConsumeCode is destructive: whichever request reaches the store first
 	// gets the record and every later one, on any process, gets ErrInvalidCode.
 	// That is the whole single-use guarantee, so nothing is cached here. The
 	// expiry re-check is belt and braces against a store that does not honour
 	// the "expired is absent" clause of the AuthCodeStore contract.
-	meta, err := idp.codes.ConsumeCode(ctx, hashToken(r.FormValue("code")))
+	meta, err := idp.codes.ConsumeCode(ctx, codeHash)
 	if err != nil || idp.now().After(meta.ExpiresAt) {
-		return nil, invalidGrant("the authorization code is invalid, expired or already used")
+		idp.undoReplayedCode(ctx, codeHash)
+		return nil, idp.invalidGrant("the authorization code is unknown, expired or already used")
 	}
 	// RFC 6749 §4.1.3: the code must have been issued to the client now
 	// redeeming it. The record carries ClientID precisely so the store can be
 	// asked.
 	if meta.ClientID != client.ClientID {
-		return nil, invalidGrant("the authorization code was issued to another client")
+		return nil, idp.invalidGrant("the authorization code was issued to another client")
+	}
+	// §4.1.3 again: redirect_uri must be present and identical when the
+	// authorization request carried one, and /authorize always requires it,
+	// so it is required here. For a client not using PKCE it is the only thing
+	// binding the code to the flow that asked for it.
+	if r.PostFormValue("redirect_uri") != meta.RedirectURI {
+		return nil, idp.invalidGrant("redirect_uri is missing or differs from the authorization request")
 	}
 	// RFC 7636 §4.6: a code issued with a challenge is redeemed only with the
 	// verifier it was derived from. The code is already consumed, so a wrong
-	// guess burns it. A code issued without a challenge is redeemed as it always
-	// was, with or without a code_verifier. S256 is the only method /authorize
-	// accepts; a record carrying another is refused rather than compared.
-	if meta.CodeChallenge != "" {
-		verifier := r.FormValue("code_verifier")
+	// guess burns it. S256 is the only method /authorize accepts; a record
+	// carrying another is refused rather than compared.
+	//
+	// RFC 9700 §2.1.1 closes the other direction: a code_verifier for a code
+	// issued without a challenge is refused too. A client that sends a verifier
+	// sent a challenge, so a code without one means the challenge was stripped
+	// from its authorization request, or the code was injected from another
+	// flow — the downgrade PKCE exists to catch. And a public client's code
+	// must have had one (/authorize requires it; this is belt and braces).
+	_, verifierSent := r.PostForm["code_verifier"]
+	switch {
+	case meta.CodeChallenge != "":
+		verifier := r.PostFormValue("code_verifier")
 		if verifier == "" {
-			return nil, invalidGrant("code_verifier is required: the code was issued with a code_challenge")
+			return nil, idp.invalidGrant("code_verifier is missing: the code was issued with a code_challenge")
 		}
 		if meta.CodeChallengeMethod != pkceMethodS256 || !validPKCEVerifier(verifier) ||
 			!secureEqual(pkceS256Challenge(verifier), meta.CodeChallenge) {
-			return nil, invalidGrant("code_verifier does not match the code_challenge")
+			return nil, idp.invalidGrant("code_verifier does not match the code_challenge")
 		}
+	case verifierSent:
+		return nil, idp.invalidGrant("code_verifier was sent for a code issued without a code_challenge")
+	case client.ClientSecret == "":
+		return nil, idp.invalidGrant("a public client's code was issued without a code_challenge")
 	}
 
 	user, err := idp.authSvc.users.GetUserByID(ctx, meta.UserID, meta.TenantID)
@@ -239,6 +313,10 @@ func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, cli
 		"token_type":   "Bearer",
 		"expires_in":   int(tokens.ExpiresIn.Seconds()),
 	}
+	redemption := AuthCodeRedemption{
+		CodeHash: codeHash, SessionID: sessionID, UserID: user.ID, TenantID: user.TenantID,
+		ExpiresAt: meta.ExpiresAt,
+	}
 
 	// OIDC Core §11: a refresh token is issued when the code was granted
 	// offline_access, and not otherwise. §11 also asks for prompt=consent
@@ -251,15 +329,19 @@ func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, cli
 	// The grant checks the session on every refresh, and with a session store
 	// that cannot look a session up it could not; rather than issue a token
 	// whose revocation it cannot honour, it issues none (RFC 6749 §5.1 makes
-	// refresh_token optional) and says why once per request.
-	if scopeHas(meta.Scope, oidcScopeOfflineAccess) {
-		if !idp.authSvc.canLookupSessions() {
+	// refresh_token optional). IDPConfig.DisableRefreshTokenGrant turns the
+	// grant off outright.
+	if scopeHas(meta.Scope, oidcScopeOfflineAccess) && !idp.cfg.DisableRefreshTokenGrant {
+		if !idp.refreshGrantServable() {
 			idp.logf("auth: idp: offline_access granted but the session store cannot look sessions up (SessionLookupStore or SessionAdminStore); no refresh token issued")
 		} else {
 			familyID, err := newID("rtf")
 			if err != nil {
 				return nil, tokenServerError()
 			}
+			// The session's own expiry, to within the time since issueSession:
+			// the family cannot outlive the session whose access tokens it mints.
+			familyExpiresAt := idp.authSvc.now().Add(idp.authSvc.cfg.RefreshTokenTTL)
 			refresh, err := idp.saveRefreshToken(ctx, IDPRefreshToken{
 				FamilyID:  familyID,
 				ClientID:  client.ClientID,
@@ -267,18 +349,48 @@ func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, cli
 				TenantID:  user.TenantID,
 				SessionID: sessionID,
 				Scope:     meta.Scope,
-				// The session's own expiry, to within the time since
-				// issueSession: the family cannot outlive the session whose
-				// access tokens it mints.
-				ExpiresAt: idp.authSvc.now().Add(idp.authSvc.cfg.RefreshTokenTTL),
+				ExpiresAt: familyExpiresAt,
 			})
 			if err != nil {
 				return nil, tokenServerError()
 			}
 			body["refresh_token"] = refresh
+			redemption.FamilyID = familyID
+			redemption.FamilyExpiresAt = familyExpiresAt
+		}
+	}
+	if replay, ok := idp.codes.(AuthCodeReplayStore); ok {
+		if err := replay.SaveRedemption(ctx, redemption); err != nil {
+			// The exchange succeeded; what failed is the record that would let a
+			// later replay undo it. Refusing now would strand the tokens just
+			// minted, so the answer stands and the failure is logged.
+			idp.logf("auth: idp: record code redemption: %v", err)
 		}
 	}
 	return body, nil
+}
+
+// undoReplayedCode is RFC 6749 §4.1.2's SHOULD: when a code that was already
+// redeemed comes back, revoke what it produced — the session its exchange
+// opened and the refresh-token family, if any. It needs the code store to be an
+// AuthCodeReplayStore, and does nothing otherwise, or when the code was never
+// redeemed at all (unknown or merely expired).
+func (idp *IDP) undoReplayedCode(ctx context.Context, codeHash string) {
+	replay, ok := idp.codes.(AuthCodeReplayStore)
+	if !ok {
+		return
+	}
+	redemption, err := replay.RedemptionOf(ctx, codeHash)
+	if err != nil {
+		return
+	}
+	idp.logf("auth: idp: authorization code replayed; revoking session %s and its refresh tokens", redemption.SessionID)
+	if redemption.FamilyID != "" {
+		idp.revokeRefreshFamily(ctx, redemption.FamilyID, redemption.FamilyExpiresAt)
+	}
+	if err := idp.authSvc.revokeSession(ctx, redemption.SessionID, redemption.UserID, redemption.TenantID); err != nil {
+		idp.logf("auth: idp: revoke session %s after a code replay: %v", redemption.SessionID, err)
+	}
 }
 
 // refreshTokenGrant redeems a refresh token (RFC 6749 §6), rotating it.
@@ -287,59 +399,77 @@ func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, cli
 // refusal is evidence the token is in the wrong hands or no longer backed by a
 // session: a replay of a used token, the token presented by another client
 // (RFC 6749 §10.4 binds it to the client it was issued to, so another
-// client's holding it is a leak), and a session that was revoked or has
-// expired. The legitimate holder then signs in again, which is the cost RFC
-// 9700 §4.14.2 accepts for refusing the attacker.
+// client's holding it is a leak), and a session that was revoked, has expired
+// or is gone. The legitimate holder then signs in again, which is the cost RFC
+// 9700 §4.14.2 accepts for refusing the attacker. A store that fails, on the
+// other hand, revokes nothing and answers server_error: an outage is not
+// evidence of anything, and turning it into a forced sign-in for every client
+// that refreshed during it would punish the wrong party.
 func (idp *IDP) refreshTokenGrant(ctx context.Context, r *http.Request, client IDPClient) (map[string]any, *tokenError) {
-	presented := r.FormValue("refresh_token")
+	presented := r.PostFormValue("refresh_token")
 	if presented == "" {
 		return nil, invalidRequest("refresh_token is required")
 	}
 	rec, err := idp.refreshTokens.ConsumeRefreshToken(ctx, hashToken(presented))
 	switch {
 	case errors.Is(err, ErrRefreshTokenReused):
-		idp.revokeRefreshFamily(ctx, rec.FamilyID)
-		return nil, invalidGrant("the refresh token was already used; every token of its grant is revoked")
+		idp.revokeRefreshFamily(ctx, rec.FamilyID, rec.ExpiresAt)
+		return nil, idp.invalidGrant("refresh token reused; family " + rec.FamilyID + " revoked")
 	case errors.Is(err, ErrInvalidToken):
-		return nil, invalidGrant("the refresh token is invalid, expired or revoked")
+		return nil, idp.invalidGrant("refresh token unknown, expired or of a revoked family")
 	case err != nil:
 		return nil, tokenServerError()
 	}
 	if idp.now().After(rec.ExpiresAt) {
-		return nil, invalidGrant("the refresh token is invalid, expired or revoked")
+		return nil, idp.invalidGrant("refresh token expired")
 	}
 	if rec.ClientID != client.ClientID {
-		idp.revokeRefreshFamily(ctx, rec.FamilyID)
-		return nil, invalidGrant("the refresh token was issued to another client")
+		idp.revokeRefreshFamily(ctx, rec.FamilyID, rec.ExpiresAt)
+		return nil, idp.invalidGrant("refresh token presented by another client; family " + rec.FamilyID + " revoked")
 	}
 	// RFC 6749 §6: the requested scope may only narrow what was granted, and
 	// an absent scope means the granted one. The narrowing reaches the answer —
 	// its scope member, and whether an id_token is in it — and not the access
 	// token, which is the session's HS256 token and carries no scope claim. The
 	// rotated refresh token keeps the granted scope, as §6 requires.
-	scope, ok := narrowScope(rec.Scope, r.FormValue("scope"))
+	scope, ok := narrowScope(rec.Scope, r.PostFormValue("scope"))
 	if !ok {
 		return nil, &tokenError{status: http.StatusBadRequest, code: "invalid_scope",
 			description: "the requested scope exceeds the scope originally granted"}
 	}
 	session, supported, err := idp.authSvc.lookupSession(ctx, rec.SessionID, rec.UserID, rec.TenantID)
-	if !supported || err != nil ||
-		idp.authSvc.validateSessionState(session, tokenClaims{Sid: rec.SessionID, Sub: rec.UserID, Tid: rec.TenantID}) != nil {
-		idp.revokeRefreshFamily(ctx, rec.FamilyID)
-		return nil, invalidGrant("the session behind the refresh token has ended")
+	switch {
+	case !supported:
+		// refreshGrantServable was true when this request was admitted; a
+		// store that stopped supporting lookups is a misconfiguration.
+		return nil, tokenServerError()
+	case errors.Is(err, ErrSessionNotFound):
+		idp.revokeRefreshFamily(ctx, rec.FamilyID, rec.ExpiresAt)
+		return nil, idp.invalidGrant("the session behind the refresh token is gone")
+	case err != nil:
+		return nil, tokenServerError()
 	}
+	if err := idp.authSvc.validateSessionState(session, tokenClaims{Sid: rec.SessionID, Sub: rec.UserID, Tid: rec.TenantID}); err != nil {
+		idp.revokeRefreshFamily(ctx, rec.FamilyID, rec.ExpiresAt)
+		return nil, idp.invalidGrant("the session behind the refresh token has ended")
+	}
+	// UserStore has no not-found sentinel, so a deleted user and a failing
+	// store look alike here. Both are refused without revoking: nothing is
+	// issued either way, and DeleteAccount revokes the user's sessions where
+	// the store can list them, which ends the family at the session check.
 	user, err := idp.authSvc.users.GetUserByID(ctx, rec.UserID, rec.TenantID)
 	if err != nil {
-		idp.revokeRefreshFamily(ctx, rec.FamilyID)
-		return nil, invalidGrant("the user behind the refresh token no longer exists")
+		idp.logf("auth: idp: refresh: user %s: %v", rec.UserID, err)
+		return nil, tokenServerError()
 	}
 
 	access, _, err := idp.authSvc.issueToken(ctx, user, rec.SessionID, "access", idp.authSvc.cfg.AccessTokenTTL)
 	if err != nil {
 		return nil, tokenServerError()
 	}
-	rotated := rec
-	refresh, err := idp.saveRefreshToken(ctx, rotated)
+	// The rotated token is rec with a new hash: the same family, client,
+	// session, granted scope and ExpiresAt. Rotation never extends the grant.
+	refresh, err := idp.saveRefreshToken(ctx, rec)
 	if err != nil {
 		return nil, tokenServerError()
 	}
@@ -383,11 +513,11 @@ func (idp *IDP) saveRefreshToken(ctx context.Context, rec IDPRefreshToken) (stri
 	return token, nil
 }
 
-// revokeRefreshFamily revokes a family, logging a store failure rather than
-// answering with it: the request is refused either way, and the refusal is
-// what the client has to see.
-func (idp *IDP) revokeRefreshFamily(ctx context.Context, familyID string) {
-	if err := idp.refreshTokens.RevokeRefreshTokenFamily(ctx, familyID); err != nil {
+// revokeRefreshFamily revokes a family until its expiry, logging a store
+// failure rather than answering with it: the request is refused either way,
+// and the refusal is what the client has to see.
+func (idp *IDP) revokeRefreshFamily(ctx context.Context, familyID string, until time.Time) {
+	if err := idp.refreshTokens.RevokeRefreshTokenFamily(ctx, familyID, until); err != nil {
 		idp.logf("auth: idp: revoke refresh token family %s: %v", familyID, err)
 	}
 }
