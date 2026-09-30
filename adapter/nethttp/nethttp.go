@@ -54,9 +54,9 @@ func MountWithConfig(mux *http.ServeMux, a *auth.Auth, cfg auth.HTTPConfig) {
 //
 // It authenticates through Auth.VerifyAccess, which reads no user store, as
 // the reference's authMiddleware does (auth.middleware.ts:44-61 at v1.10.8):
-// the user in context is built from the verified token — its base claims, tid,
-// and the whole payload in CustomClaims — plus the optional stores' enrichment
-// (metadata, roles, permissions, tenants). A token whose user has been deleted
+// the user in context is built from the verified token — its base claims and
+// tid, with CustomClaims nil — plus the optional stores' enrichment (metadata,
+// roles, permissions, tenants). A token whose user has been deleted
 // therefore reaches the handler, and the handler answers for the missing user
 // itself (#31). Config.BuildTokenClaims is not run — it is a mint-time hook,
 // with a ClaimsWebhook behind it a network round trip. GET /me is the one route
