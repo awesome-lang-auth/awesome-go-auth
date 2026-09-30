@@ -23,6 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before, on every route. The email-verified side effect lives in
   `VerifyMagicLink`, the login wrapper, and is no longer inferred from whether
   an owner id was passed, which also settles #33.
+- **Registration may open a session, chosen by the instance admin (#21):
+  `Config.IssueSessionOnRegister` and `WithIssueSessionOnRegister(bool)`.**
+  The family option of the same name (the family spec "register may open a
+  session"). On, a successful `POST <prefix>/register` delivers a session
+  exactly as a successful `POST /login` does — the access and refresh cookies
+  in cookie mode, `accessToken` and `refreshToken` in the body in bearer mode,
+  a session row, and `identity.auth.login.success` raised after
+  `identity.user.created`; off, it answers the reference's
+  `201 {"success":true,"userId":"…"}` and nothing else. `DefaultConfig` turns
+  it **on** for every 0.x release, which is how the port always behaved, so an
+  unconfigured deployment answers as before; a `Config` built without
+  `DefaultConfig` starts from `false`. The compatibility note
+  `register-issues-a-session` now describes the option and its default.
+
+  Even with the option on, the login's gates now win, and this changes what a
+  deployment that uses them sees: under `EmailVerificationModeStrict` the new,
+  unverified account gets the plain `201` and no session — registration used
+  to hand out exactly the access token `POST /login` refuses with
+  `403 EMAIL_NOT_VERIFIED` — and under `Require2FA` the registration no longer
+  skips the second factor either. The service logs once at startup when the
+  option and strict are configured together. A refused registration never
+  issues anything. `identity.auth.login.success` is new on the registration
+  path, and `identity.user.created` is now raised before the session is
+  opened, not after. Adapters write the answer through the new
+  `HTTPConfig.WriteRegistration`.
+
+  **Planned for v1.0.0:** the default flips to `false`, the reference's. A
+  deployment that wants registration to log people in will have to say
+  `WithIssueSessionOnRegister(true)`.
 
 ### Changed
 - **`Service.ChangePassword` lets an account with no password set one (#30).**

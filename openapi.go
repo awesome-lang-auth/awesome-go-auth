@@ -649,8 +649,8 @@ func openAPISchemas() map[string]any {
 			"properties": map[string]any{
 				"success":      map[string]any{"type": "boolean", "enum": []bool{true}},
 				"userId":       str,
-				"accessToken":  map[string]any{"type": "string", "description": "Bearer callers only."},
-				"refreshToken": map[string]any{"type": "string", "description": "Bearer callers only."},
+				"accessToken":  map[string]any{"type": "string", "description": "Bearer callers only, and only when the registration opened a session."},
+				"refreshToken": map[string]any{"type": "string", "description": "Bearer callers only, and only when the registration opened a session."},
 			},
 		},
 		// Session is one entry of GET /sessions. It is the response-safe
@@ -814,7 +814,7 @@ func openAPIPaths(prefix string) map[string]any {
 	return map[string]any{
 		prefix + "/register": map[string]any{
 			"post": map[string]any{
-				"summary":     "Register a new user and open a session",
+				"summary":     "Register a new user, and open a session when Config.IssueSessionOnRegister allows it",
 				"operationId": "register",
 				"tags":        []string{"Auth"},
 				"parameters":  tokenDelivery,

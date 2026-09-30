@@ -306,7 +306,7 @@ func (ad *Adapter) register(c echo.Context) error {
 		auth.WriteServiceError(c.Response(), err)
 		return nil
 	}
-	ad.cfg.WriteTokens(c.Response(), c.Request(), http.StatusCreated, tokens, map[string]any{"userId": user.ID})
+	ad.cfg.WriteRegistration(c.Response(), c.Request(), user.ID, tokens)
 	return nil
 }
 

@@ -74,7 +74,7 @@ Low-level constructor. Use `New()` for most cases.
 
 | Method | Description |
 |--------|-------------|
-| `Register(ctx, RegisterInput) (User, AuthTokens, error)` | Create a user and return tokens — see [Registration input](#registration-input) |
+| `Register(ctx, RegisterInput) (User, AuthTokens, error)` | Create a user, and return tokens when [`IssueSessionOnRegister`](#issuesessiononregister) opens a session — see [Registration input](#registration-input) |
 | `Login(ctx, LoginInput) (User, AuthTokens, error)` | Authenticate and return tokens |
 | `Refresh(ctx, refreshToken) (AuthTokens, error)` | Rotate refresh token |
 | `Logout(ctx, refreshToken) error` | Revoke session |
@@ -183,6 +183,7 @@ type Config struct {
     EmailVerificationTTL  time.Duration                 // default: 24h
     EmailVerificationMode string                        // none|lazy|strict (default: none)
     EmailChangeTTL        time.Duration                 // default: 24h
+    IssueSessionOnRegister bool                         // default: true in 0.x, false from v1.0.0 — see IssueSessionOnRegister
     ClockSkew             time.Duration                 // default: 5s
     MinPasswordLen        int                           // default: 8
     BcryptCost            int                           // default: bcrypt.DefaultCost (10); 0 means unset
@@ -216,10 +217,8 @@ user is already verified. It still applies to users that reach the store another
 (admin provisioning, a data import, a custom `UserStore` whose column defaults to
 `false`). `lazy` is the only mode that lets an unverified address log in.
 
-Two limitations apply to `strict`:
+One limitation applies to `strict`:
 
-- `Register` still returns a usable `AuthTokens` pair, so the mode gates `Login`
-  rather than access as a whole ([#21](https://github.com/nik2208/awesome-go-auth/issues/21)).
 - `POST /send-verification-email` mints and persists the token and answers
   `{"success": true}`; it mails it only when `Config.SendEmailVerification` is
   wired (`WithEmailVerificationSender`, or
@@ -228,6 +227,24 @@ Two limitations apply to `strict`:
   deployment with no email block does, so a `strict` deployment either wires a
   sender or sends the mail itself from the token `SendVerificationEmailToken`
   returns.
+
+### `IssueSessionOnRegister`
+
+Whether `POST <prefix>/register` (and `Service.Register`) also logs the new account
+in is the instance administrator's choice — the family option of the same name
+([#21](https://github.com/nik2208/awesome-go-auth/issues/21)).
+
+| `IssueSessionOnRegister` | `201` body | cookies / tokens | session row |
+|---|---|---|---|
+| `true` — `DefaultConfig` in every 0.x release | `{"success": true, "userId": "…"}` | as `POST /login`: the access and refresh cookies, or `accessToken` / `refreshToken` in the body with `X-Auth-Strategy: bearer` | created, and `identity.auth.login.success` raised |
+| `false` — the reference's answer, and the default from v1.0.0 | `{"success": true, "userId": "…"}` | none | none |
+
+Even when it is `true`, the login's gates win: an account `POST /login` would not
+log straight in gets the plain `201` and no session — an unverified address under
+`EmailVerificationMode` `strict` (the service logs this once at startup when both
+are configured), or any account under `Require2FA`. A refused registration never
+issues anything. `WithIssueSessionOnRegister(false)` gives the reference's answer
+today; a `Config` built without `DefaultConfig` starts at `false`.
 
 ### `TwoFactorAppName` and the TOTP parameters
 

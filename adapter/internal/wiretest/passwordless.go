@@ -1134,8 +1134,14 @@ func testTwoFactor(t *testing.T, mount Mounter) {
 	})
 
 	t.Run("disable refuses under a system-wide policy", func(t *testing.T) {
-		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithRequire2FA(true))
-		_, tokens := env.Seed("policy@example.com")
+		// The account is seeded, and its session opened, by an instance without
+		// the policy: under Require2FA registration issues no session (the
+		// login would answer a challenge instead, #21). The instance under test
+		// shares its stores and its secret, so the token is a live one there.
+		users, sessions := auth.NewMemoryUserStore(), auth.NewMemorySessionStore()
+		seeder := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithUserStore(users), auth.WithSessionStore(sessions))
+		_, tokens := seeder.Seed("policy@example.com")
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithUserStore(users), auth.WithSessionStore(sessions), auth.WithRequire2FA(true))
 
 		rec := env.Do(passwordlessBearer(env.Request(http.MethodPost, "/2fa/disable", nil), tokens.AccessToken))
 		AssertError(t, rec, http.StatusForbidden, "Cannot disable 2FA: required by system policy", auth.CodeTwoFactorRequired)

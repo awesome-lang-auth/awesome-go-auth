@@ -125,19 +125,21 @@ var wantClaims = map[string][]string{
 		"MinRefreshInterval", "invalidateCache", "RS256", "401",
 	},
 	"csrf-cookie-not-reissued-with-tokens": {"Set-Cookie", "setTokenCookies"},
-	// Both halves of the difference, the fact that there is no way back to the
-	// reference (an entry that dropped "no knob" would read as a documented
-	// option a deployment could take), and — the part that must survive every
-	// future reword — that this is a provisional record of the defect tracked as
-	// nik2208/awesome-go-auth#21, that what it costs is the email verification
-	// gate, and that awesome-lambda-auth's contract suite already classifies it
-	// that way. An entry that keeps the wire facts but loses the bypass reads as
-	// a settled product decision, which is exactly what it is not.
+	// Both halves of the difference; the option that decides it, its 0.x
+	// default and the release that flips it (an entry that lost "v1.0.0" would
+	// read as a permanent divergence, one that lost the option as a difference
+	// with no way back); and — the part that must survive every reword — that
+	// the email verification gate wins over the option, which is what
+	// nik2208/awesome-go-auth#21 was filed about. An entry that kept the wire
+	// facts but lost the gate would read as if a strict deployment could still
+	// hand out the credential its login withholds.
 	"register-issues-a-session": {
 		"201", "userId", "accessToken", "refreshToken", "Set-Cookie",
-		"sendTokens", "POST /login", "no knob",
-		"Provisional", "email verification", "nik2208/awesome-go-auth#21",
-		"cases_register_test.go", "EMAIL_NOT_VERIFIED",
+		"sendTokens", "POST /login",
+		"Config.IssueSessionOnRegister", "WithIssueSessionOnRegister(false)",
+		"DefaultConfig", "v1.0.0", "issueSessionOnRegister",
+		"email verification gate wins", "EmailVerificationModeStrict", "EMAIL_NOT_VERIFIED",
+		"nik2208/awesome-go-auth#21", "cases_register_test.go",
 	},
 	// The last four claims are U15's: the entry now covers all three routers,
 	// and the one fact a reader must not lose is that the admin console's pair
