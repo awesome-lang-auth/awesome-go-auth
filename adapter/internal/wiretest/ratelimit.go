@@ -183,10 +183,14 @@ func testRateLimitSkipsJWKS(t *testing.T, mount Mounter) {
 // The request is a cookie-authenticated GET: it carries a valid access-token
 // cookie and no CSRF cookie, so with no limiter in the way both middlewares
 // leave a mark — the CSRF middleware mints and distributes the cookie, and the
-// auth middleware verifies the token, which reaches the user store. That is the
-// control. With the limiter refusing, all three marks have to be gone: the 429
-// body verbatim, no Set-Cookie at all, and not one store lookup. A limiter
-// mounted inside either middleware fails on one of them.
+// route verifies the token and reads the user it names from the user store.
+// That is the control. The route is GET /me because it is the one whose
+// credential check reaches the user store: since #31 the shared auth
+// middleware verifies the token without a store read, as the reference's
+// does, so a route behind it would leave no store mark to count. With the
+// limiter refusing, all three marks have to be gone: the 429 body verbatim, no
+// Set-Cookie at all, and not one store lookup. A limiter mounted inside the
+// CSRF middleware or behind the credential check fails on one of them.
 func testRateLimitRefusalShortCircuits(t *testing.T, mount Mounter) {
 	probe := func(t *testing.T, limiter func(http.Handler) http.Handler) (*httptest.ResponseRecorder, int) {
 		t.Helper()
@@ -197,7 +201,7 @@ func testRateLimitRefusalShortCircuits(t *testing.T, mount Mounter) {
 		_, tokens := env.Seed("ratelimit@example.com")
 
 		before := store.count()
-		req := env.Request(http.MethodGet, "/sessions", nil)
+		req := env.Request(http.MethodGet, "/me", nil)
 		req.AddCookie(&http.Cookie{Name: hostAccess, Value: tokens.AccessToken})
 		return env.Do(req), store.count() - before
 	}
@@ -207,7 +211,7 @@ func testRateLimitRefusalShortCircuits(t *testing.T, mount Mounter) {
 		AssertStatus(t, rec, http.StatusOK)
 		Cookie(t, rec, hostCSRF)
 		if lookups == 0 {
-			t.Fatalf("the auth middleware made no store lookup, so the control proves nothing")
+			t.Fatalf("the credential check made no store lookup, so the control proves nothing")
 		}
 	})
 
@@ -221,7 +225,7 @@ func testRateLimitRefusalShortCircuits(t *testing.T, mount Mounter) {
 		// arrives without one, so a single Set-Cookie here would mean it ran.
 		AssertNoCookies(t, rec)
 		if lookups != 0 {
-			t.Errorf("the auth middleware made %d store lookup(s) behind a refusal, want 0", lookups)
+			t.Errorf("the credential check made %d store lookup(s) behind a refusal, want 0", lookups)
 		}
 	})
 }

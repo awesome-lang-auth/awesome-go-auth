@@ -183,6 +183,13 @@ func HTTPErrorFor(err error) HTTPError {
 		return HTTPError{}
 	case errors.Is(err, ErrSessionRevoked):
 		return HTTPErrSessionRevoked
+	case errors.Is(err, ErrUserNotFound):
+		// Before ErrInvalidCredentials, which it wraps.
+		return HTTPErrUserNotFound
+	case errors.Is(err, ErrPasswordRequired):
+		return HTTPErrPasswordRequired
+	case errors.Is(err, ErrNewPasswordRequired):
+		return HTTPErrNewPasswordRequired
 	case errors.Is(err, ErrInvalidCredentials):
 		return HTTPErrInvalidCredentials
 	case errors.Is(err, ErrEmailNotVerified):
@@ -225,9 +232,18 @@ func RefreshHTTPError(err error) HTTPError {
 
 // AccessHTTPError maps an access-token verification failure the way the
 // reference auth middleware does.
+//
+// ErrUserNotFound is the one failure that is not the gate's: Service.Me
+// returns it when the token verifies and the user it names is gone, and GET
+// /me answers the reference's 404 {"error":"User not found"} for it
+// (auth.router.ts:1182-1185 at v1.10.8). Service.VerifyAccess, which the
+// middleware calls, never returns it.
 func AccessHTTPError(err error) HTTPError {
-	if errors.Is(err, ErrSessionRevoked) {
+	switch {
+	case errors.Is(err, ErrSessionRevoked):
 		return HTTPErrSessionRevoked
+	case errors.Is(err, ErrUserNotFound):
+		return HTTPErrUserNotFound
 	}
 	return HTTPErrInvalidAccessToken
 }

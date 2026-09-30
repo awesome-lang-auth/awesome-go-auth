@@ -52,11 +52,15 @@ func MountWithConfig(mux *http.ServeMux, a *auth.Auth, cfg auth.HTTPConfig) {
 
 // Middleware validates access tokens and injects user context.
 //
-// It authenticates through Auth.Authenticate, not Auth.Me: the user in context
-// carries the stores' enrichment (metadata, roles, permissions, tenants) but
-// not CustomClaims, because Config.BuildTokenClaims is a mint-time hook — with
-// a ClaimsWebhook behind it, one network round trip per protected request if
-// the middleware ran it. GET /me is the one route that does; see Me.
+// It authenticates through Auth.VerifyAccess, which reads no user store, as
+// the reference's authMiddleware does (auth.middleware.ts:44-61 at v1.10.8):
+// the user in context is built from the verified token — its base claims, tid,
+// and the whole payload in CustomClaims — plus the optional stores' enrichment
+// (metadata, roles, permissions, tenants). A token whose user has been deleted
+// therefore reaches the handler, and the handler answers for the missing user
+// itself (#31). Config.BuildTokenClaims is not run — it is a mint-time hook,
+// with a ClaimsWebhook behind it a network round trip. GET /me is the one route
+// that runs it; see Me.
 func (a *Adapter) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +69,7 @@ func (a *Adapter) Middleware() func(http.Handler) http.Handler {
 				auth.WriteHTTPError(w, auth.HTTPErrNoAccessToken)
 				return
 			}
-			user, err := a.auth.Authenticate(r.Context(), accessToken)
+			user, err := a.auth.VerifyAccess(r.Context(), accessToken)
 			if err != nil {
 				auth.WriteHTTPError(w, auth.AccessHTTPError(err))
 				return
@@ -333,12 +337,14 @@ func (a *Adapter) Logout(w http.ResponseWriter, r *http.Request) {
 // Me handles GET <prefix>/me. The user object is the whole body: the family
 // clients read it unwrapped.
 //
-// The handler authenticates itself through Auth.Me — Authenticate plus
+// The handler authenticates itself through Auth.Me — the stored user plus
 // Config.BuildTokenClaims — rather than reading the user Middleware put in
 // context, because Middleware deliberately skips the hook and this body is the
 // one place its result (customClaims) is rendered. Mounted bare, as Mount does,
 // the token is verified once and the hook runs once; mounted behind Middleware
-// by a host anyway, the body is the same and the token is verified twice.
+// by a host anyway, the body is the same and the token is verified twice. A
+// token that verifies for a user the store no longer has is the reference's
+// 404 {"error":"User not found"} (auth.router.ts:1182-1185 at v1.10.8, #31).
 func (a *Adapter) Me(w http.ResponseWriter, r *http.Request) {
 	accessToken := auth.AccessTokenFromRequest(r)
 	if accessToken == "" {

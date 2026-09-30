@@ -1,6 +1,9 @@
 package auth
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	ErrInvalidCredentials  = errors.New("auth: invalid credentials")
@@ -35,6 +38,28 @@ var (
 	// not ErrWeakPassword: an absent password is not a rejected one. See
 	// Service.ChangePassword.
 	ErrNewPasswordRequired = errors.New("auth: new password is required")
+
+	// ErrUserNotFound is an authenticated request whose user the UserStore no
+	// longer has: the token verified, and the row it names is gone. It is the
+	// reference's `404 {"error":"User not found"}` on the routes whose handler
+	// looks the user up itself — GET /me, /change-password,
+	// /send-verification-email, /change-email/request (awesome-node-auth v1.10.8
+	// auth.router.ts:1182-1185, :1471-1474, :1519-1521, :1591-1594) — which the
+	// port can reach since its auth gate stopped reading the user store (#31).
+	//
+	// It wraps ErrInvalidCredentials, the sentinel ChangePassword,
+	// SendVerificationEmailToken and RequestEmailChange returned for a missing
+	// user before it existed, so a caller testing errors.Is(err,
+	// ErrInvalidCredentials) on those three still matches. Test for
+	// ErrUserNotFound first to tell the two apart.
+	ErrUserNotFound = fmt.Errorf("%w: user not found", ErrInvalidCredentials)
+
+	// ErrPasswordRequired is an email change requested for an account whose
+	// only credential is the address itself: it has no password, and may not
+	// move the address until it sets one. The reference's 403 PASSWORD_REQUIRED
+	// (awesome-node-auth v1.10.8 auth.router.ts:1595-1601). See
+	// Service.RequestEmailChange.
+	ErrPasswordRequired = errors.New("auth: a password is required to change the email address")
 
 	// ErrEmailNotConfigured and ErrSMSNotConfigured mean the deployment has no
 	// way to deliver the credential a send route just asked for. They are

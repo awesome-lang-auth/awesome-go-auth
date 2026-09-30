@@ -196,10 +196,6 @@ func (a *Adapter) ChangeEmailRequest(w http.ResponseWriter, r *http.Request) {
 	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
-	if httpErr, refused := auth.ChangeEmailInlineError(user); refused {
-		auth.WriteHTTPError(w, httpErr)
-		return
-	}
 	// The change token is discarded for the same reason the reset token is: it is
 	// a credential. The service mails it to the *new* address through
 	// Config.SendEmailChange, and unlike /forgot-password a failed send here is

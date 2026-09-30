@@ -107,13 +107,15 @@ func ResetPasswordHTTPError(err error) HTTPError {
 
 // ChangePasswordHTTPError maps a Service.ChangePassword failure.
 //
-// ErrInvalidCredentials becomes 401 "Current password is incorrect" rather than
-// the reference's 404 "User not found", because the service returns the same
-// sentinel for both and the auth middleware resolved this user from the store
-// moments earlier: a wrong password is the reachable case, a row that vanished
-// in between is not.
+// ErrUserNotFound is the reference's 404 "User not found": the auth gate lets a
+// token through whose user has been deleted, as the reference's does, and the
+// handler's own lookup misses (auth.router.ts:1471-1474 at v1.10.8). It is
+// tested before ErrInvalidCredentials, which it wraps and which is the wrong
+// current password's 401 "Current password is incorrect".
 func ChangePasswordHTTPError(err error) HTTPError {
 	switch {
+	case errors.Is(err, ErrUserNotFound):
+		return HTTPErrUserNotFound
 	case errors.Is(err, ErrNewPasswordRequired):
 		return HTTPErrNewPasswordRequired
 	case errors.Is(err, ErrInvalidCredentials):
@@ -128,12 +130,9 @@ func ChangePasswordHTTPError(err error) HTTPError {
 
 // SendVerificationEmailHTTPError maps a Service.SendVerificationEmailToken failure.
 //
-// The 404 "User not found" branch is not reachable over HTTP in this port and is
-// kept only for a store race: the reference's auth gate trusts the JWT and never
-// reads the store (auth.middleware.ts:60), so its handler's own lookup can miss
-// and answer 404, whereas this port's gate resolves the user through Me() and
-// answers 403 "Invalid or expired access token" for a row that no longer exists.
-// The divergence belongs to the shared middleware, not to this route.
+// ErrUserNotFound is the reference's 404 "User not found" for a token whose user
+// has been deleted (auth.router.ts:1519-1521 at v1.10.8), reachable since the
+// auth gate stopped reading the user store (#31).
 func SendVerificationEmailHTTPError(err error) HTTPError {
 	switch {
 	case errors.Is(err, ErrDeliveryFailed):
@@ -147,6 +146,8 @@ func SendVerificationEmailHTTPError(err error) HTTPError {
 	case errors.Is(err, ErrFeatureNotSupported):
 		return HTTPErrEmailVerificationStoreMissing
 	case errors.Is(err, ErrInvalidCredentials):
+		// ErrUserNotFound, and the bare sentinel a host wrapper may still return
+		// for the same case.
 		return HTTPErrUserNotFound
 	default:
 		return HTTPErrInternal
@@ -165,10 +166,11 @@ func VerifyEmailHTTPError(err error) HTTPError {
 	}
 }
 
-// ChangeEmailRequestHTTPError maps a Service.RequestEmailChange failure.
+// ChangeEmailRequestHTTPError maps an Auth.RequestEmailChange failure.
 //
-// As on /send-verification-email, the 404 branch is a store-race path only: this
-// port's auth gate answers 403 where the reference's handler would answer 404.
+// ErrUserNotFound is the reference's 404 for a token whose user has been
+// deleted (auth.router.ts:1591-1594 at v1.10.8), and ErrPasswordRequired its
+// 403 PASSWORD_REQUIRED (:1595-1601).
 func ChangeEmailRequestHTTPError(err error) HTTPError {
 	switch {
 	case errors.Is(err, ErrDeliveryFailed):
@@ -183,7 +185,10 @@ func ChangeEmailRequestHTTPError(err error) HTTPError {
 		// Not the catalog's 409 USER_EXISTS: this route's 409 is code-less and
 		// says "Email address is already in use".
 		return HTTPErrEmailInUse
+	case errors.Is(err, ErrPasswordRequired):
+		return HTTPErrPasswordRequired
 	case errors.Is(err, ErrInvalidCredentials):
+		// ErrUserNotFound, which wraps it.
 		return HTTPErrUserNotFound
 	default:
 		return HTTPErrInternal
@@ -210,7 +215,8 @@ func ChangeEmailConfirmHTTPError(err error) HTTPError {
 // reference's v1.10.8 order — after the user lookup and for every account, not
 // only a passwordless one (auth.router.ts:1471-1479) — and answers it as
 // ErrNewPasswordRequired, which ChangePasswordHTTPError maps to the same 400.
-// The adapters no longer call this.
+// The adapters no longer call this. It also reads user.PasswordHash, which the
+// user the auth middleware puts in context does not carry since #31.
 func ChangePasswordInlineError(user User, currentPassword, newPassword string) (HTTPError, bool) {
 	if user.PasswordHash == "" && currentPassword == "" && newPassword == "" {
 		return HTTPErrNewPasswordRequired, true
@@ -220,14 +226,14 @@ func ChangePasswordInlineError(user User, currentPassword, newPassword string) (
 
 // ChangeEmailInlineError reproduces the reference's PASSWORD_REQUIRED guard on
 // /change-email/request: an account whose only credential is the address itself
-// may not move that address (auth.router.ts:1015-1021).
+// may not move that address (auth.router.ts:1595-1601 at v1.10.8).
 //
-// The reference runs this check after the 409 and 404 branches; here it runs
-// before them, because the service persists the pending change in the same call
-// that would report those two failures and there is no point at which the guard
-// could still run without leaving a token behind. The status and code are
-// therefore exact, and only the precedence between two simultaneous failures
-// differs.
+// Deprecated: Auth.RequestEmailChange makes this check itself now, against the
+// stored row and in the reference's order — after the 409 and 404 branches —
+// and answers it as ErrPasswordRequired, which ChangeEmailRequestHTTPError maps
+// to the same 403. The adapters no longer call this. The user the auth
+// middleware puts in context is built from the token since #31 and carries no
+// password hash, so calling this with it refuses every account.
 func ChangeEmailInlineError(user User) (HTTPError, bool) {
 	if user.PasswordHash == "" {
 		return HTTPErrPasswordRequired, true
@@ -349,9 +355,15 @@ func (a *Auth) VerifyEmail(ctx context.Context, in VerifyEmailInput) error {
 	return a.service.VerifyEmail(ctx, in)
 }
 
-// RequestEmailChange delegates to Service.RequestEmailChange.
+// RequestEmailChange performs POST /change-email/request: Service.RequestEmailChange
+// plus the reference's PASSWORD_REQUIRED guard, which refuses an account with
+// no password with ErrPasswordRequired. The guard runs after the 409 and 404
+// branches and before anything is stored, the reference's order
+// (auth.router.ts:1586-1601 at v1.10.8). It reads the stored row, because the
+// user the auth middleware puts in context is built from the token and carries
+// no password hash (#31).
 func (a *Auth) RequestEmailChange(ctx context.Context, in ChangeEmailRequestInput) (string, error) {
-	return a.service.RequestEmailChange(ctx, in)
+	return a.service.requestEmailChange(ctx, in, true)
 }
 
 // ConfirmEmailChange delegates to Service.ConfirmEmailChange.

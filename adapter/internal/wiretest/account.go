@@ -796,9 +796,11 @@ func testDeleteAccount(t *testing.T, mount Mounter) {
 			AssertCleared(t, rec, name)
 		}
 
-		// The user record is gone, so the access token no longer resolves.
+		// The user record is gone. The access token still verifies — the gate
+		// reads no user store, as the reference's does — and /me's own lookup
+		// misses: the reference's 404 (auth.router.ts:1182-1185 at v1.10.8, #31).
 		me := env.Do(Replay(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+"/me", nil), login))
-		AssertError(t, me, http.StatusForbidden, "Invalid or expired access token", "")
+		AssertError(t, me, http.StatusNotFound, "User not found", "")
 
 		// And the session was revoked before the record was deleted, so the
 		// refresh credential reports the family's fast-logout code.
@@ -840,7 +842,7 @@ func testDeleteAccount(t *testing.T, mount Mounter) {
 		}
 
 		me := env.Do(bearerRequest(http.MethodGet, env.Config.Prefix()+"/me", tokens.AccessToken))
-		AssertError(t, me, http.StatusForbidden, "Invalid or expired access token", "")
+		AssertError(t, me, http.StatusNotFound, "User not found", "")
 	})
 
 	// No credential at all: the reference's authMiddleware answers

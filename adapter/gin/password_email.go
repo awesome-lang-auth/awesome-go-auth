@@ -164,10 +164,6 @@ func (ad *Adapter) changeEmailRequest(c *gin.Context) {
 	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
-	if httpErr, refused := auth.ChangeEmailInlineError(user); refused {
-		auth.WriteHTTPError(c.Writer, httpErr)
-		return
-	}
 	in := auth.ChangeEmailRequestInput{
 		UserID:   user.ID,
 		TenantID: user.TenantID,

@@ -60,6 +60,7 @@ func Run(t *testing.T, mount Mounter) {
 	t.Run("Me", func(t *testing.T) { testMe(t, mount) })
 	t.Run("Claims", func(t *testing.T) { testClaims(t, mount) })
 	t.Run("SessionRevoked", func(t *testing.T) { testSessionRevoked(t, mount) })
+	t.Run("DeletedUser", func(t *testing.T) { testDeletedUser(t, mount) })
 	t.Run("Sessions", func(t *testing.T) { testSessions(t, mount) })
 	t.Run("Account", func(t *testing.T) { testAccount(t, mount) })
 	t.Run("CookieNames", func(t *testing.T) { testCookieNames(t, mount) })

@@ -278,30 +278,24 @@ func (s *Service) Logout(ctx context.Context, refreshToken string) error {
 	return nil
 }
 
-// Authenticate verifies an access token and returns the user it names. The
-// token's signature, type, issuer and lifetime are checked, the session is
-// validated when Config.SessionCheckOn is "allcalls", and the user is loaded
-// from the UserStore; the failure sentinels are Me's — ErrInvalidToken,
-// ErrSessionNotFound, ErrSessionRevoked. It is what the adapters' Middleware
-// calls for every request to a protected route.
+// Authenticate verifies an access token and returns the user it names, read
+// from the UserStore. The token's signature, type, issuer and lifetime are
+// checked, the session is validated when Config.SessionCheckOn is "allcalls",
+// and the user is loaded; the failure sentinels are ErrInvalidToken — for a
+// user the store no longer has, too — ErrSessionNotFound and ErrSessionRevoked.
+//
+// It is not the adapters' auth gate any more: since #31 their Middleware calls
+// VerifyAccess, which reads no user store, as the reference's authMiddleware
+// does. Authenticate stays for the callers that need the stored row behind a
+// token — the IdP's userinfo endpoint, the identity half of POST /link-request —
+// and for a host that wants deletion to take effect on its own routes at once.
 //
 // The user comes back with the optional stores' enrichment — metadata, roles,
-// permissions, tenants — because host handlers behind the middleware read those
-// off UserFromContext for their own authorisation decisions, and each is a
-// local store read that never fails the request: a store error is logged and
-// the field left empty, as it always was. What Authenticate does not do is run
-// Config.BuildTokenClaims, so CustomClaims is nil. The builder is a mint-time
-// hook — with a ClaimsWebhook behind it, a network round trip — and what it
-// computed is already inside the token the request carried; running it again
-// on every request would make each protected route pay for a claim set nothing
-// reads. Me is the call that runs it, for the one route whose body is the
-// profile. This is also where the reference draws the line: its authMiddleware
-// verifies the token and hands the route the verified payload as req.user
-// (auth.middleware.ts:44-61). It does consult the session store — the allcalls
-// check at :47-53 and the last-active touch at :56-58 — but never the user
-// store and never buildTokenPayload; only its /me calls buildPayload again.
-// Authenticate reads the user store in addition, because the Go middleware
-// hands the route a User rather than a payload.
+// permissions, tenants — each a local store read that never fails the request:
+// a store error is logged and the field left empty. What Authenticate does not
+// do is run Config.BuildTokenClaims, so CustomClaims is nil: the builder is a
+// mint-time hook — with a ClaimsWebhook behind it, a network round trip — and
+// Me is the call that runs it, for the one route whose body is the profile.
 func (s *Service) Authenticate(ctx context.Context, accessToken string) (User, error) {
 	claims, err := s.parseToken(accessToken, "access")
 	if err != nil {
@@ -317,18 +311,81 @@ func (s *Service) Authenticate(ctx context.Context, accessToken string) (User, e
 	return s.enrichFromStores(ctx, user), nil
 }
 
-// Me is Authenticate plus the custom claims: the profile GET /me renders, with
-// CustomClaims filled from Config.BuildTokenClaims so that the body reflects
-// the hook the way the reference's /me does — its body is buildPayload(user)
-// (auth.router.ts:656-680). A builder failure is logged and leaves CustomClaims
-// nil rather than failing the call, as it always has: /me is a read, and a read
-// should not go dark because a mint-time hook is down.
-func (s *Service) Me(ctx context.Context, accessToken string) (User, error) {
-	user, err := s.Authenticate(ctx, accessToken)
+// VerifyAccess verifies an access token and returns the principal it carries,
+// built from the verified claims without reading the UserStore. It is what the
+// adapters' Middleware calls for every request to a protected route.
+//
+// This is the reference's authMiddleware (awesome-node-auth v1.10.8
+// auth.middleware.ts:44-61): it verifies the token, consults the session store
+// only for the allcalls check, and hands the route the verified payload as
+// req.user. It never reads the user store, so a token whose user has since been
+// deleted still reaches the handler, and each handler answers for the missing
+// user itself — GET /me, /change-password, /send-verification-email and
+// /change-email/request with the reference's 404 "User not found" (#31).
+//
+// The checks are Authenticate's up to the user lookup, with the same sentinels:
+// ErrInvalidToken for a token that does not verify, and, under
+// SessionCheckOn "allcalls", ErrSessionNotFound or ErrSessionRevoked for a
+// session that is gone — SESSION_REVOKED on the wire, unchanged. The principal
+// is UserFromRS256Claims of the payload: the six base claims (sub, email,
+// role, loginProvider, isEmailVerified, isTotpEnabled) plus tid. CustomClaims
+// is nil, as Authenticate leaves it. Fields the token cannot carry —
+// PasswordHash, FirstName, PhoneNumber, CreatedAt and the rest of the stored
+// row — are zero; a handler that needs them reads the store, as the
+// reference's handlers do.
+//
+// The optional stores' enrichment is kept: Metadata, Roles, Permissions and
+// Tenants are filled as Authenticate fills them, keyed by the token's subject,
+// because host handlers behind the middleware read them off UserFromContext for
+// their own authorisation decisions. It is the one read the reference's gate
+// does not make, and it cannot fail the request.
+//
+// The consequence is the reference's, and it is a posture: deleting a user no
+// longer locks out an access token already issued to them. The token keeps
+// passing the gate until it expires — Config.AccessTokenTTL — unless
+// SessionCheckOn is "allcalls" and the session was revoked, which is what
+// Service.DeleteAccount does first.
+func (s *Service) VerifyAccess(ctx context.Context, accessToken string) (User, error) {
+	claims, payload, err := s.accessTokenPayload(accessToken)
 	if err != nil {
 		return User{}, err
 	}
-	return s.enrichCustomClaims(ctx, user), nil
+	if err := s.validateSessionForAccess(ctx, claims); err != nil {
+		return User{}, err
+	}
+	user := UserFromRS256Claims(payload)
+	// CustomClaims stays nil, as Authenticate leaves it: the payload is not
+	// re-exposed as claims a host route could echo back, and the hook's
+	// output is Me's to render.
+	user.CustomClaims = nil
+	return s.enrichFromStores(ctx, user), nil
+}
+
+// Me is the profile GET /me renders: the token verified as VerifyAccess
+// verifies it, the user then read from the UserStore, and CustomClaims filled
+// from Config.BuildTokenClaims, so that the body reflects the hook the way the
+// reference's /me does — its body is buildPayload(user) (auth.router.ts:656-680).
+//
+// A user the store no longer has is ErrUserNotFound, the reference's
+// 404 {"error":"User not found"} (awesome-node-auth v1.10.8
+// auth.router.ts:1182-1185): its gate lets the token through and the handler's
+// own findById misses. Before #31 this was ErrInvalidToken. A builder failure
+// is logged and leaves CustomClaims nil rather than failing the call, as it
+// always has: /me is a read, and a read should not go dark because a mint-time
+// hook is down.
+func (s *Service) Me(ctx context.Context, accessToken string) (User, error) {
+	claims, err := s.parseToken(accessToken, "access")
+	if err != nil {
+		return User{}, err
+	}
+	if err := s.validateSessionForAccess(ctx, claims); err != nil {
+		return User{}, err
+	}
+	user, err := s.users.GetUserByID(ctx, claims.Sub, claims.Tid)
+	if err != nil {
+		return User{}, ErrUserNotFound
+	}
+	return s.enrichCustomClaims(ctx, s.enrichFromStores(ctx, user)), nil
 }
 
 // The `data.method` values the dev line writes on identity.auth.login.success
@@ -552,7 +609,8 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // account that has none — the reference's POST /change-password
 // (awesome-node-auth v1.10.8 auth.router.ts:1465-1500), in its order:
 //
-//  1. the user is looked up; a missing one is ErrInvalidCredentials;
+//  1. the user is looked up; a missing one is ErrUserNotFound, the
+//     reference's 404 (#31);
 //  2. an empty NewPassword is ErrNewPasswordRequired, whatever the account;
 //  3. only an account that has a password must present it: an empty or wrong
 //     CurrentPassword is ErrInvalidCredentials. An account with no stored
@@ -572,7 +630,7 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) error {
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return ErrInvalidCredentials
+		return ErrUserNotFound
 	}
 	if in.NewPassword == "" {
 		return ErrNewPasswordRequired
@@ -839,7 +897,7 @@ func (s *Service) SendVerificationEmailToken(ctx context.Context, in EmailVerifi
 	}
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return "", ErrInvalidCredentials
+		return "", ErrUserNotFound
 	}
 	if user.IsEmailVerified {
 		return "", nil
@@ -888,7 +946,24 @@ func (s *Service) VerifyEmail(ctx context.Context, in VerifyEmailInput) error {
 	return nil
 }
 
+// RequestEmailChange mints an email-change token for the user and mails it to
+// the new address. It refuses a store that cannot hold a pending change
+// (ErrFeatureNotSupported), an address already in use (ErrUserExists) and a
+// user the store no longer has (ErrUserNotFound), before anything is stored.
+//
+// It does not refuse an account with no password; Auth.RequestEmailChange,
+// the HTTP surface, does, as the reference's route does.
 func (s *Service) RequestEmailChange(ctx context.Context, in ChangeEmailRequestInput) (string, error) {
+	return s.requestEmailChange(ctx, in, false)
+}
+
+// requestEmailChange is RequestEmailChange with the reference's
+// PASSWORD_REQUIRED guard as an option. With requirePassword the refusals come
+// in the reference's order (awesome-node-auth v1.10.8 auth.router.ts:1575-1601):
+// the store capability, the address in use (409), the missing user (404), and
+// then an account whose only credential is the address itself
+// (ErrPasswordRequired, 403) — all four before anything is stored.
+func (s *Service) requestEmailChange(ctx context.Context, in ChangeEmailRequestInput, requirePassword bool) (string, error) {
 	ecs, ok := s.users.(EmailChangeStore)
 	if !ok {
 		return "", ErrFeatureNotSupported
@@ -899,7 +974,10 @@ func (s *Service) RequestEmailChange(ctx context.Context, in ChangeEmailRequestI
 	}
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return "", ErrInvalidCredentials
+		return "", ErrUserNotFound
+	}
+	if requirePassword && user.PasswordHash == "" {
+		return "", ErrPasswordRequired
 	}
 	token, err := randomToken(32)
 	if err != nil {

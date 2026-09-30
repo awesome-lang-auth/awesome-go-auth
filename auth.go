@@ -613,10 +613,17 @@ func (a *Auth) Me(ctx context.Context, accessToken string) (User, error) {
 	return a.service.Me(ctx, accessToken)
 }
 
-// Authenticate delegates to Service.Authenticate: Me without the custom-claim
-// enrichment, which is what the adapters' Middleware calls.
+// Authenticate delegates to Service.Authenticate: the token verified and the
+// user read from the store, without the custom-claim enrichment.
 func (a *Auth) Authenticate(ctx context.Context, accessToken string) (User, error) {
 	return a.service.Authenticate(ctx, accessToken)
+}
+
+// VerifyAccess delegates to Service.VerifyAccess: the token verified and the
+// principal built from its claims, with no user-store read. It is what the
+// adapters' Middleware calls.
+func (a *Auth) VerifyAccess(ctx context.Context, accessToken string) (User, error) {
+	return a.service.VerifyAccess(ctx, accessToken)
 }
 
 // UpdateProfile delegates to Service.UpdateProfile.

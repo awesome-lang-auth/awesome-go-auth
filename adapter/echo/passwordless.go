@@ -197,7 +197,7 @@ func (ad *Adapter) twoFactorSetup(c echo.Context) error {
 		auth.WriteHTTPError(c.Response(), auth.HTTPErrNoAccessToken)
 		return nil
 	}
-	setup, err := ad.auth.StartTOTPEnrolment(c.Request().Context(), user.ID, user.TenantID)
+	setup, err := ad.auth.NewTOTPEnrolment(user.Email)
 	if err != nil {
 		auth.WriteServiceError(c.Response(), err)
 		return nil
