@@ -1924,6 +1924,7 @@ type IDPConfig struct {
     Codes           AuthCodeStore // nil → NewMemoryAuthCodeStore()
     CodeTTL         time.Duration // 0 → 5 minutes
     RefreshTokens   IDPRefreshTokenStore // nil → NewMemoryIDPRefreshTokenStore()
+    DisableRefreshTokenGrant bool       // true → no refresh_token grant, not advertised
     JWKSPath        string        // "" → DefaultJWKSPath, "/.well-known/jwks.json"
     JWKSCORSOrigins []string      // nil → "*"
     JWKSURL         string        // "" → Issuer + JWKSPath, for jwks_uri
@@ -2193,7 +2194,7 @@ type IDPRefreshToken struct {
 type IDPRefreshTokenStore interface {
     SaveRefreshToken(ctx context.Context, token IDPRefreshToken) error
     ConsumeRefreshToken(ctx context.Context, tokenHash string) (IDPRefreshToken, error)
-    RevokeRefreshTokenFamily(ctx context.Context, familyID string) error
+    RevokeRefreshTokenFamily(ctx context.Context, familyID string, until time.Time) error
 }
 ```
 
@@ -2208,6 +2209,18 @@ The contract, in full in the `IDPRefreshTokenStore` doc comment:
 - Unknown, expired and revoked-family tokens are absent: `ErrInvalidToken`.
 - `RevokeRefreshTokenFamily` is permanent and covers a member saved after it,
   because a rotation (consume, then save) can race a concurrent replay.
+  `until` is the family's expiry, the natural TTL of a revocation marker.
+- Expiry is decided by the store at the call, not left to a background TTL
+  that deletes late.
+- Store errors other than the two sentinels are answered `server_error`, and
+  nothing is revoked on them.
+
+On a store without multi-item atomicity the consume is the hard part: with
+DynamoDB it has to be one `TransactWriteItems` — a `ConditionCheck` that the
+family's revocation item does not exist, plus the conditional update that
+marks the token used (`attribute_not_exists(usedAt)` and `ExpiresAt > :now`)
+— because reading the family first and updating second lets a revocation land
+in between. The doc comment spells out the layout.
 
 `IDPConfig.RefreshTokens` left nil selects `NewMemoryIDPRefreshTokenStore()`,
 which, like the code store's default, is correct only in a single process.
@@ -2269,9 +2282,9 @@ another.
 that is what `RegisterHandlers` has always done with its method-less
 `http.ServeMux` patterns and because the handlers discriminate themselves:
 `authorize` reads `r.Method` to tell its form from its credential post, `token`
-reads `grant_type` out of the form, `userinfo` reads the `Authorization`
-header. So `GET <prefix>/token` is `400 unsupported_grant_type` from the
-handler, not a 405 from the router. This is the one place the IdP surface
+refuses every method but `POST`, `userinfo` reads the `Authorization`
+header. So `GET <prefix>/token` is `405` with `Allow: POST` and the JSON
+error body from the handler, not a 405 from the router. This is the one place the IdP surface
 differs from the JWKS route, which is `GET` (and `HEAD`) only because the
 reference registers it that way.
 
@@ -2291,6 +2304,11 @@ a relying party is on the other end.
 These have no counterpart in the reference, whose IdP mode is the JWKS route
 alone; they follow the OAuth and OIDC specifications.
 
+- **The request** is a `POST` with an `application/x-www-form-urlencoded`
+  body; any other method is `405` with `Allow: POST` (RFC 6749 §3.2). A
+  `client_id`, `client_secret`, `code`, `code_verifier` or `refresh_token` in
+  the URL query is `400 invalid_request` rather than read (§2.3.1): a URL
+  ends up in access logs, proxies and browser history.
 - **Client authentication** is `client_secret_basic` or `client_secret_post`,
   both advertised in `token_endpoint_auth_methods_supported`. Basic
   credentials are form-urlencoded before they are base64-encoded (RFC 6749
@@ -2298,7 +2316,17 @@ alone; they follow the OAuth and OIDC specifications.
   invalid_request`, as is a `client_id` in the body that names a different
   client from the Basic one. A wrong secret is `401 invalid_client`, with
   `WWW-Authenticate: Basic realm="token"` when Basic was tried. Secrets are
-  compared in constant time.
+  compared in constant time. `NewIDP` refuses an empty or duplicated
+  `ClientID`.
+- **Public clients.** An `IDPClient` with an empty `ClientSecret` is a public
+  client — a browser or native app that cannot keep a secret. It
+  authenticates by `client_id` alone (`none`, which discovery then
+  advertises), and presenting any secret, even an empty one or an empty
+  Basic password, is `401 invalid_client`. `authorize` refuses it without an
+  `S256` challenge (RFC 9700 §2.1.1: public clients MUST use PKCE), with the
+  same error redirect as below. It may receive refresh tokens: RFC 9700
+  §4.14.2 allows them for a public client when they are sender-constrained
+  or rotated, and these are rotated with reuse detection.
 - **PKCE** is `S256` only (`code_challenge_methods_supported: ["S256"]`).
   `authorize` answers `plain`, a challenge with no method (RFC 7636 §4.3
   reads that as `plain`), a method with no challenge, and a challenge that is
@@ -2306,27 +2334,61 @@ alone; they follow the OAuth and OIDC specifications.
   `302` to the registered `redirect_uri` with `error=invalid_request`,
   `error_description` and `state`. A code issued with a challenge is redeemed
   only with the matching `code_verifier`; a missing or wrong one is `400
-  invalid_grant` and burns the code. A code issued without a challenge is
-  redeemed as before.
+  invalid_grant` and burns the code. A `code_verifier` sent for a code issued
+  *without* a challenge is refused too: a client that sends a verifier sent a
+  challenge, so its absence means it was stripped or the code injected — the
+  downgrade RFC 9700 §2.1.1 requires the server to catch.
+- **The code** must be redeemed by the client it was issued to and with the
+  same `redirect_uri` the authorization request carried; a missing or
+  different one is `400 invalid_grant` (RFC 6749 §4.1.3). A code presented a
+  second time is refused and, when the code store implements the optional
+  `AuthCodeReplayStore` (`MemoryAuthCodeStore` does), also revokes the
+  session and the refresh-token family that code produced (§4.1.2). The
+  record is kept for the code's own lifetime, `IDPConfig.CodeTTL`.
 - **Refresh tokens** are issued only when the code was granted
   `offline_access` (OIDC Core §11), and are opaque. `grant_type=refresh_token`
   consumes the presented token and returns a new one with a new access token
   for the same session. A token presented a second time, presented by another
-  client, or presented after its session was revoked or expired is `400
-  invalid_grant` and revokes every token of its grant (RFC 9700 §4.14.2).
-  `scope` may narrow the granted scope and never widen it (`400
+  client, or presented after its session was revoked, expired or deleted is
+  `400 invalid_grant` and revokes every token of its grant (RFC 9700
+  §4.14.2). A store that fails answers `500 server_error` and revokes
+  nothing. `scope` may narrow the granted scope and never widen it (`400
   invalid_scope`); the answer carries the effective `scope`, and an
   `id_token`, with no `nonce`, while that scope includes `openid`. The
   narrowing is visible there only: the access token is the session's HS256
   token and carries no scope claim. A grant lives as long as the session the
   code opened, `Config.RefreshTokenTTL`, and rotation does not extend it.
-  The state is kept in `IDPConfig.RefreshTokens`, an `IDPRefreshTokenStore`
-  whose doc comment is the implementor's contract (atomic single-use consume,
-  used tokens kept as tombstones until expiry, family revocation that also
-  covers a token saved after it); the default `MemoryIDPRefreshTokenStore`
-  is in-process only. With a session store that implements neither
-  `SessionLookupStore` nor `SessionAdminStore` no refresh token is issued,
-  since the grant could not check the session.
+- **Turning the grant off.** `IDPConfig.DisableRefreshTokenGrant` stops
+  refresh tokens being issued, answers `grant_type=refresh_token` with
+  `unsupported_grant_type`, and drops `refresh_token` and `offline_access`
+  from discovery. The same happens without the switch when the session store
+  implements neither `SessionLookupStore` nor `SessionAdminStore`, since the
+  grant could not check the session. With the grant on and
+  `IDPConfig.RefreshTokens` nil, the IdP logs once that it is served from the
+  in-memory store: **a deployment with more than one process must supply a
+  shared `IDPRefreshTokenStore`, or turn the grant off**, or a refresh is
+  refused whenever it reaches another process and reuse detection only works
+  within one.
+- **What a relying party cannot do.** It cannot end the session its code
+  opened: the response carries no session refresh token any more, and there
+  is no revocation endpoint (RFC 7009) yet. The session ends when it expires,
+  when it is revoked through the session or admin surface, or when its code
+  is replayed.
+- **Every `invalid_grant` reads the same**, whatever the reason; the reason
+  is logged. A client holding someone else's code or token learns nothing
+  about its state from the description.
+
+Two things are deliberately not done. **Offline access is not a per-client
+permission**: every registered client may ask for `offline_access`, because
+every client is one the host registered itself, and the alternative before
+this grant existed was a session refresh token handed to every client
+unconditionally; a host that wants none for any client sets
+`DisableRefreshTokenGrant`, and a per-client flag is a possible follow-up.
+The requested scope is stored as sent, not checked against
+`scopes_supported`. **A password change or reset does not revoke grants**,
+exactly as it revokes no session, which is also the reference's behaviour
+for its sessions; a grant ends with its session, so a host that revokes a
+user's sessions after a reset ends that user's grants too.
 
 
 **Resource-server mode gates two of them.** `HTTPConfig.ResourceServer`
