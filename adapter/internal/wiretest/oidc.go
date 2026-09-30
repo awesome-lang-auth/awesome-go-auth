@@ -23,10 +23,16 @@ import (
 // That also means this file is where their shapes are pinned for all four
 // adapters — a change in any of them fails here four times.
 //
-// The unhappy paths are the standard library's http.Error: a plain-text line,
-// not the family's JSON error envelope. That is a genuine difference from every
-// other route in this suite and it is asserted as such, so that "fixing" it
-// into an envelope is a visible decision rather than a silent one.
+// The unhappy paths of authorize and userinfo are the standard library's
+// http.Error: a plain-text line, not the family's JSON error envelope. That is
+// a genuine difference from every other route in this suite and it is asserted
+// as such, so that "fixing" it into an envelope is a visible decision rather
+// than a silent one. The token endpoint's are the OAuth error body of RFC 6749
+// §5.2 instead — {"error": ..., "error_description": ...} with Cache-Control:
+// no-store — because that is the one a relying party's OAuth library parses;
+// assertTokenRefusal holds that shape, and oidc_token.go holds the flows
+// behind it: PKCE, the two client authentication methods, and the
+// refresh_token grant.
 //
 // The other half of the contract — that the four are absent without WithIDP,
 // and that the generated OpenAPI document tracks them in both directions — is
@@ -39,19 +45,22 @@ import (
 // where they are. That combination is not a conditional set because the
 // harness's removes field only takes routes the base configuration mounts.
 
-// The one client the suite's IdP registers. authorize and token both refuse
-// every request whose client_id is not registered, so without one the refusals
-// below could not tell an unknown client from an empty registry.
+// The clients the suite's IdP registers. authorize and token both refuse every
+// request whose client_id is not registered, so without one the refusals below
+// could not tell an unknown client from an empty registry; the second is what
+// a token issued to the first is presented by in the wrong-client cases.
 const (
-	testOIDCClientID     = "wiretest-client"
-	testOIDCClientSecret = "wiretest-client-secret"
-	testOIDCRedirectURI  = "https://rp.example.com/callback"
+	testOIDCClientID          = "wiretest-client"
+	testOIDCClientSecret      = "wiretest-client-secret"
+	testOIDCRedirectURI       = "https://rp.example.com/callback"
+	testOIDCOtherClientID     = "wiretest-other-client"
+	testOIDCOtherClientSecret = "wiretest-other-client-secret"
 )
 
 // newTestOIDCIDP builds the IdP the OIDC cases mount: the JWKS group's key,
 // issuer and kid — the key is generated once for the whole binary, see
-// testIDPKey — plus that one registered client, which newTestIDP has no reason
-// to carry.
+// testIDPKey — plus the two registered clients, which newTestIDP has no
+// reason to carry.
 func newTestOIDCIDP() *auth.IDP {
 	// The Service is nil: auth.WithIDP binds the one the Auth is built around,
 	// which is the Service /token and /userinfo then read their user from.
@@ -63,6 +72,12 @@ func newTestOIDCIDP() *auth.IDP {
 			ClientSecret: testOIDCClientSecret,
 			RedirectURIs: []string{testOIDCRedirectURI},
 			Name:         "wiretest relying party",
+		},
+		auth.IDPClient{
+			ClientID:     testOIDCOtherClientID,
+			ClientSecret: testOIDCOtherClientSecret,
+			RedirectURIs: []string{testOIDCRedirectURI},
+			Name:         "wiretest other relying party",
 		},
 	)
 	if err != nil {
@@ -162,7 +177,7 @@ func assertOIDCStringList(t *testing.T, doc map[string]any, member string, want 
 // assertOIDCDiscoveryDocument holds one answer from the discovery endpoint to
 // the frame every one of them has: 200, application/json, no cookie — it is
 // mounted ahead of the CSRF middleware like the JWKS route and a relying party
-// fetches it with no credential at all — and exactly the eleven members. It
+// fetches it with no credential at all — and exactly the thirteen members. It
 // returns the parsed document so a caller can go on to the values.
 func assertOIDCDiscoveryDocument(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
@@ -176,8 +191,8 @@ func assertOIDCDiscoveryDocument(t *testing.T, rec *httptest.ResponseRecorder) m
 	AssertKeys(t, doc,
 		"issuer", "authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri",
 		"response_types_supported", "subject_types_supported",
-		"id_token_signing_alg_values_supported", "scopes_supported",
-		"token_endpoint_auth_methods_supported", "claims_supported",
+		"id_token_signing_alg_values_supported", "scopes_supported", "grant_types_supported",
+		"token_endpoint_auth_methods_supported", "code_challenge_methods_supported", "claims_supported",
 	)
 	return doc
 }
@@ -205,8 +220,10 @@ func testOIDC(t *testing.T, mount Mounter) {
 		assertOIDCStringList(t, doc, "response_types_supported", "code")
 		assertOIDCStringList(t, doc, "subject_types_supported", "public")
 		assertOIDCStringList(t, doc, "id_token_signing_alg_values_supported", "RS256")
-		assertOIDCStringList(t, doc, "scopes_supported", "openid", "email", "profile")
-		assertOIDCStringList(t, doc, "token_endpoint_auth_methods_supported", "client_secret_post")
+		assertOIDCStringList(t, doc, "scopes_supported", "openid", "email", "profile", "offline_access")
+		assertOIDCStringList(t, doc, "grant_types_supported", "authorization_code", "refresh_token")
+		assertOIDCStringList(t, doc, "token_endpoint_auth_methods_supported", "client_secret_basic", "client_secret_post")
+		assertOIDCStringList(t, doc, "code_challenge_methods_supported", "S256")
 		assertOIDCStringList(t, doc, "claims_supported",
 			"sub", "email", "name", "iat", "exp", "iss", "aud", "nonce")
 
@@ -261,7 +278,7 @@ func testOIDC(t *testing.T, mount Mounter) {
 			"client_id":     {testOIDCClientID},
 			"client_secret": {testOIDCClientSecret},
 		}))
-		assertOIDCRefusal(t, rec, http.StatusBadRequest, "invalid_grant")
+		assertTokenRefusal(t, rec, http.StatusBadRequest, "invalid_grant")
 
 		// The client credentials are checked before the code, so an unknown
 		// client is a different refusal with a different status — which is what
@@ -272,7 +289,7 @@ func testOIDC(t *testing.T, mount Mounter) {
 			"client_id":     {"nobody-registered-this"},
 			"client_secret": {testOIDCClientSecret},
 		}))
-		assertOIDCRefusal(t, unknown, http.StatusUnauthorized, "invalid_client")
+		assertTokenRefusal(t, unknown, http.StatusUnauthorized, "invalid_client")
 
 		// And the registered client with the wrong secret is the same refusal:
 		// the endpoint never distinguishes the two for a caller.
@@ -282,16 +299,17 @@ func testOIDC(t *testing.T, mount Mounter) {
 			"client_id":     {testOIDCClientID},
 			"client_secret": {"not-the-secret"},
 		}))
-		assertOIDCRefusal(t, wrongSecret, http.StatusUnauthorized, "invalid_client")
+		assertTokenRefusal(t, wrongSecret, http.StatusUnauthorized, "invalid_client")
 
-		// Only the one grant is implemented, and it is the only one the
-		// discovery document advertises.
+		// Two grants are implemented, and they are the two the discovery
+		// document advertises; any other is refused before the client is
+		// looked at.
 		other := env.Do(oidcForm(env, auth.OIDCTokenPath, url.Values{
 			"grant_type":    {"client_credentials"},
 			"client_id":     {testOIDCClientID},
 			"client_secret": {testOIDCClientSecret},
 		}))
-		assertOIDCRefusal(t, other, http.StatusBadRequest, "unsupported_grant_type")
+		assertTokenRefusal(t, other, http.StatusBadRequest, "unsupported_grant_type")
 	})
 
 	t.Run("userinfo refuses a token nobody signed", func(t *testing.T) {
@@ -330,7 +348,7 @@ func testOIDC(t *testing.T, mount Mounter) {
 		for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
 			t.Run(method+" token", func(t *testing.T) {
 				req := httptest.NewRequest(method, env.Config.Prefix()+auth.OIDCTokenPath, nil)
-				assertOIDCRefusal(t, env.Do(req), http.StatusBadRequest, "unsupported_grant_type")
+				assertTokenRefusal(t, env.Do(req), http.StatusBadRequest, "unsupported_grant_type")
 			})
 		}
 		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {

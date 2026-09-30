@@ -306,8 +306,8 @@ func (f *idpFixture) authorize(t *testing.T, client IDPClient, extra url.Values)
 	return code
 }
 
-// token redeems code at POST /token as the given client.
-func (f *idpFixture) token(t *testing.T, code string, client IDPClient) (int, map[string]any) {
+// token redeems code at POST /token as the given client, by client_secret_post.
+func (f *idpFixture) token(t *testing.T, code string, client IDPClient, extra ...string) (int, map[string]any) {
 	t.Helper()
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -315,18 +315,36 @@ func (f *idpFixture) token(t *testing.T, code string, client IDPClient) (int, ma
 		"client_id":     {client.ClientID},
 		"client_secret": {client.ClientSecret},
 	}
-	resp, err := f.client.PostForm(f.srv.URL+"/oidc/token", form)
+	for i := 0; i+1 < len(extra); i += 2 {
+		form.Set(extra[i], extra[i+1])
+	}
+	status, body, _ := f.postToken(t, form, nil)
+	return status, body
+}
+
+// postToken posts form to /token, authenticating with HTTP Basic when basic
+// is not nil, and decodes the JSON answer whatever its status: every answer of
+// the endpoint, refusals included, is a JSON object.
+func (f *idpFixture) postToken(t *testing.T, form url.Values, basic *IDPClient) (int, map[string]any, http.Header) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, f.srv.URL+"/oidc/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if basic != nil {
+		req.SetBasicAuth(url.QueryEscape(basic.ClientID), url.QueryEscape(basic.ClientSecret))
+	}
+	resp, err := f.client.Do(req)
 	if err != nil {
 		t.Fatalf("POST /token: %v", err)
 	}
 	defer resp.Body.Close()
 	var body map[string]any
-	if resp.StatusCode == http.StatusOK {
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			t.Fatalf("decode /token body: %v", err)
-		}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode /token body (status %d): %v", resp.StatusCode, err)
 	}
-	return resp.StatusCode, body
+	return resp.StatusCode, body, resp.Header
 }
 
 func decodeJWTPayload(t *testing.T, token string) map[string]any {
@@ -355,7 +373,7 @@ func TestIDPAuthorizeTokenUserInfoThroughStore(t *testing.T) {
 	before := time.Now()
 	code := f.authorize(t, idpTestClient, url.Values{
 		"scope":                 {"openid email"},
-		"code_challenge":        {"challenge"},
+		"code_challenge":        {idpTestChallenge},
 		"code_challenge_method": {"S256"},
 	})
 
@@ -373,7 +391,7 @@ func TestIDPAuthorizeTokenUserInfoThroughStore(t *testing.T) {
 	want := AuthCode{
 		CodeHash: rec.CodeHash, UserID: f.user.ID, TenantID: idpTestTenant, ClientID: idpTestClient.ClientID,
 		Nonce: "n-1", RedirectURI: idpTestClient.RedirectURIs[0],
-		CodeChallenge: "challenge", CodeChallengeMethod: "S256", Scope: "openid email",
+		CodeChallenge: idpTestChallenge, CodeChallengeMethod: "S256", Scope: "openid email",
 		ExpiresAt: rec.ExpiresAt,
 	}
 	if rec != want {
@@ -383,9 +401,9 @@ func TestIDPAuthorizeTokenUserInfoThroughStore(t *testing.T) {
 		t.Fatalf("ExpiresAt is %v out, want about IDPConfig.CodeTTL = %v", ttl, idpTestCodeTTL)
 	}
 
-	status, body := f.token(t, code, idpTestClient)
+	status, body := f.token(t, code, idpTestClient, "code_verifier", idpTestVerifier)
 	if status != http.StatusOK {
-		t.Fatalf("POST /token = %d, want 200", status)
+		t.Fatalf("POST /token = %d, want 200 (%v)", status, body)
 	}
 	_, consumed = f.store.snapshot()
 	if len(consumed) != 1 || consumed[0] != hashToken(code) {
@@ -393,8 +411,12 @@ func TestIDPAuthorizeTokenUserInfoThroughStore(t *testing.T) {
 	}
 	accessToken, _ := body["access_token"].(string)
 	idToken, _ := body["id_token"].(string)
-	if accessToken == "" || idToken == "" || body["refresh_token"] == "" {
+	if accessToken == "" || idToken == "" {
 		t.Fatalf("/token body missing tokens: %v", body)
+	}
+	// No offline_access, so no refresh token (OIDC Core §11).
+	if _, ok := body["refresh_token"]; ok {
+		t.Fatalf("/token issued a refresh token without offline_access: %v", body)
 	}
 	if body["token_type"] != "Bearer" || body["expires_in"] != float64(900) {
 		t.Fatalf("/token body = %v, want Bearer / 900", body)
@@ -424,7 +446,7 @@ func TestIDPAuthorizeTokenUserInfoThroughStore(t *testing.T) {
 
 	// Single use: the same code again is refused, and the refusal came from
 	// the store, not from anything the handler remembered.
-	if status, _ := f.token(t, code, idpTestClient); status != http.StatusBadRequest {
+	if status, _ := f.token(t, code, idpTestClient, "code_verifier", idpTestVerifier); status != http.StatusBadRequest {
 		t.Fatalf("replayed code: POST /token = %d, want 400", status)
 	}
 	if _, consumed = f.store.snapshot(); len(consumed) != 2 {
@@ -711,12 +733,12 @@ func TestIDPInjectedSignerSignsIDTokenOnly(t *testing.T) {
 	if claims["sub"] != f.user.ID || claims["aud"] != idpTestClient.ClientID || claims["iss"] != idpTestIssuer {
 		t.Fatalf("id_token claims = %v", claims)
 	}
+	// The access token is the HS256 session token; there is no refresh token
+	// without offline_access, and with it the refresh token is opaque, so
+	// neither is the signer's work.
 	accessToken, _ := body["access_token"].(string)
-	refreshToken, _ := body["refresh_token"].(string)
-	for name, tok := range map[string]string{"access_token": accessToken, "refresh_token": refreshToken} {
-		if alg := decodeJWTHeader(t, tok)["alg"]; alg != "HS256" {
-			t.Fatalf("/token %s alg = %v, want the HS256 session token", name, alg)
-		}
+	if alg := decodeJWTHeader(t, accessToken)["alg"]; alg != "HS256" {
+		t.Fatalf("/token access_token alg = %v, want the HS256 session token", alg)
 	}
 	if calls, _, _ := rec.snapshot(); calls != 1 {
 		t.Fatalf("signer was asked %d times during the code flow, want 1 (the id_token)", calls)
