@@ -132,6 +132,24 @@ func WithSecret(secret string) Option {
 	}
 }
 
+// WithRefreshSecret sets the key refresh tokens are signed and verified with,
+// the reference's refreshTokenSecret. See Config.RefreshSecret: omitted, refresh
+// tokens stay on the WithSecret key, as they were before this Option existed.
+//
+// Unlike the zero value of Config.RefreshSecret, which means "unset" and falls
+// back to Config.Secret, calling this Option with an empty or short secret is
+// an error: an explicit setter reached with an unset value is a caller mistake,
+// not a request for the fallback. Omit the Option to get the fallback.
+func WithRefreshSecret(secret string) Option {
+	return func(b *authBuilder) error {
+		if len(secret) < 32 {
+			return errors.New("auth: refresh secret must be at least 32 chars; omit WithRefreshSecret to sign refresh tokens with the secret")
+		}
+		b.cfg.RefreshSecret = secret
+		return nil
+	}
+}
+
 // WithIssuer configures token issuer.
 func WithIssuer(issuer string) Option {
 	return func(b *authBuilder) error {
