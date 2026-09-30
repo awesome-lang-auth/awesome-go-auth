@@ -680,10 +680,10 @@ func UserFromRS256Claims(claims map[string]any) User {
 //   - anything else is 401 {"error":"Invalid or expired access token",
 //     "code":"INVALID_TOKEN"} (:76-78).
 //
-// The cookie path here is deliberately not Auth.Authenticate, which the
-// adapters' session Middleware uses. Authenticate reads the user store and
-// checks the session for revocation; verifyAccessToken does neither, so this
-// middleware does neither. Two consequences follow, both the reference's: a
+// The cookie path here is deliberately not Auth.VerifyAccess, which the
+// adapters' session Middleware uses. VerifyAccess checks the session for
+// revocation under SessionCheckOn "allcalls"; verifyAccessToken does not, so
+// this middleware does not. Two consequences follow, both the reference's: a
 // cookie whose subject is not in this instance store is still accepted, and a
 // revoked session is accepted until its access token expires — SESSION_REVOKED
 // is a code of the session middleware, and this middleware cannot emit it. A
@@ -784,22 +784,32 @@ func resourceServerPrincipal(r *http.Request, a *Auth, client *JWKSClient, issue
 // them apart by typ. Dropping the check would turn every refresh token into an
 // access credential here, which the reference never does.
 func (s *Service) verifyLocalAccessToken(token string) (map[string]any, error) {
-	if _, err := s.parseToken(token, "access"); err != nil {
-		return nil, err
+	_, claims, err := s.accessTokenPayload(token)
+	return claims, err
+}
+
+// accessTokenPayload is parseToken for an access token, returning the
+// verified payload twice: as the seven-field struct the session check reads,
+// and as the whole claim map a principal is built from. It reads no store.
+// verifyLocalAccessToken and Service.VerifyAccess are its two callers.
+func (s *Service) accessTokenPayload(token string) (tokenClaims, map[string]any, error) {
+	parsed, err := s.parseToken(token, "access")
+	if err != nil {
+		return tokenClaims{}, nil, err
 	}
 	_, payload, _, err := splitToken(token)
 	if err != nil {
-		return nil, ErrInvalidToken
+		return tokenClaims{}, nil, ErrInvalidToken
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(payload)
 	if err != nil {
-		return nil, ErrInvalidToken
+		return tokenClaims{}, nil, ErrInvalidToken
 	}
 	var claims map[string]any
 	if err := json.Unmarshal(raw, &claims); err != nil {
-		return nil, ErrInvalidToken
+		return tokenClaims{}, nil, ErrInvalidToken
 	}
-	return claims, nil
+	return parsed, claims, nil
 }
 
 // ResourceServerPrincipal verifies the credential on r the way

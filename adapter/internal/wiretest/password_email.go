@@ -625,6 +625,22 @@ func testChangeEmailRequest(t *testing.T, mount Mounter) {
 		req := env.Request(http.MethodPost, "/change-email/request", map[string]string{"newEmail": "changed@example.com"})
 		AssertError(t, env.Do(bearer(req, tokens)), http.StatusForbidden,
 			"You must set a password before you can change your email address.", auth.CodePasswordRequired)
+		if n := len(env.Delivered.EmailChanges); n != 0 {
+			t.Fatalf("%d email-change mail(s) sent for a refused request", n)
+		}
+	})
+
+	// The guard reads the stored row since #31 — the user in context is built
+	// from the token and has no password hash — and it now runs where the
+	// reference runs it, after the 409 (auth.router.ts:1586-1601 at v1.10.8).
+	// It used to run first, so this request answered 403.
+	t.Run("an address in use outranks PASSWORD_REQUIRED", func(t *testing.T) {
+		env, store := storeEnv(t, mount, auth.DefaultHTTPConfig())
+		user, tokens := env.Seed("changemailnopw2@example.com")
+		dropPassword(t, store, user)
+		env.Seed("taken2@example.com")
+		req := env.Request(http.MethodPost, "/change-email/request", map[string]string{"newEmail": "taken2@example.com"})
+		AssertError(t, env.Do(bearer(req, tokens)), http.StatusConflict, "Email address is already in use", "")
 	})
 
 	t.Run("an incapable store gets 500 with the reference's wording", func(t *testing.T) {

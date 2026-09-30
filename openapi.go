@@ -1045,7 +1045,7 @@ func openAPIPaths(prefix string) map[string]any {
 				},
 				"responses": respond(http.StatusOK, "Verification email sent", schema("Success"),
 					HTTPErrEmailAlreadyVerified, HTTPErrEmailVerificationStoreMissing,
-					HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid),
+					HTTPErrUserNotFound, HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid),
 			},
 		},
 		prefix + "/verify-email": map[string]any{
@@ -1074,7 +1074,7 @@ func openAPIPaths(prefix string) map[string]any {
 				})),
 				"responses": respond(http.StatusOK, "Confirmation email sent", schema("Success"),
 					HTTPErrInvalidBody, HTTPErrEmailInUse, HTTPErrPasswordRequired,
-					HTTPErrChangeEmailStoreMissing, HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid),
+					HTTPErrChangeEmailStoreMissing, HTTPErrUserNotFound, HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid),
 			},
 		},
 		prefix + "/change-email/confirm": map[string]any{
@@ -1120,7 +1120,7 @@ func openAPIPaths(prefix string) map[string]any {
 				"tags":        []string{"Auth"},
 				"security":    anyCredential,
 				"responses": respond(http.StatusOK, "The authenticated user", schema("User"),
-					HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrSessionRevoked),
+					HTTPErrUserNotFound, HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrSessionRevoked),
 			},
 		},
 

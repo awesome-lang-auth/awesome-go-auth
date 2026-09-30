@@ -502,7 +502,7 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"`OpenAPIInfo.ResourceServer`, so the published spec and the mount agree. " +
 					"What stays is `/me`, the session routes, `/profile`, `/add-phone`, " +
 					"`/account` and the OAuth and linking group — and those still need a local " +
-					"user store: `/me` reads it through `Service.Authenticate`, `/profile`, " +
+					"user store: `/me` reads it through `Service.Me`, `/profile`, " +
 					"`/add-phone` and `/account` write it, and the OAuth callback provisions a " +
 					"user and mints a local session. The flag is about credentials, not about " +
 					"store independence. The deployment with no user store is the one that " +

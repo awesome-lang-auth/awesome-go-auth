@@ -215,17 +215,31 @@ type TOTPSetup struct {
 	OTPAuthURL string `json:"otpauthUrl"`
 }
 
-// StartTOTPEnrolment mints an enrolment secret and its provisioning URI.
+// StartTOTPEnrolment mints an enrolment secret and its provisioning URI for a
+// user it reads from the store; a user the store does not have is
+// ErrInvalidCredentials.
 func (s *Service) StartTOTPEnrolment(ctx context.Context, userID, tenantID string) (TOTPSetup, error) {
 	user, err := s.users.GetUserByID(ctx, userID, tenantID)
 	if err != nil {
 		return TOTPSetup{}, ErrInvalidCredentials
 	}
+	return s.NewTOTPEnrolment(user.Email)
+}
+
+// NewTOTPEnrolment mints an enrolment secret and its provisioning URI for the
+// account named email, reading no store. It is what POST <prefix>/2fa/setup
+// calls with the address the access token carries: the reference's route labels
+// the URI with req.user.email, the verified payload, and never looks the user up
+// (awesome-node-auth v1.10.8 auth.router.ts:1369-1375). So a token whose user
+// has been deleted is answered 200 there, and here (#31). Nothing is stored:
+// the secret becomes the user's only when POST <prefix>/2fa/verify-setup
+// confirms a code against it.
+func (s *Service) NewTOTPEnrolment(email string) (TOTPSetup, error) {
 	secret, err := generateTOTPSecret()
 	if err != nil {
 		return TOTPSetup{}, err
 	}
-	return TOTPSetup{Secret: secret, OTPAuthURL: totpProvisioningURI(secret, user.Email, s.cfg.totpIssuer())}, nil
+	return TOTPSetup{Secret: secret, OTPAuthURL: totpProvisioningURI(secret, email, s.cfg.totpIssuer())}, nil
 }
 
 // totpProvisioningURI renders the otpauth:// URI an authenticator app scans:
@@ -512,6 +526,13 @@ func (a *Auth) VerifySMSCode(ctx context.Context, in SMSCodeVerifyInput) (User, 
 // StartTOTPEnrolment delegates to Service.StartTOTPEnrolment.
 func (a *Auth) StartTOTPEnrolment(ctx context.Context, userID, tenantID string) (TOTPSetup, error) {
 	return a.service.StartTOTPEnrolment(ctx, userID, tenantID)
+}
+
+// NewTOTPEnrolment delegates to Service.NewTOTPEnrolment. The adapters' POST
+// <prefix>/2fa/setup calls it with the email of the principal the auth
+// middleware verified.
+func (a *Auth) NewTOTPEnrolment(email string) (TOTPSetup, error) {
+	return a.service.NewTOTPEnrolment(email)
 }
 
 // VerifyTOTPSetup delegates to Service.VerifyTOTPSetup.

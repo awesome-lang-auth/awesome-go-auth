@@ -357,8 +357,10 @@ func TestChangePassword_UserNotFound(t *testing.T) {
 		CurrentPassword: "password1",
 		NewPassword:     "newpassword1",
 	})
-	if err != ErrInvalidCredentials {
-		t.Fatalf("expected ErrInvalidCredentials, got %v", err)
+	// ErrUserNotFound since #31, and still ErrInvalidCredentials, which it
+	// wraps, for a caller written against the old sentinel.
+	if !errors.Is(err, ErrUserNotFound) || !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("expected ErrUserNotFound wrapping ErrInvalidCredentials, got %v", err)
 	}
 }
 

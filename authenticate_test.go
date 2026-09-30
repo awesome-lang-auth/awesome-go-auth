@@ -243,6 +243,119 @@ func TestAuthenticate_RefusesWhatMeRefuses(t *testing.T) {
 	}
 }
 
+// userReadCounter counts every UserStore read and write a Service makes, so a
+// test can pin that a call made none.
+type userReadCounter struct {
+	*MemoryUserStore
+	mu    sync.Mutex
+	reads int
+}
+
+func (c *userReadCounter) GetUserByID(ctx context.Context, id, tenantID string) (User, error) {
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+	return c.MemoryUserStore.GetUserByID(ctx, id, tenantID)
+}
+
+func (c *userReadCounter) GetUserByEmail(ctx context.Context, email, tenantID string) (User, error) {
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+	return c.MemoryUserStore.GetUserByEmail(ctx, email, tenantID)
+}
+
+func (c *userReadCounter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
+}
+
+// TestVerifyAccess_ReadsNoUserStore pins #31: the adapters' gate builds the
+// principal from the verified claims without a user-store read, as the
+// reference's authMiddleware does (auth.middleware.ts:44-61 at v1.10.8), so a
+// deleted user's token still verifies — and Me, whose handler looks the user
+// up, answers ErrUserNotFound for it. The optional stores' enrichment is kept,
+// and the claims hook is not run.
+func TestVerifyAccess_ReadsNoUserStore(t *testing.T) {
+	ctx := context.Background()
+	counter := &countingClaims{}
+	store := &userReadCounter{MemoryUserStore: NewMemoryUserStore()}
+	cfg := testConfig(testSecret)
+	cfg.BuildTokenClaims = counter.build
+	svc, err := NewService(cfg, store, NewMemorySessionStore(), WithRolesPermissionsStore(NewMemoryRolesPermissionsStore()))
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	user, tokens, err := svc.Register(ctx, RegisterInput{Email: "principal@example.com", Password: "password1", TenantID: "t1"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := svc.CreateRole(ctx, "editor", []string{"posts:write"}); err != nil {
+		t.Fatalf("CreateRole: %v", err)
+	}
+	if err := svc.AssignRole(ctx, user.ID, "editor", user.TenantID); err != nil {
+		t.Fatalf("AssignRole: %v", err)
+	}
+	if err := store.DeleteUser(ctx, user.ID, user.TenantID); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	counter.reset()
+	before := store.count()
+
+	principal, err := svc.VerifyAccess(ctx, tokens.AccessToken)
+	if err != nil {
+		t.Fatalf("VerifyAccess for a deleted user's live token: %v", err)
+	}
+	if got := store.count() - before; got != 0 {
+		t.Errorf("VerifyAccess made %d user-store read(s), want 0", got)
+	}
+	if principal.ID != user.ID || principal.TenantID != "t1" || principal.Email != "principal@example.com" || !principal.IsEmailVerified {
+		t.Errorf("principal = %+v, want the token's claims", principal)
+	}
+	if principal.PasswordHash != "" {
+		t.Error("the principal carries a password hash; it is built from the token")
+	}
+	if len(principal.Roles) != 1 || principal.Roles[0] != "editor" {
+		t.Errorf("Roles = %v, want the RBAC store's enrichment", principal.Roles)
+	}
+	if principal.CustomClaims != nil || counter.count() != 0 {
+		t.Errorf("VerifyAccess ran the hook (%d calls, claims %+v)", counter.count(), principal.CustomClaims)
+	}
+
+	if _, err := svc.Me(ctx, tokens.AccessToken); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("Me for a deleted user = %v, want ErrUserNotFound", err)
+	}
+	if _, err := svc.Authenticate(ctx, tokens.AccessToken); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("Authenticate for a deleted user = %v, want ErrInvalidToken, unchanged", err)
+	}
+	if _, err := svc.VerifyAccess(ctx, tokens.RefreshToken); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("VerifyAccess(refresh token) = %v, want ErrInvalidToken", err)
+	}
+}
+
+// Under allcalls the gate still refuses a revoked session with the sentinel
+// SESSION_REVOKED is written from.
+func TestVerifyAccess_KeepsTheSessionCheck(t *testing.T) {
+	ctx := context.Background()
+	cfg := testConfig(testSecret)
+	cfg.SessionCheckOn = SessionCheckOnAllCalls
+	svc, err := NewService(cfg, NewMemoryUserStore(), NewMemorySessionStore())
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	_, tokens, err := svc.Register(ctx, RegisterInput{Email: "revoked-gate@example.com", Password: "password1", TenantID: "t1"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := svc.Logout(ctx, tokens.RefreshToken); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if _, err := svc.VerifyAccess(ctx, tokens.AccessToken); !errors.Is(err, ErrSessionRevoked) {
+		t.Errorf("VerifyAccess after logout under allcalls = %v, want ErrSessionRevoked", err)
+	}
+}
+
 func TestAuthAuthenticateDelegates(t *testing.T) {
 	counter := &countingClaims{}
 	a, err := newTestAuth(WithTokenClaimsBuilder(counter.build))

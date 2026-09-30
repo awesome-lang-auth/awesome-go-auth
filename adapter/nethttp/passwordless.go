@@ -234,7 +234,7 @@ func (a *Adapter) TwoFactorSetup(w http.ResponseWriter, r *http.Request) {
 		auth.WriteHTTPError(w, auth.HTTPErrNoAccessToken)
 		return
 	}
-	setup, err := a.auth.StartTOTPEnrolment(r.Context(), user.ID, user.TenantID)
+	setup, err := a.auth.NewTOTPEnrolment(user.Email)
 	if err != nil {
 		auth.WriteServiceError(w, err)
 		return

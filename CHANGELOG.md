@@ -52,7 +52,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The port's password policy now runs last, so a wrong current password is
   `401` even when the new one is too short.
 
+- **The auth gate trusts the access token and reads no user store (#31).**
+  Every adapter's `Middleware()` used to resolve the user through the store,
+  so a valid, unexpired access token whose user had been deleted got
+  `403 "Invalid or expired access token"` on every protected route. It now
+  calls the new `Service.VerifyAccess` (and `Auth.VerifyAccess`), which
+  verifies the token, keeps the `SessionCheckOn=allcalls` check — a revoked
+  session is still `401 SESSION_REVOKED` — and builds the user from the
+  verified claims, as the reference's `createAuthMiddleware` does
+  (`auth.middleware.ts:44-61` at v1.10.8). Each handler answers for a missing
+  user itself: `GET /me`, `/change-password`, `/send-verification-email` and
+  `/change-email/request` answer the reference's
+  `404 {"error":"User not found"}` (`auth.router.ts:1182-1185`, `:1471-1474`,
+  `:1519-1521`, `:1591-1594`), and `/2fa/setup` answers `200`, labelling the
+  enrolment with the address the token carries (the new
+  `Service.NewTOTPEnrolment`), as the reference reads `req.user.email`.
+  Routes whose handler writes the user store without looking the user up
+  first answer what the store answers; with `MemoryUserStore`, which refuses a
+  write to a missing row, that is `500` on `PATCH /profile`,
+  `POST /add-phone`, `POST /2fa/disable` and `DELETE /account`.
+
+  Three things are visible to an embedder. The user a handler reads with
+  `UserFromContext` behind `Middleware()` is now the token's principal: `ID`,
+  `TenantID`, `Email`, `Role`, `LoginProvider`, `IsEmailVerified`,
+  `IsTOTPEnabled`, plus `Metadata`, `Roles`, `Permissions` and `Tenants` from
+  the optional stores as before; the stored-row fields (`PasswordHash`,
+  `FirstName`, `LastName`, `PhoneNumber`, `CreatedAt` and the rest) are zero,
+  and a handler that needs them reads the store. `Service.Me` returns the new
+  `ErrUserNotFound` for a deleted user, where it returned `ErrInvalidToken`.
+  And deleting a user no longer locks out the access tokens already issued to
+  them: they keep passing the gate until they expire, unless `SessionCheckOn`
+  is `allcalls` and the session was revoked, which `DeleteAccount` does first.
+  That is the reference's posture. `Service.Authenticate` is unchanged and
+  still reads the store, for the IdP's `userinfo`, `/link-request`, and any
+  host that wants deletion to take effect at once on its own routes.
+
+  `ErrUserNotFound` wraps `ErrInvalidCredentials`, which `ChangePassword`,
+  `SendVerificationEmailToken` and `RequestEmailChange` returned for a missing
+  user before, so `errors.Is(err, ErrInvalidCredentials)` still matches there.
+  `/change-email/request` now checks `PASSWORD_REQUIRED` against the stored
+  row inside `Auth.RequestEmailChange` (the new `ErrPasswordRequired`), after
+  the `409` and the `404` as in the reference, where it used to run first; an
+  address in use is therefore `409` even for an account with no password.
+  `Service.RequestEmailChange` itself does not make that check, as before.
+
 ### Deprecated
+- **`ChangeEmailInlineError` (#31).** `Auth.RequestEmailChange` makes the
+  check itself now, against the stored row and in the reference's order; the
+  user in context carries no password hash, so the helper would refuse every
+  account. The adapters no longer call it.
 - **`ChangePasswordInlineError` (#30).** `Service.ChangePassword` makes the
   check itself now, for every account and in the reference's order, and the
   adapters no longer call it.

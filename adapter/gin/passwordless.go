@@ -193,7 +193,7 @@ func (ad *Adapter) twoFactorSetup(c *gin.Context) {
 		auth.WriteHTTPError(c.Writer, auth.HTTPErrNoAccessToken)
 		return
 	}
-	setup, err := ad.auth.StartTOTPEnrolment(c.Request.Context(), user.ID, user.TenantID)
+	setup, err := ad.auth.NewTOTPEnrolment(user.Email)
 	if err != nil {
 		auth.WriteServiceError(c.Writer, err)
 		return

@@ -167,10 +167,6 @@ func (ad *Adapter) changeEmailRequest(c echo.Context) error {
 	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
-	if httpErr, refused := auth.ChangeEmailInlineError(user); refused {
-		auth.WriteHTTPError(c.Response(), httpErr)
-		return nil
-	}
 	in := auth.ChangeEmailRequestInput{
 		UserID:   user.ID,
 		TenantID: user.TenantID,

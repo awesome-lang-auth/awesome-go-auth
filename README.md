@@ -494,13 +494,12 @@ revision the whole contract was extracted from.
   drops the same nineteen under `OpenAPIInfo.ResourceServer`, so the published
   spec and the mount agree. What stays is `/me`, the session routes, `/profile`,
   `/add-phone`, `/account` and the OAuth and linking group — and those still
-  need a local user store: `/me` reads it through `Service.Authenticate`,
-  `/profile`, `/add-phone` and `/account` write it, and the OAuth callback
-  provisions a user and mints a local session. The flag is about credentials,
-  not about store independence. The deployment with no user store is the one
-  that mounts `ResourceServerMiddleware` on its own routes, whose bearer and
-  cookie paths both build the principal from verified claims and read no store
-  at all.
+  need a local user store: `/me` reads it through `Service.Me`, `/profile`,
+  `/add-phone` and `/account` write it, and the OAuth callback provisions a user
+  and mints a local session. The flag is about credentials, not about store
+  independence. The deployment with no user store is the one that mounts
+  `ResourceServerMiddleware` on its own routes, whose bearer and cookie paths
+  both build the principal from verified claims and read no store at all.
 - **The reference**: Guards six registrations on `isResourceServer` — `/login`,
   `/logout`, `/refresh`, `/register`, `/forgot-password` and `/reset-password` —
   and leaves the other thirteen mounted. Those thirteen reach handlers that read

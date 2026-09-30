@@ -79,7 +79,8 @@ Low-level constructor. Use `New()` for most cases.
 | `Refresh(ctx, refreshToken) (AuthTokens, error)` | Rotate refresh token |
 | `Logout(ctx, refreshToken) error` | Revoke session |
 | `Authenticate(ctx, accessToken) (User, error)` | Verify an access token and load its user with the stores' enrichment; never runs `BuildTokenClaims` — see [Custom Claims](#custom-claims) |
-| `Me(ctx, accessToken) (User, error)` | `Authenticate` plus `CustomClaims` from `BuildTokenClaims`: the `/me` profile |
+| `VerifyAccess(ctx, accessToken) (User, error)` | Verify an access token and build its user from the claims, with no user-store read — what the adapters' `Middleware()` calls; see [Custom Claims](#custom-claims) |
+| `Me(ctx, accessToken) (User, error)` | The stored user plus `CustomClaims` from `BuildTokenClaims`: the `/me` profile; `ErrUserNotFound` when the token verifies and the user is gone |
 | `UpdateProfile(ctx, UpdateProfileInput) (User, error)` | Update first/last name |
 | `DeleteAccount(ctx, DeleteAccountInput) error` | Delete current account |
 | `ForgotPassword(ctx, ForgotPasswordInput) (string, error)` | Generate reset token |
@@ -521,7 +522,7 @@ does.
 | `Roles` | `[]string` | Enriched by RBACStore |
 | `Permissions` | `[]string` | Enriched by RBACStore |
 | `Tenants` | `[]Tenant` | Enriched by TenantStore |
-| `CustomClaims` | `map[string]any` | From the BuildTokenClaims hook; filled by `Me`, nil from `Authenticate` |
+| `CustomClaims` | `map[string]any` | From the BuildTokenClaims hook; filled by `Me`, nil from `Authenticate` and `VerifyAccess` |
 | `CreatedAt`, `UpdatedAt` | `time.Time` | |
 
 ### `Session`
@@ -596,7 +597,7 @@ type SessionStore interface {
 | `RolesPermissionsStore` | `AddRoleToUser`, `RemoveRoleFromUser`, `GetRolesForUser`, `CreateRole`, `DeleteRole`, `AddPermissionToRole`, `RemovePermissionFromRole`, `GetPermissionsForRole`, `GetPermissionsForUser`, `UserHasPermission` | CreateRole, AssignRole, UserHasPermission |
 | `TenantStore` | `CreateTenant`, `GetTenantByID`, `GetAllTenants`, `UpdateTenant`, `DeleteTenant`, `AssociateUserWithTenant`, `DisassociateUserFromTenant`, `GetTenantsForUser`, `GetUsersForTenant` | CreateTenant, AddUserToTenant |
 | `UserAccountStore` | `UpdateProfile`, `DeleteUser` | UpdateProfile, DeleteAccount |
-| `SessionLookupStore` | `GetSessionByID` | SessionCheckOn=allcalls (`Authenticate`, `Me`) |
+| `SessionLookupStore` | `GetSessionByID` | SessionCheckOn=allcalls (`VerifyAccess`, `Authenticate`, `Me`) |
 
 ---
 
@@ -682,13 +683,26 @@ deployment configured.
 |------|------------------|-----|
 | Every mint — `Register`, `Login`, `Refresh`, the OAuth callback, the passwordless and 2FA verifies, the step-up token | once per token | The claims go into the token |
 | `Me` / `GET /me` | once | The profile mirrors the reference's `/me`, whose body is `buildPayload(user)` (`auth.router.ts:656-680`); the result is rendered under `customClaims`. A failure here is logged and `customClaims` omitted — a read does not go dark because a mint-time hook is down |
-| `Authenticate` — the four adapters' `Middleware()`, `POST /link-request`, the IdP `userinfo` endpoint | never | What the builder computed is already inside the token the request carried; `CustomClaims` is nil on the user in context. The reference's `authMiddleware` draws the same line: it verifies the token and hands the route the payload as `req.user`, without `buildTokenPayload` (`auth.middleware.ts:44-61`) |
+| `VerifyAccess` — the four adapters' `Middleware()` — and `Authenticate` — `POST /link-request`, the IdP `userinfo` endpoint | never | What the builder computed is already inside the token the request carried; `CustomClaims` is nil on the user in context. The reference's `authMiddleware` draws the same line: it verifies the token and hands the route the payload as `req.user`, without `buildTokenPayload` (`auth.middleware.ts:44-61`) |
 
 `Authenticate(ctx, accessToken)` is `Me` without the builder: it verifies the token,
 runs the `SessionCheckOn=allcalls` check, loads the user and fills `Metadata`, `Roles`,
 `Permissions` and `Tenants` from the optional stores (best effort, as always), and
-fails with `Me`'s sentinels. A host route that needs the builder's result can call
-`Auth.Me` itself.
+fails with `ErrInvalidToken`, `ErrSessionNotFound` or `ErrSessionRevoked` — a user the
+store no longer has is `ErrInvalidToken`. A host route that needs the builder's result
+can call `Auth.Me` itself.
+
+`VerifyAccess(ctx, accessToken)` is what the adapters' `Middleware()` calls. It makes
+`Authenticate`'s checks up to the user lookup and then builds the user from the
+verified claims — `sub`, `email`, `role`, `loginProvider`, `isEmailVerified`,
+`isTotpEnabled`, `tid` — plus the optional stores' enrichment, without reading the
+user store, as the reference's `authMiddleware` does (`auth.middleware.ts:44-61`). So
+the user in context carries no `PasswordHash`, no names, no phone number, and a token
+whose user has been deleted reaches the handler, which answers for the missing user
+itself: `GET /me`, `/change-password`, `/send-verification-email` and
+`/change-email/request` answer the reference's `404 {"error":"User not found"}`. The
+token keeps passing the gate until it expires unless `SessionCheckOn` is `allcalls`
+and its session was revoked, which `DeleteAccount` does first.
 
 ### Building the hook from configuration
 
@@ -2458,8 +2472,9 @@ It is the reference's `createJwksAuthMiddleware`
 checks it — `tokenService.verifyAccessToken`, a bare `jwt.verify` against the
 HS256 secret (`token.service.ts:143-150`, called at
 `jwks-auth.middleware.ts:70-73`) — and *not* through `Auth.Authenticate`, which
-the session `Middleware` uses and which reads `users.GetUserByID` and checks the
-session for revocation. That difference is the whole point here: a resource
+reads `users.GetUserByID` and checks the session for revocation, nor through
+`Auth.VerifyAccess`, which the session `Middleware` uses and which checks the
+session under `allcalls`. That difference is the whole point here: a resource
 server has no user table for `Authenticate` to read, so routing the cookie
 through it would 401 every SSR request on the deployment this mode exists for.
 Two consequences, both the reference's:
@@ -2561,7 +2576,7 @@ session pair; see [The OIDC endpoints](#the-oidc-endpoints). They are not in
 know about an IdP; `OIDCMount.ResourceServerGated` names them instead.
 
 > **Those survivors still need a local user store.** `/me` reads it through
-> `Service.Authenticate` → `users.GetUserByID`; `/profile`, `/add-phone` and
+> `Service.Me` → `users.GetUserByID`; `/profile`, `/add-phone` and
 > `/account` read *and write* it; and `GET /oauth/{provider}/callback` provisions
 > a user and mints a local session, which is a credential this list otherwise
 > gates. They stay because the reference mounts them, and because the deployment

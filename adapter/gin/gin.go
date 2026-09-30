@@ -58,10 +58,12 @@ func MountWithConfig(group gin.IRoutes, a *auth.Auth, cfg auth.HTTPConfig) {
 
 // Middleware validates access tokens and injects the user into the context.
 //
-// It authenticates through Auth.Authenticate, not Auth.Me: the context user
-// carries the stores' enrichment but not CustomClaims, because
-// Config.BuildTokenClaims is a mint-time hook that must not run on every
-// protected request. GET /me is the one route that runs it; see me.
+// It authenticates through Auth.VerifyAccess, which reads no user store, as
+// the reference's authMiddleware does: the context user is built from the
+// verified token plus the optional stores' enrichment, so a token whose user
+// has been deleted reaches the handler, which answers for the missing user
+// itself (#31). Config.BuildTokenClaims is a mint-time hook that must not run
+// on every protected request. GET /me is the one route that runs it; see me.
 func (ad *Adapter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := auth.AccessTokenFromRequest(c.Request)
@@ -70,7 +72,7 @@ func (ad *Adapter) Middleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		user, err := ad.auth.Authenticate(c.Request.Context(), token)
+		user, err := ad.auth.VerifyAccess(c.Request.Context(), token)
 		if err != nil {
 			auth.WriteHTTPError(c.Writer, auth.AccessHTTPError(err))
 			c.Abort()
@@ -381,9 +383,10 @@ func (ad *Adapter) logout(c *gin.Context) {
 	auth.WriteSuccess(c.Writer, http.StatusOK, nil)
 }
 
-// me authenticates through Auth.Me — Authenticate plus Config.BuildTokenClaims
+// me authenticates through Auth.Me — the stored user plus Config.BuildTokenClaims
 // — rather than reading the context user, because Middleware skips the hook and
-// this body is the one place its result (customClaims) is rendered.
+// this body is the one place its result (customClaims) is rendered. A token that
+// verifies for a user the store no longer has is 404 "User not found" (#31).
 func (ad *Adapter) me(c *gin.Context) {
 	token := auth.AccessTokenFromRequest(c.Request)
 	if token == "" {
