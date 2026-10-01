@@ -182,8 +182,9 @@ type fixtureOptions struct {
 	// default mapping.
 	profileMap map[string]string
 	// provisioning is the callback's provisioning policy. nil is the wiring's
-	// own default — create, link by address — which is what every case written
-	// before the policy existed runs under.
+	// own default — create, and answer an address another account holds with
+	// the account conflict (issue #36) — which is what every case runs under
+	// unless it says otherwise.
 	provisioning *auth.OAuthProvisioning
 }
 
@@ -741,8 +742,93 @@ const conflictStashKey = "pending-link:oauth@example.com|acme"
 // testOAuthProvisioning covers the callback outcomes the provisioning policy
 // adds: the reference's account-conflict redirect, and the three refusals that
 // are this port's own (compatibility.go). Everything before this ran under the
-// default policy, which is what the port did before the policy existed.
+// default policy, whose answer to an address another account holds is the
+// conflict; the first cases here pin that default, the rest name a policy.
 func testOAuthProvisioning(t *testing.T, mount Mounter) {
+	// Issue #36: the default policy — a wiring that sets no Provisioning at all
+	// — answers an address another account holds with the reference's conflict,
+	// as the findOrCreateUser the reference documents does (README.detailed.md
+	// "OAuth Strategies" at 1.10.8). Through 0.12.0 this exact request signed
+	// the provider account into the holder's account.
+	t.Run("the default policy answers an address another account holds with the conflict", func(t *testing.T) {
+		f := newOAuthFixture(t, mount, fixtureOptions{allowed: []string{fixtureSiteURL}})
+		f.Seed("oauth@example.com")
+		location := f.begin(t, "", map[string]string{"Origin": fixtureSiteURL})
+		rec := f.callback(t, "c", location.Query().Get("state"))
+
+		AssertStatus(t, rec, http.StatusFound)
+		want := fixtureSiteURL + f.Config.Prefix() +
+			"/account-conflict?provider=acme&code=OAUTH_ACCOUNT_CONFLICT&email=oauth%40example.com"
+		if got := rec.Header().Get("Location"); got != want {
+			t.Fatalf("Location = %q, want %q", got, want)
+		}
+		AssertNoCookie(t, rec, hostAccess)
+		AssertNoCookie(t, rec, hostRefresh)
+		if _, err := f.links.FindByProvider(context.Background(), testProvider, "acme-1"); err == nil {
+			t.Fatal("the default policy linked the provider account by address")
+		}
+		if _, err := f.pending.Get(context.Background(), conflictStashKey); err != nil {
+			t.Fatalf("the default policy stashed nothing under %q: %v", conflictStashKey, err)
+		}
+	})
+
+	// The old behaviour is still there for a host that asks for it by name.
+	t.Run("an explicit link policy still links by address and signs the holder in", func(t *testing.T) {
+		policy := auth.DefaultOAuthProvisioning()
+		policy.OnEmailMatch = auth.OAuthEmailMatchLink
+		f := newOAuthFixture(t, mount, fixtureOptions{allowed: []string{fixtureSiteURL}, provisioning: &policy})
+		holder, _ := f.Seed("oauth@example.com")
+		location := f.begin(t, "", map[string]string{"Origin": fixtureSiteURL})
+		rec := f.callback(t, "c", location.Query().Get("state"))
+
+		AssertStatus(t, rec, http.StatusFound)
+		if got := rec.Header().Get("Location"); got != fixtureSiteURL {
+			t.Fatalf("Location = %q, want the login redirect %q", got, fixtureSiteURL)
+		}
+		if got := f.sessionUser(t, rec).ID; got != holder.ID {
+			t.Fatalf("the callback issued a session for %q, want the holder %q", got, holder.ID)
+		}
+		link, err := f.links.FindByProvider(context.Background(), testProvider, "acme-1")
+		if err != nil || link.UserID != holder.ID {
+			t.Fatalf("link = %+v (%v), want one pointing at the holder", link, err)
+		}
+	})
+
+	// The reference builds the conflict page on the state's bare origin
+	// (conflictOrigin, auth.router.ts:1992-1995 at 1.10.8), not on the
+	// resolveOAuthRedirect value a successful login is sent to, so the
+	// return_path the flow began with is not in the Location.
+	t.Run("the conflict page is on the site's origin, not under the return path", func(t *testing.T) {
+		f := newOAuthFixture(t, mount, fixtureOptions{allowed: []string{fixtureSiteURL}})
+		f.Seed("oauth@example.com")
+		location := f.begin(t, "?return_path=/dashboard", map[string]string{"Origin": fixtureSiteURL})
+		rec := f.callback(t, "c", location.Query().Get("state"))
+
+		AssertStatus(t, rec, http.StatusFound)
+		want := fixtureSiteURL + f.Config.Prefix() +
+			"/account-conflict?provider=acme&code=OAUTH_ACCOUNT_CONFLICT&email=oauth%40example.com"
+		if got := rec.Header().Get("Location"); got != want {
+			t.Fatalf("Location = %q, want %q", got, want)
+		}
+	})
+
+	// encodeURIComponent, not url.QueryEscape: an apostrophe, which a local
+	// part may hold, stays bare (auth.router.ts:2000 at 1.10.8).
+	t.Run("the address is escaped as encodeURIComponent escapes it", func(t *testing.T) {
+		f := newOAuthFixture(t, mount, fixtureOptions{allowed: []string{fixtureSiteURL}})
+		f.provider.setProfile(`{"sub":"acme-1","email":"o'brien+x@example.com","email_verified":true}`)
+		f.Seed("o'brien+x@example.com")
+		location := f.begin(t, "", map[string]string{"Origin": fixtureSiteURL})
+		rec := f.callback(t, "c", location.Query().Get("state"))
+
+		AssertStatus(t, rec, http.StatusFound)
+		want := fixtureSiteURL + f.Config.Prefix() +
+			"/account-conflict?provider=acme&code=OAUTH_ACCOUNT_CONFLICT&email=o'brien%2Bx%40example.com"
+		if got := rec.Header().Get("Location"); got != want {
+			t.Fatalf("Location = %q, want %q", got, want)
+		}
+	})
+
 	// The reference's conflict: stash (email, provider, providerAccountId) and
 	// redirect to buildUiLink(siteUrl, "/account-conflict?…")
 	// (auth.router.ts:1346-1355). No session, no link row, and the query the

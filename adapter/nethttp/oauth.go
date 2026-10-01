@@ -125,13 +125,13 @@ func (a *Adapter) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// The conflict is the reference's redirect, not an error body: the state
 		// stash was written by OAuthComplete and the browser is sent to the page
-		// that drives /link-request. result.RedirectTo is the same
-		// resolveOAuthRedirect value the reference passes to buildUiLink there
-		// (auth.router.ts:1347), so a rejected state origin lands on the default
-		// site url exactly as a successful login would.
+		// that drives /link-request. result.ConflictOrigin is the reference's
+		// conflictOrigin (auth.router.ts:1992-1995 at 1.10.8): the state's bare
+		// origin, or the default site URL when the allowlist rejects it, and
+		// never the return path the success redirect appends.
 		var conflict *auth.OAuthAccountConflictError
 		if errors.As(err, &conflict) {
-			http.Redirect(w, r, a.cfg.AccountConflictLink(result.RedirectTo, provider, conflict.Email), http.StatusFound)
+			http.Redirect(w, r, a.cfg.AccountConflictLink(result.ConflictOrigin, provider, conflict.Email), http.StatusFound)
 			return
 		}
 		auth.WriteHTTPError(w, auth.OAuthHTTPError(err))

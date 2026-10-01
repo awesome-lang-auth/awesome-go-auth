@@ -132,7 +132,9 @@ func TestOAuthProvisioningOnEmailMatch(t *testing.T) {
 	t.Run("link signs the holder in and links the provider account", func(t *testing.T) {
 		f := newProvisioningFixture(t)
 		held := f.seed(t, "held@example.com")
-		user, err := f.callback(acmeProfile("held@example.com", nil), DefaultOAuthProvisioning())
+		policy := DefaultOAuthProvisioning()
+		policy.OnEmailMatch = OAuthEmailMatchLink
+		user, err := f.callback(acmeProfile("held@example.com", nil), policy)
 		if err != nil {
 			t.Fatalf("callback: %v", err)
 		}
@@ -368,6 +370,7 @@ func TestOAuthProvisioningFieldMap(t *testing.T) {
 		f := newProvisioningFixture(t)
 		f.seed(t, "mapped@example.com")
 		policy := DefaultOAuthProvisioning()
+		policy.OnEmailMatch = OAuthEmailMatchLink
 		policy.FieldMap = map[string]string{"firstName": "$.given_name"}
 		user, err := f.callback(info, policy)
 		if err != nil {
@@ -450,26 +453,48 @@ func TestWithOAuthValidatesTheProvisioningPolicy(t *testing.T) {
 }
 
 // nil means the default, and an explicit policy is taken as written except for
-// OnEmailMatch, which has no empty mode.
+// OnEmailMatch, which has no empty mode: "" is the conflict, never the link
+// (issue #36), so a policy that leaves the mode out cannot link by address.
 func TestOAuthWiringProvisioningDefaults(t *testing.T) {
-	if got := (&OAuthWiring{}).provisioning(); got.AutoCreate != true || got.OnEmailMatch != OAuthEmailMatchLink {
+	if got := DefaultOAuthProvisioning(); got.AutoCreate != true || got.OnEmailMatch != OAuthEmailMatchConflict {
+		t.Fatalf("DefaultOAuthProvisioning = %+v, want AutoCreate and the conflict mode", got)
+	}
+	if got := (&OAuthWiring{}).provisioning(); got.AutoCreate != true || got.OnEmailMatch != OAuthEmailMatchConflict {
 		t.Fatalf("an unset policy = %+v, want DefaultOAuthProvisioning", got)
 	}
 	explicit := &OAuthWiring{Provisioning: &OAuthProvisioning{}}
-	if got := explicit.provisioning(); got.AutoCreate != false || got.OnEmailMatch != OAuthEmailMatchLink {
-		t.Fatalf("an explicit zero policy = %+v, want AutoCreate false and the link mode", got)
+	if got := explicit.provisioning(); got.AutoCreate != false || got.OnEmailMatch != OAuthEmailMatchConflict {
+		t.Fatalf("an explicit zero policy = %+v, want AutoCreate false and the conflict mode", got)
+	}
+	link := &OAuthWiring{Provisioning: &OAuthProvisioning{OnEmailMatch: OAuthEmailMatchLink}}
+	if got := link.provisioning(); got.OnEmailMatch != OAuthEmailMatchLink {
+		t.Fatalf("an explicit link policy = %+v, want the link mode kept", got)
 	}
 }
 
-// The old signature still exists and still behaves as it did: create when the
-// identity is unknown, link when the address matches.
-func TestHandleCallbackKeepsTheDefaultPolicy(t *testing.T) {
+// The policy-less signature follows the default, and so changed with it
+// (issue #36): an address another account holds is the reference's conflict,
+// not a link, and nothing is written. The old behaviour is one explicit
+// policy away.
+func TestHandleCallbackFollowsTheDefaultPolicy(t *testing.T) {
 	f := newProvisioningFixture(t)
 	held := f.seed(t, "old@example.com")
-	user, _, err := NewOAuthService().HandleCallback(
+	_, _, err := NewOAuthService().HandleCallback(
 		context.Background(), f.auth.service, f.links, acmeProfile("old@example.com", nil), provisioningTenant, "")
+	var conflict *OAuthAccountConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("HandleCallback = %v, want *OAuthAccountConflictError", err)
+	}
+	if _, err := f.links.FindByProvider(context.Background(), "acme", "acme-1"); err == nil {
+		t.Fatal("the default policy linked the provider account by address")
+	}
+
+	link := DefaultOAuthProvisioning()
+	link.OnEmailMatch = OAuthEmailMatchLink
+	user, _, err := NewOAuthService().HandleCallbackWithPolicy(
+		context.Background(), f.auth.service, f.links, acmeProfile("old@example.com", nil), provisioningTenant, "", link)
 	if err != nil {
-		t.Fatalf("HandleCallback: %v", err)
+		t.Fatalf("HandleCallbackWithPolicy(link): %v", err)
 	}
 	if user.ID != held.ID {
 		t.Fatalf("session user = %q, want the address holder %q", user.ID, held.ID)
@@ -479,7 +504,8 @@ func TestHandleCallbackKeepsTheDefaultPolicy(t *testing.T) {
 // ── the conflict redirect ────────────────────────────────────────────────────
 
 // The Location a conflict answers with, in both branches of buildUiLink
-// (auth.router.ts:261-271) and with the reference's parameter order.
+// (auth.router.ts:365-375 at 1.10.8), with the reference's parameter order and
+// its encodeURIComponent escaping (:2000-2001).
 func TestAccountConflictLink(t *testing.T) {
 	const site = "https://app.example.com"
 	for _, tc := range []struct {
@@ -507,7 +533,14 @@ func TestAccountConflictLink(t *testing.T) {
 		},
 		{
 			"an escaped provider name", HTTPConfig{}, "acme corp", "",
-			site + "/auth/account-conflict?provider=acme+corp&code=OAUTH_ACCOUNT_CONFLICT",
+			site + "/auth/account-conflict?provider=acme%20corp&code=OAUTH_ACCOUNT_CONFLICT",
+		},
+		// encodeURIComponent leaves !'()*~ bare and escapes everything else
+		// outside the unreserved set, + and @ included; url.QueryEscape would
+		// have written %27 for the apostrophe a local part may hold.
+		{
+			"an address only encodeURIComponent spells this way", HTTPConfig{}, "acme", "o'brien+x(1)~*!@example.com",
+			site + "/auth/account-conflict?provider=acme&code=OAUTH_ACCOUNT_CONFLICT&email=o'brien%2Bx(1)~*!%40example.com",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -532,5 +565,34 @@ func TestOAuthHTTPErrorMapsTheProvisioningRefusals(t *testing.T) {
 		if got := OAuthHTTPError(tc.err); got != tc.want {
 			t.Errorf("OAuthHTTPError(%v) = %+v, want %+v", tc.err, got, tc.want)
 		}
+	}
+}
+
+// The conflict event's address is the reference's eventEmail: cut to 320
+// UTF-16 code units (router-events.ts:13, :46-48 at 1.10.8), which is
+// JavaScript's string length, not Go's byte length.
+func TestEventEmailCapsAtTheReferenceLength(t *testing.T) {
+	short := "held@example.com"
+	if got := eventEmail(short); got != short {
+		t.Fatalf("eventEmail(%q) = %q, want it untouched", short, got)
+	}
+	long := strings.Repeat("a", 400) + "@example.com"
+	if got := eventEmail(long); got != long[:320] {
+		t.Fatalf("eventEmail(400+ ASCII) has length %d, want the first 320", len(got))
+	}
+	// "é" is one UTF-16 unit and two UTF-8 bytes: 320 of them are kept whole.
+	accented := strings.Repeat("é", 330)
+	if got := eventEmail(accented); got != strings.Repeat("é", 320) {
+		t.Fatalf("eventEmail(330 x é) kept %d runes, want 320", len([]rune(got)))
+	}
+	// An astral character is two units. 319 ASCII units leave room for one
+	// unit only, so the pair is dropped rather than split.
+	astral := strings.Repeat("a", 319) + "\U0001F600" + "b"
+	if got := eventEmail(astral); got != strings.Repeat("a", 319) {
+		t.Fatalf("eventEmail(319 a + emoji) = %d bytes, want the 319 a before the pair", len(got))
+	}
+	exact := strings.Repeat("a", 318) + "\U0001F600" + "b"
+	if got := eventEmail(exact); got != strings.Repeat("a", 318)+"\U0001F600" {
+		t.Fatalf("eventEmail(318 a + emoji + b) = %q, want the pair kept at exactly 320 units", got)
 	}
 }
