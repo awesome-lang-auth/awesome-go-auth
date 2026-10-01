@@ -383,9 +383,13 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"`OAUTH_EMAIL_DOMAIN_NOT_ALLOWED` when the address is outside " +
 					"`AllowedEmailDomains`, and `OAUTH_USER_NOT_PROVISIONED` when the identity is " +
 					"unknown and `AutoCreate` is false, or when the address belongs to an account and " +
-					"`OnEmailMatch` is `reject`. The fourth, `OnEmailMatch: \"conflict\"`, is the " +
-					"reference's own `OAUTH_ACCOUNT_CONFLICT`: the stash and the 302 to " +
-					"`/account-conflict`, sent exactly as the reference sends them. An account the " +
+					"`OnEmailMatch` is `reject`. The fourth, `OnEmailMatch: \"conflict\"` — the " +
+					"default, and what an empty mode means — is the reference's own " +
+					"`OAUTH_ACCOUNT_CONFLICT`: the stash and the 302 to `/account-conflict`, sent " +
+					"exactly as the reference sends them at 1.10.8, on the state's bare origin " +
+					"rather than under the return path a login lands on. `OnEmailMatch: \"link\"` signs the " +
+					"provider account into the account holding the address, and is only ever an " +
+					"explicit choice. An account the " +
 					"callback creates records the provider as `loginProvider`, takes " +
 					"`isEmailVerified` from the provider's claim — true when the provider said " +
 					"nothing, which is the common case — and fills further columns from `FieldMap`.",
@@ -403,20 +407,24 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"strategy, so a policy expressed as configuration is the only form the " +
 					"reference's function can take here. The refusals are what that policy needs to " +
 					"say and the reference never had to: its integrator would have thrown whatever " +
-					"they liked. Defaults reproduce what this port did before the policy existed — " +
-					"`AutoCreate` true, `OnEmailMatch` `link`, no domain list, no verification " +
-					"demand — so a deployment that configures nothing cannot see any of the three " +
+					"they liked. The default is the `findOrCreateUser` the reference documents for its " +
+					"integrators — an existing provider link signs in, an address another account " +
+					"holds raises `OAUTH_ACCOUNT_CONFLICT`, anything else is created " +
+					"(`README.detailed.md:659-719`) — with no domain list and no verification " +
+					"demand, so a deployment that configures nothing cannot see any of the three " +
 					"codes. `OnEmailMatch` exists because linking by address across providers is the " +
 					"account-takeover shape the reference's own store interface warns about " +
-					"(`findByProviderAccount`, `user-store.interface.ts:105-119`), and the port's " +
-					"default is the unsafe one only because changing it silently would lock accounts " +
-					"out of deployments that rely on it.",
+					"(`findByProviderAccount`, `user-store.interface.ts:105-119`); `link` stays " +
+					"available for a host that trusts its providers' addresses, best paired with " +
+					"`RequireVerifiedEmail`. Through 0.12.0 `link` was the default (issue #36).",
 				Notes: []DeviationNote{{
 					Label: "Matching the reference exactly",
-					Text: "Leave `OAuthWiring.Provisioning` nil. The callback then behaves as it " +
-						"always has, no refusal is reachable, and the only policy-driven answer that " +
-						"can appear is the reference's own account conflict — which needs " +
-						"`OnEmailMatch: \"conflict\"` and so cannot appear either.",
+					Text: "Leave `OAuthWiring.Provisioning` nil. The callback then resolves an " +
+						"identity the way the reference's documented `findOrCreateUser` does, no " +
+						"refusal is reachable, and the only policy-driven answer that can appear is " +
+						"the reference's own account conflict. Give it `OAuthWiring.PendingLinks` so " +
+						"the conflict is stashed for `/link-request`, as the reference's " +
+						"`pendingLinkStore` would be.",
 				}},
 			},
 			{
