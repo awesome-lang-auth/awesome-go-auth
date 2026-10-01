@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`README_DETAILED.md` §HTTP Adapters now documents the adapters that exist
+  (#16).** The section showed `chi.New(svc)`, `gin.New(svc)`, `echo.New(svc)`
+  and `adapt.RequireAuth`, and claimed a list of per-route handlers that every
+  adapter provides. None of these exist. It now documents what the code has:
+  - `nethttp`, `gin` and `echo` take an `*auth.Auth` through
+    `New`/`NewWithConfig`. `chi` has only package functions.
+  - Routes are mounted as a whole by `Mount`/`MountWithConfig`.
+  - The middleware and the context reader each adapter exposes.
+  - Only `nethttp.Adapter` exports individual handlers, and `Mount` is the
+    supported way to serve them.
+
+  Every sample compiles against this release. The admin note under
+  `HTTPConfig.RateLimiter` said no admin router existed. It now describes
+  `AdminOptions.RateLimiter`, which covers the promote route only. The `Config`
+  listing had three wrong defaults. They now match `DefaultConfig`:
+  `RefreshTokenTTL` is 30d, not 7d. `ClockSkew` is 30s, not 5s.
+  `EmailChangeTTL` is 1h, not 24h. The listing also gains `Issuer`'s default
+  and the `TempTokenTTL`, `Uploads` and `Events` fields it was missing.
+  Documentation only; no code changes.
+
 ### Added
 - **Verify a magic link without opening a session (#32):
   `Service.ConsumeMagicLink` and `Service.CompleteMagicLinkLogin`**, with
@@ -25,16 +46,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an owner id was passed, which also settles #33.
 
 ### Fixed
-- **`README_DETAILED.md` §HTTP Adapters now documents the adapters that exist
-  (#16).** The section showed `chi.New(svc)`, `gin.New(svc)`, `echo.New(svc)`
-  and `adapt.RequireAuth`, and claimed a list of per-route handlers that every
-  adapter provides. None of these exist. It now documents what the code has:
-  - `nethttp`, `gin` and `echo` take an `*auth.Auth` through
-    `New`/`NewWithConfig`. `chi` has only package functions.
-  - Routes are mounted as a whole by `Mount`/`MountWithConfig`.
-  - The middleware and the context reader each adapter exposes.
-  - Only `nethttp.Adapter` exports individual handlers, and `Mount` is the
-    supported way to serve them.
+- **An empty request body is no longer `400 INVALID_BODY` on `/register`,
+  `/login`, `/link-request` and `/link-verify` (#34).** The reference reads
+  `req.body ?? {}` on every route since v1.10.5, so a bodyless request reaches
+  each route's own per-field check. The port now does the same on all four
+  adapters: `/register` answers `400 INVALID_INPUT`, `/link-request`
+  `400 EMAIL_REQUIRED`, `/link-verify` `400 TOKEN_REQUIRED`. The adapters used
+  to disagree, since echo's binder tolerated a zero-length body and the other
+  three did not. Every body-reading auth route now decodes through the one
+  shared `auth.DecodeOptionalJSON`, and the per-adapter step-up helpers are
+  gone. Malformed JSON is still `400 INVALID_BODY` everywhere.
+
+  `/login` also gains the reference's presence check. A body with no email or
+  no password, an empty body included, now answers
+  `400 {"error":"Email and password are required"}` with no code, where it
+  used to answer `401 INVALID_CREDENTIALS` (`auth.router.ts:996-1000` at
+  v1.10.8). The check runs in the route before the service, so it raises no
+  `identity.auth.login.failed` event, as in the reference. `Service.Login`
+  itself is unchanged.
 - **`MemoryLinkedAccounts.Save` no longer leaves a stale link behind when it
   re-points a binding (#37).** Saving a `(provider, providerID)` pair that
   another user held, under a new id, overwrote the pair's lookup but left the
@@ -46,16 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that raises no conflict of its own (`linked-accounts-store.interface.ts:58-63`
   at v1.10.8). The contract is now written on `LinkedAccountStore`, so a host
   store knows it keys on the pair.
-- **An empty request body is no longer `400 INVALID_BODY` on `/register`,
-  `/login`, `/link-request` and `/link-verify` (#34).** The reference reads
-  `req.body ?? {}` on every route since v1.10.5, so a bodyless request reaches
-  each route's own per-field check. The port now does the same on all four
-  adapters: `/register` answers `400 INVALID_INPUT`, `/link-request`
-  `400 EMAIL_REQUIRED`, `/link-verify` `400 TOKEN_REQUIRED`. The adapters used
-  to disagree, since echo's binder tolerated a zero-length body and the other
-  three did not. Every body-reading auth route now decodes through the one
-  shared `auth.DecodeOptionalJSON`, and the per-adapter step-up helpers are
-  gone. Malformed JSON is still `400 INVALID_BODY` everywhere.
 
 ## [0.12.0] - 2026-09-30
 
