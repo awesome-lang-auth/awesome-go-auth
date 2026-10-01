@@ -834,7 +834,11 @@ func TestIssueToken_LoginProviderAfterOAuthCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	linked, tokens, err := oauth.HandleCallback(ctx, svc, links, OAuthUserInfo{Provider: "acme", ProviderID: "acme-2", Email: "linked@example.com"}, "t1", "")
+	// Linking by address is an explicit policy since the default became the
+	// conflict (issue #36).
+	linkPolicy := DefaultOAuthProvisioning()
+	linkPolicy.OnEmailMatch = OAuthEmailMatchLink
+	linked, tokens, err := oauth.HandleCallbackWithPolicy(ctx, svc, links, OAuthUserInfo{Provider: "acme", ProviderID: "acme-2", Email: "linked@example.com"}, "t1", "", linkPolicy)
 	if err != nil {
 		t.Fatalf("HandleCallback for an existing account: %v", err)
 	}

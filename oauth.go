@@ -565,8 +565,9 @@ var ErrOAuthAccountConflict = errors.New("auth: oauth account conflict")
 // /account-conflict — rather than as a JSON error, which is why nothing maps it
 // in OAuthHTTPError.
 //
-// It is raised only under OnEmailMatch = OAuthEmailMatchConflict: a provider
-// account nobody has linked, asserting an address some account already holds.
+// It is raised only under OnEmailMatch = OAuthEmailMatchConflict, which is the
+// default: a provider account nobody has linked, asserting an address some
+// account already holds.
 type OAuthAccountConflictError struct {
 	Provider          string
 	Email             string
@@ -583,8 +584,11 @@ func (e *OAuthAccountConflictError) Unwrap() error { return ErrOAuthAccountConfl
 // HandleCallback resolves/creates a user after OAuth callback under the default
 // provisioning policy (DefaultOAuthProvisioning): accounts are created when the
 // provider identity is unknown, and an address some account already holds is
-// linked to it. It is HandleCallbackWithPolicy with that policy, kept as it was
-// so an embedder driving the service directly is unaffected by the policy.
+// answered with *OAuthAccountConflictError rather than linked. It is
+// HandleCallbackWithPolicy with that policy, so it follows the default: through
+// 0.12.0 it linked the address and signed that account in (issue #36). An
+// embedder that wants the old behaviour calls HandleCallbackWithPolicy with
+// OnEmailMatch: OAuthEmailMatchLink.
 //
 // If linkToUserID is non-empty the provider is linked to that existing account.
 func (s *OAuthService) HandleCallback(
