@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Config.IssueSessionOnRegister (#21, the family spec "register may open a
@@ -47,26 +48,53 @@ func sessionsOf(t *testing.T, svc *Service, user User) []Session {
 	return sessions
 }
 
+// Unset is not off: in 0.x an unset option means on, whether the Config came
+// from DefaultConfig or was built by hand, and only an explicit false is the
+// reference's answer.
 func TestIssueSessionOnRegister_DefaultsOnInZeroX(t *testing.T) {
-	if !DefaultConfig(testSecret).IssueSessionOnRegister {
-		t.Fatal("DefaultConfig().IssueSessionOnRegister = false; it stays true until v1.0.0")
+	if DefaultConfig(testSecret).IssueSessionOnRegister != nil {
+		t.Fatal("DefaultConfig sets the option; it leaves it unset so the release default applies")
 	}
-	if (Config{}).IssueSessionOnRegister {
-		t.Fatal("the zero Config has the option on")
+	handBuilt := Config{
+		Secret: testSecret, Issuer: "hand-built", AccessTokenTTL: time.Minute, RefreshTokenTTL: time.Hour,
+		MinPasswordLen: 8, BcryptCost: testBcryptCost, ResetTokenTTL: time.Hour, MagicLinkTTL: time.Hour,
+		SMSCodeTTL: time.Hour, EmailVerificationTTL: time.Hour, EmailChangeTTL: time.Hour, TempTokenTTL: time.Minute,
 	}
-	a, err := newTestAuth()
-	if err != nil {
-		t.Fatalf("newTestAuth: %v", err)
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{"DefaultConfig", testConfig(testSecret), true},
+		{"a hand-built Config that does not set it", handBuilt, true},
+		{"explicitly false", func() Config { c := handBuilt; c.IssueSessionOnRegister = boolPtr(false); return c }(), false},
+		{"explicitly true", func() Config { c := handBuilt; c.IssueSessionOnRegister = boolPtr(true); return c }(), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, err := NewService(tc.cfg, NewMemoryUserStore(), NewMemorySessionStore())
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			_, tokens, err := svc.Register(context.Background(), RegisterInput{Email: "default@example.com", Password: "password1", TenantID: "t1"})
+			if err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			if got := tokens.AccessToken != ""; got != tc.want {
+				t.Fatalf("registration opened a session = %v, want %v", got, tc.want)
+			}
+		})
 	}
-	if !a.service.cfg.IssueSessionOnRegister {
-		t.Fatal("New() has the option off; it is built on DefaultConfig")
-	}
-	a, err = newTestAuth(WithIssueSessionOnRegister(false))
-	if err != nil {
-		t.Fatalf("newTestAuth: %v", err)
-	}
-	if a.service.cfg.IssueSessionOnRegister {
-		t.Fatal("WithIssueSessionOnRegister(false) left the option on")
+	for _, tc := range []struct {
+		opt  bool
+		want bool
+	}{{false, false}, {true, true}} {
+		a, err := newTestAuth(WithIssueSessionOnRegister(tc.opt))
+		if err != nil {
+			t.Fatalf("newTestAuth: %v", err)
+		}
+		if got := a.service.cfg.issueSessionOnRegister(); got != tc.want {
+			t.Fatalf("WithIssueSessionOnRegister(%v) resolves to %v", tc.opt, got)
+		}
 	}
 }
 
@@ -100,7 +128,7 @@ func TestRegister_OnOpensTheLoginsSession(t *testing.T) {
 
 // Off: the reference's answer — the account and nothing else.
 func TestRegister_OffCreatesTheAccountOnly(t *testing.T) {
-	svc, _, events := registerSessionService(t, func(c *Config) { c.IssueSessionOnRegister = false })
+	svc, _, events := registerSessionService(t, func(c *Config) { c.IssueSessionOnRegister = boolPtr(false) })
 	user, tokens, err := svc.Register(context.Background(), RegisterInput{Email: "off@example.com", Password: "password1", TenantID: "t1"})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
@@ -210,7 +238,7 @@ func TestIssueSessionOnRegister_StrictIsLoggedOnce(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var lines []string
 			cfg := testConfig(testSecret)
-			cfg.IssueSessionOnRegister = tc.on
+			cfg.IssueSessionOnRegister = boolPtr(tc.on)
 			cfg.EmailVerificationMode = tc.mode
 			cfg.Logger = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
 			svc, err := NewService(cfg, NewMemoryUserStore(), NewMemorySessionStore())

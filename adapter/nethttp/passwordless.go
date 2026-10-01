@@ -190,7 +190,10 @@ func (a *Adapter) SMSSend(w http.ResponseWriter, r *http.Request) {
 		auth.WriteHTTPError(w, auth.HTTPErrUserNotFound)
 		return
 	}
-	if strings.TrimSpace(user.PhoneNumber) == "" {
+	// Untrimmed, as the reference tests it (`if (!user.phoneNumber)`,
+	// auth.router.ts:1830 at v1.10.8): a number of only spaces is stored as sent
+	// since #35, and it is a number here too.
+	if user.PhoneNumber == "" {
 		auth.WriteHTTPError(w, auth.HTTPErrPhoneNotSet)
 		return
 	}
@@ -293,28 +296,12 @@ func (a *Adapter) TwoFactorDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Re-read the user rather than trust the access token: a require2FA flag
-	// set after the token was issued still has to be honoured.
-	//
-	// A failed re-read is not an error here. The reference reads the user with
-	// optional chaining (`currentUser?.require2FA`, auth.router.ts:884-885), so a
-	// token whose user the store no longer has falls through to the disable
-	// instead of 404ing — and the disable itself then reports whatever the store
-	// says. Reachable only if the user vanishes between the middleware's lookup
-	// and this one, but a 404 here would be the port inventing a status.
-	//
-	// Note the asymmetry with the settings read below, deliberately: this term
-	// fails OPEN and that one fails closed. `err != nil` here covers a user store
-	// that is merely down as well as a user that is gone, so a transient outage
-	// lets a user whose record carries require2FA disable the factor. The
-	// reference does distinguish them — a findById that *throws* reaches
-	// handleError and becomes 500, and only a null user falls through — and this
-	// port does not, because Auth.FindUser reports both as an error. Matching the
-	// reference here needs a not-found sentinel the user-store interface does not
-	// have; until it does, the fail-closed rule stated below is the rule for the
-	// settings read and not for this one.
-	fresh, err := a.auth.FindUser(r.Context(), user.ID, "", user.TenantID)
-	if err == nil && fresh.Require2FA {
-		auth.WriteHTTPError(w, auth.HTTPErrTwoFactorRequiredForUser)
+	// set after the token was issued still has to be honoured. The re-read fails
+	// closed — a missing user is 404, any other read failure 500 — because since
+	// #31 no gate has read the row before this handler; see
+	// auth.Auth.TwoFactorDisableUserRefusal.
+	if herr, refused := a.auth.TwoFactorDisableUserRefusal(r.Context(), user.ID, user.TenantID); refused {
+		auth.WriteHTTPError(w, herr)
 		return
 	}
 	// The system-wide term is second, as it is in the reference, where the

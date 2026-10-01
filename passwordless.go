@@ -549,3 +549,33 @@ func (a *Auth) VerifyTOTP(ctx context.Context, userID, tenantID, code string) (U
 func (a *Auth) DisableTOTP(ctx context.Context, userID, tenantID string) error {
 	return a.service.DisableTOTP(ctx, userID, tenantID)
 }
+
+// TwoFactorDisableUserRefusal is the per-user term of POST <prefix>/2fa/disable,
+// the one the four adapters share: it re-reads the user the access token names
+// and reports the envelope to answer with, and true, when the disable must be
+// refused. It is the reference's `currentUser?.require2FA` check
+// (awesome-node-auth v1.10.8 auth.router.ts:1440-1445), run first, before the
+// system-wide term.
+//
+// It fails closed. A user who must keep the factor is 403 2FA_REQUIRED. A user
+// the store does not have — deleted, or no longer in the token's tenant — is
+// 404 "User not found", and any other read failure is the generic 500, logged.
+// The reference's optional chaining would fall through to the disable for a
+// missing user, but that fall-through was only ever reachable in this port
+// behind a gate that had just read the same row; since the gate reads no user
+// store (#31) it would hold for the whole lifetime of an access token, through
+// a store outage or a tenant move, and a failed read is not permission to drop
+// a second factor.
+func (a *Auth) TwoFactorDisableUserRefusal(ctx context.Context, userID, tenantID string) (HTTPError, bool) {
+	fresh, err := a.service.users.GetUserByID(ctx, userID, tenantID)
+	switch {
+	case errors.Is(err, ErrUserNotFound):
+		return HTTPErrUserNotFound, true
+	case err != nil:
+		a.service.logf("auth: 2fa/disable could not re-read user %q; the disable is refused with a generic 500: %v", userID, err)
+		return HTTPErrInternal, true
+	case fresh.Require2FA:
+		return HTTPErrTwoFactorRequiredForUser, true
+	}
+	return HTTPError{}, false
+}

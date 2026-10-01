@@ -238,7 +238,7 @@ func WithRequire2FA(enabled bool) Option {
 // a required second factor win over it — see Config.IssueSessionOnRegister.
 func WithIssueSessionOnRegister(enabled bool) Option {
 	return func(b *authBuilder) error {
-		b.cfg.IssueSessionOnRegister = enabled
+		b.cfg.IssueSessionOnRegister = &enabled
 		return nil
 	}
 }

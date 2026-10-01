@@ -248,6 +248,19 @@ func testLoginTwoFactor(t *testing.T, mount Mounter) {
 			assertMethods(t, methods, auth.TwoFactorMethodSMS)
 		})
 
+		// The stored number is tested untrimmed, as the reference tests it
+		// (`if (user.phoneNumber && config.sms)`, auth.router.ts:1015 at
+		// v1.10.8): a number of only spaces, which /add-phone stores as sent
+		// since #35, is advertised.
+		t.Run("a number of only spaces is advertised", func(t *testing.T) {
+			store := phoneUserStore{MemoryUserStore: auth.NewMemoryUserStore(), phone: " "}
+			env := challengeEnv(t, mount, challengeOpts{sms: true},
+				auth.WithUserStore(store), auth.WithRequire2FA(true))
+			env.Seed("mspace@example.com")
+			_, methods := loginChallenge(t, env, "mspace@example.com")
+			assertMethods(t, methods, auth.TwoFactorMethodSMS)
+		})
+
 		// A sender but no stored number is not a method either. With nothing else
 		// enrolled that leaves no method at all, so the answer is the setup branch —
 		// which is itself the assertion that 'sms' was not advertised: a challenge

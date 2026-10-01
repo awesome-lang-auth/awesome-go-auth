@@ -102,14 +102,25 @@ import (
 //     actually chosen, all still enforce the length. The one value refused is
 //     the empty string: if a verifier answers ok for an empty password the login
 //     proceeds, but nothing is written, because a bcrypt hash of "" would make
-//     empty-password login succeed forever and would permanently close the
-//     passwordless initial-password path that keys on an empty PasswordHash
-//     (wire_password_email.go:347). An empty password behaves as migrated=false.
+//     empty-password login succeed forever. An empty password behaves as
+//     migrated=false.
 //
 //   - ok=true, migrated=false: the password, but keep nothing. The login
 //     proceeds and the stored hash is left alone, so the next login consults
 //     the verifier again. This is for a host that means to keep owning the
 //     credential rather than hand this library a copy of it.
+//
+// Service.ChangePassword — POST /change-password — consults the verifier too,
+// the way the login does: a current password that does not verify against the
+// stored hash is handed to the verifier, with the same results (a migration
+// included), before the new password is written. And with a verifier
+// configured it treats an account with no stored hash as one that may have a
+// password behind the verifier, so it must present its current password and
+// pass it there; only a deployment with no verifier lets an account with no
+// hash set its first password without one. On a deployment with a verifier, an
+// OAuth-only or magic-link-only account therefore sets its first password
+// through POST /forgot-password rather than /change-password, unless the
+// verifier answers ok for it.
 //
 // A non-nil err is a failure to decide, not a rejection: the old system was
 // unreachable, the call timed out, the answer did not parse. The login fails

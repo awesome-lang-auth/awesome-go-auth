@@ -31,10 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in cookie mode, `accessToken` and `refreshToken` in the body in bearer mode,
   a session row, and `identity.auth.login.success` raised after
   `identity.user.created`; off, it answers the reference's
-  `201 {"success":true,"userId":"…"}` and nothing else. `DefaultConfig` turns
-  it **on** for every 0.x release, which is how the port always behaved, so an
-  unconfigured deployment answers as before; a `Config` built without
-  `DefaultConfig` starts from `false`. The compatibility note
+  `201 {"success":true,"userId":"…"}` and nothing else. The field is a
+  `*bool`, so that unset is not the same as off: unset — what `DefaultConfig`
+  leaves, and what a hand-built `Config` has unless it says otherwise — means
+  **on** for every 0.x release, which is how the port always behaved, so no
+  deployment that does not touch it sees a change. The compatibility note
   `register-issues-a-session` now describes the option and its default.
 
   Even with the option on, the login's gates now win, and this changes what a
@@ -49,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opened, not after. Adapters write the answer through the new
   `HTTPConfig.WriteRegistration`.
 
-  **Planned for v1.0.0:** the default flips to `false`, the reference's. A
+  **Planned for v1.0.0:** the unset default flips to off, the reference's. A
   deployment that wants registration to log people in will have to say
   `WithIssueSessionOnRegister(true)`.
 
@@ -73,15 +74,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embedder that calls `Service.ChangePassword` directly and wants a stronger
   proof for that case has to ask for it before the call.
 
+  "Has a password" is what `POST /login` would check, so an account whose
+  credential lives behind `Config.PasswordVerifier` is not passwordless: a
+  current password that does not verify against the stored hash is passed to
+  the verifier, as the login passes it (migration included), and with a
+  verifier configured an account with no stored hash at all must present its
+  current password and pass it there too — its credential may be a row not
+  migrated yet, or one the verifier keeps owning. Only an account with no hash
+  on a deployment with no verifier sets its first password without one; on a
+  deployment with a verifier such an account uses `POST /forgot-password`.
+  `UserStore.GetUserByID` must return `PasswordHash` for this decision, and its
+  contract now says so.
+
   The route also takes the reference's v1.10.8 order: an absent `newPassword`
   is `400 {"error":"New password is required"}` for every account, before the
   current password is looked at (the service returns the new
   `ErrNewPasswordRequired`). An account with a password used to get the
-  port-only `400 WEAK_PASSWORD` there, or `401` with a wrong current password.
-  The port's password policy now runs last, so a wrong current password is
-  `401` even when the new one is too short.
+  port-only `400 WEAK_PASSWORD` there. The port's password policy now runs
+  last, so a wrong current password is `401` even when the new one is too
+  short.
 
-- **The auth gate trusts the access token and reads no user store (#31).**
+- **BREAKING (behaviour) — the auth gate trusts the access token and reads no
+  user store (#31).**
   Every adapter's `Middleware()` used to resolve the user through the store,
   so a valid, unexpired access token whose user had been deleted got
   `403 "Invalid or expired access token"` on every protected route. It now
@@ -96,29 +110,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:1519-1521`, `:1591-1594`), and `/2fa/setup` answers `200`, labelling the
   enrolment with the address the token carries (the new
   `Service.NewTOTPEnrolment`), as the reference reads `req.user.email`.
-  Routes whose handler writes the user store without looking the user up
-  first answer what the store answers; with `MemoryUserStore`, which refuses a
-  write to a missing row, that is `500` on `PATCH /profile`,
-  `POST /add-phone`, `POST /2fa/disable` and `DELETE /account`.
+  Only a missing row is the 404: `UserStore.GetUserByID` now reports one with
+  `ErrUserNotFound` (`MemoryUserStore` does), and any other store failure on
+  those routes is the reference's generic `500`, as its throwing `findById` is
+  — a host store that reports a missing row with an error of its own gets the
+  `500` until it returns `ErrUserNotFound`. Routes whose handler writes the
+  user store without looking the user up first answer what the store answers;
+  with `MemoryUserStore`, which refuses a write to a missing row, that is the
+  detail-free `500 {"error":"Internal server error"}` on `PATCH /profile`,
+  `POST /add-phone`, `POST /2fa/verify-setup` and `DELETE /account`, with no
+  event raised. `POST /2fa/disable` re-reads the user and fails closed: a
+  missing user (deleted, or no longer in the token's tenant) is `404`, any
+  other read failure `500`, never a fall-through to the disable (the new
+  `Auth.TwoFactorDisableUserRefusal`, which the four adapters share).
 
-  Three things are visible to an embedder. The user a handler reads with
-  `UserFromContext` behind `Middleware()` is now the token's principal: `ID`,
-  `TenantID`, `Email`, `Role`, `LoginProvider`, `IsEmailVerified`,
-  `IsTOTPEnabled`, plus `Metadata`, `Roles`, `Permissions` and `Tenants` from
-  the optional stores as before; the stored-row fields (`PasswordHash`,
-  `FirstName`, `LastName`, `PhoneNumber`, `CreatedAt` and the rest) are zero,
-  and a handler that needs them reads the store. `Service.Me` returns the new
-  `ErrUserNotFound` for a deleted user, where it returned `ErrInvalidToken`.
-  And deleting a user no longer locks out the access tokens already issued to
-  them: they keep passing the gate until they expire, unless `SessionCheckOn`
-  is `allcalls` and the session was revoked, which `DeleteAccount` does first.
-  That is the reference's posture. `Service.Authenticate` is unchanged and
-  still reads the store, for the IdP's `userinfo`, `/link-request`, and any
-  host that wants deletion to take effect at once on its own routes.
+  What this breaks for host code behind `Middleware()`. The user a handler
+  reads with `UserFromContext` is now the token's principal, not the stored
+  row:
+  - built from the token: `ID`, `TenantID`, `Email`, `Role`, `LoginProvider`,
+    `IsEmailVerified`, `IsTOTPEnabled` — each **as of the token's mint**, so a
+    role demotion, a verified address or a tenant move shows on host routes
+    only after the next refresh, at most `AccessTokenTTL` later; a
+    `BuildTokenClaims` hook that overrides `role` or `email` now decides them
+    in context, and a non-string `role` claim reads as `""`;
+  - from the optional stores, as before: `Metadata`, `Roles`, `Permissions`,
+    `Tenants`;
+  - zero, always: `IsAdmin` (so a `user.IsAdmin` check now always answers
+    false), `Require2FA`, `TOTPSecret`, `PasswordHash` (so a
+    `PasswordHash == ""` test now answers "passwordless" for everyone),
+    `FirstName`, `LastName`, `PhoneNumber`, `CreatedAt` and the other
+    stored-row fields.
 
-  `ErrUserNotFound` wraps `ErrInvalidCredentials`, which `ChangePassword`,
-  `SendVerificationEmailToken` and `RequestEmailChange` returned for a missing
-  user before, so `errors.Is(err, ErrInvalidCredentials)` still matches there.
+  Host code that authorises on any of those must read the store itself, or
+  call `Auth.Authenticate` (which still loads the stored row); admin checks
+  belong behind the admin guard, which does its own store read. `Service.Me`
+  returns the new `ErrUserNotFound` for a deleted user, where it returned
+  `ErrInvalidToken`. And deleting a user no longer locks out the access tokens
+  already issued to them: they keep passing the gate until they expire, unless
+  `SessionCheckOn` is `allcalls` and the session was revoked, which
+  `DeleteAccount` does first. That is the reference's posture.
+  `Service.Authenticate` is unchanged and still reads the store, for the IdP's
+  `userinfo`, `/link-request`, and any host that wants deletion to take effect
+  at once on its own routes.
+
+  `ErrUserNotFound` matches `ErrInvalidCredentials` under `errors.Is`, which
+  `ChangePassword`, `SendVerificationEmailToken` and `RequestEmailChange`
+  returned for a missing user before, so a caller testing for it still
+  matches there.
   `/change-email/request` now checks `PASSWORD_REQUIRED` against the stored
   row inside `Auth.RequestEmailChange` (the new `ErrPasswordRequired`), after
   the `409` and the `404` as in the reference, where it used to run first; an
@@ -173,7 +211,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   visible: a phone number of only whitespace used to be trimmed to the empty
   string and so cleared the number; it is now stored as sent, as in the
   reference, where only `null` clears. A store that wants normalised values
-  normalises them itself.
+  normalises them itself. `POST /sms/send` and the login challenge's
+  `available2faMethods` now test the stored number untrimmed too, as the
+  reference does (`auth.router.ts:1830`, `:1015`) and as `Service.SendSMSCode`
+  already did, so a number of only spaces is a number there as well.
 
 ## [0.12.0] - 2026-09-30
 

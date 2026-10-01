@@ -599,8 +599,9 @@ func CompatibilityNotes() APICompatibilityNotes {
 				Surface: "`POST <prefix>/register`",
 				Behaviour: "Whether a successful registration also logs the new account in is the " +
 					"instance administrator's choice, `Config.IssueSessionOnRegister` " +
-					"(`WithIssueSessionOnRegister`), and `DefaultConfig` turns it **on** for every " +
-					"0.x release, because this port always opened a session here. On, the " +
+					"(`WithIssueSessionOnRegister`), and left unset — as `DefaultConfig` leaves it, " +
+					"and as a hand-built `Config` has it unless it says otherwise — it is **on** " +
+					"for every 0.x release, because this port always opened a session here. On, the " +
 					"registration delivers a session exactly as a successful `POST /login` does, " +
 					"through the same delivery switch: in cookie mode the response is " +
 					"`201 {\"success\": true, \"userId\": \"…\"}` plus `Set-Cookie` for " +
@@ -654,11 +655,11 @@ func CompatibilityNotes() APICompatibilityNotes {
 				Notes: []DeviationNote{
 					{
 						Label: "Matching the reference exactly",
-						Text: "`WithIssueSessionOnRegister(false)`, or `IssueSessionOnRegister: " +
-							"false` on the `Config`: the registration then answers " +
+						Text: "`WithIssueSessionOnRegister(false)`, or `IssueSessionOnRegister` pointing " +
+							"at `false` on the `Config`: the registration then answers " +
 							"`201 {\"success\": true, \"userId\": \"…\"}` with no cookie, no token " +
-							"and no session row. A `Config` built without `DefaultConfig` starts " +
-							"from the zero value and is already there.",
+							"and no session row. The field is a pointer so that unset is not off: " +
+							"a `Config` that does not set it keeps the 0.x default.",
 					},
 					{
 						Label: "Planned for v1.0.0",
