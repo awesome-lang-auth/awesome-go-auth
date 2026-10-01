@@ -254,7 +254,7 @@ func (s *Service) twoFactorChallenge(ctx context.Context, user User) (*TwoFactor
 //
 //   - A verified address is not required for magic-link. The reference does not
 //     check one (:559), the step-up branch of /magic-link/verify does not either
-//     (Service.verifyMagicLink applies the verification side effect only on the
+//     (Service.VerifyMagicLink applies the verification side effect only on the
 //     login path), and login has already refused an unverified user above unless
 //     the deployment runs in lazy mode. Requiring one here would advertise fewer
 //     methods than the routes accept.

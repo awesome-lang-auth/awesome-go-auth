@@ -1,9 +1,6 @@
 package nethttp
 
 import (
-	"encoding/json"
-	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -17,30 +14,14 @@ import (
 // second factor into no factor at all. Delivery is the service's job now, through
 // the senders on Config (see delivery.go), so the only thing the send routes owe
 // that seam is the precheck below.
-
-// decodeStepUpJSON decodes a request body and treats an absent one as a body
-// with every field omitted, which is what the reference does: express.json()
-// leaves req.body as {} when there is nothing to parse, and each route then
-// answers for the field it was missing — `email is required` on
-// /magic-link/send, INVALID_MAGIC_LINK on /magic-link/verify,
-// INVALID_ACCESS_TOKEN on /2fa/verify. Answering INVALID_BODY instead replaces
-// all of those with one status a client cannot act on.
 //
+// Bodies are decoded with auth.DecodeOptionalJSON, the decoder every
+// body-reading route of the four adapters shares. An absent body is a body with
+// every field omitted, which is what the reference does: express.json() leaves
+// req.body as {} when there is nothing to parse, and each route then answers
+// for the field it was missing — `email is required` on /magic-link/send,
+// INVALID_MAGIC_LINK on /magic-link/verify, INVALID_ACCESS_TOKEN on /2fa/verify.
 // Malformed JSON is still 400 INVALID_BODY; only emptiness is tolerated.
-func decodeStepUpJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	if r.Body == nil {
-		return true
-	}
-	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		if errors.Is(err, io.EOF) {
-			return true
-		}
-		auth.WriteHTTPError(w, auth.HTTPErrInvalidBody)
-		return false
-	}
-	return true
-}
 
 type magicLinkSendRequest struct {
 	Email     string `json:"email"`
@@ -93,7 +74,7 @@ type twoFactorVerifyRequest struct {
 // MagicLinkSend handles POST <prefix>/magic-link/send.
 func (a *Adapter) MagicLinkSend(w http.ResponseWriter, r *http.Request) {
 	var req magicLinkSendRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	email, tenantID := req.Email, req.TenantID
@@ -139,7 +120,7 @@ func (a *Adapter) MagicLinkSend(w http.ResponseWriter, r *http.Request) {
 // MagicLinkVerify handles POST <prefix>/magic-link/verify.
 func (a *Adapter) MagicLinkVerify(w http.ResponseWriter, r *http.Request) {
 	var req magicLinkVerifyRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	in := auth.MagicLinkVerifyInput{Token: req.Token}
@@ -177,7 +158,7 @@ func (a *Adapter) SMSSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req smsSendRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	userID, tenantID := strings.TrimSpace(req.UserID), req.TenantID
@@ -223,7 +204,7 @@ func (a *Adapter) SMSSend(w http.ResponseWriter, r *http.Request) {
 // SMSVerify handles POST <prefix>/sms/verify.
 func (a *Adapter) SMSVerify(w http.ResponseWriter, r *http.Request) {
 	var req smsVerifyRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	userID, tenantID := strings.TrimSpace(req.UserID), req.TenantID
@@ -271,7 +252,7 @@ func (a *Adapter) TwoFactorVerifySetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req twoFactorSetupRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	if err := a.auth.VerifyTOTPSetup(r.Context(), user.ID, user.TenantID, req.Secret, req.Token); err != nil {
@@ -285,7 +266,7 @@ func (a *Adapter) TwoFactorVerifySetup(w http.ResponseWriter, r *http.Request) {
 // a tempToken into a session.
 func (a *Adapter) TwoFactorVerify(w http.ResponseWriter, r *http.Request) {
 	var req twoFactorVerifyRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	// Both arguments are the same envelope: this route has no missing-tempToken

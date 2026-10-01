@@ -28,6 +28,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the `TempTokenTTL`, `Uploads` and `Events` fields it was missing.
   Documentation only; no code changes.
 
+### Added
+- **Verify a magic link without opening a session (#32):
+  `Service.ConsumeMagicLink` and `Service.CompleteMagicLinkLogin`**, with
+  `Auth` delegates. `ConsumeMagicLink` verifies the link, burns it and answers
+  its owner — no session, no token, no event, no change to the email-verified
+  flag — so a caller can refuse on a predicate of its own (tenant membership, a
+  device binding, a risk score) before anything is in the store.
+  `CompleteMagicLinkLogin` then opens the session and raises
+  `identity.auth.login.success` with `method: "magic-link"`. This is the
+  reference's order: the strategy verifies and clears the link, and the router
+  decides before it reaches `issueTokens` (`magic-link.strategy.ts:36-52`,
+  `auth.router.ts:1741-1747` at v1.10.8). `VerifyMagicLink` and
+  `VerifyMagicLinkForUser` are now built on the two and answer exactly as
+  before, on every route. The email-verified side effect lives in
+  `VerifyMagicLink`, the login wrapper, and is no longer inferred from whether
+  an owner id was passed, which also settles #33.
+
+### Fixed
+- **An empty request body is no longer `400 INVALID_BODY` on `/register`,
+  `/login`, `/link-request` and `/link-verify` (#34).** The reference reads
+  `req.body ?? {}` on every route since v1.10.5, so a bodyless request reaches
+  each route's own per-field check. The port now does the same on all four
+  adapters: `/register` answers `400 INVALID_INPUT`, `/link-request`
+  `400 EMAIL_REQUIRED`, `/link-verify` `400 TOKEN_REQUIRED`. The adapters used
+  to disagree, since echo's binder tolerated a zero-length body and the other
+  three did not. Every body-reading auth route now decodes through the one
+  shared `auth.DecodeOptionalJSON`, and the per-adapter step-up helpers are
+  gone. Malformed JSON is still `400 INVALID_BODY` everywhere.
+
+  `/login` also gains the reference's presence check. A body with no email or
+  no password, an empty body included, now answers
+  `400 {"error":"Email and password are required"}` with no code, where it
+  used to answer `401 INVALID_CREDENTIALS` (`auth.router.ts:996-1000` at
+  v1.10.8). The check runs in the route before the service, so it raises no
+  `identity.auth.login.failed` event, as in the reference. `Service.Login`
+  itself is unchanged.
+- **`MemoryLinkedAccounts.Save` no longer leaves a stale link behind when it
+  re-points a binding (#37).** Saving a `(provider, providerID)` pair that
+  another user held, under a new id, overwrote the pair's lookup but left the
+  old owner's `ListForUser` entry in place, where no id could reach or delete
+  it. `Save` is now an upsert on the pair: whatever it supersedes — the link
+  that held the pair, or the previous version of the same id — is gone from
+  `FindByProvider`, `ListForUser` and `Delete` alike. It still does not refuse
+  the re-point, because the reference's `linkAccount` is an idempotent upsert
+  that raises no conflict of its own (`linked-accounts-store.interface.ts:58-63`
+  at v1.10.8). The contract is now written on `LinkedAccountStore`, so a host
+  store knows it keys on the pair.
+
 ## [0.12.0] - 2026-09-30
 
 The admin user detail across tenants, and the deprecation of the one exported
