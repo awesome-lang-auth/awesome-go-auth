@@ -48,13 +48,15 @@ func sessionsOf(t *testing.T, svc *Service, user User) []Session {
 	return sessions
 }
 
-// Unset is not off: in 0.x an unset option means on, whether the Config came
-// from DefaultConfig or was built by hand, and only an explicit false is the
-// reference's answer.
-func TestIssueSessionOnRegister_DefaultsOnInZeroX(t *testing.T) {
-	if DefaultConfig(testSecret).IssueSessionOnRegister != nil {
-		t.Fatal("DefaultConfig sets the option; it leaves it unset so the release default applies")
+// Off by default, the reference's answer: DefaultConfig, New() and a
+// hand-built Config all leave the option off, and only an explicit true opens
+// a session.
+func TestIssueSessionOnRegister_DefaultsOff(t *testing.T) {
+	if DefaultConfig(testSecret).IssueSessionOnRegister {
+		t.Fatal("DefaultConfig turns the option on; the default is off, as in the reference")
 	}
+	plain := DefaultConfig(testSecret)
+	plain.BcryptCost = testBcryptCost
 	handBuilt := Config{
 		Secret: testSecret, Issuer: "hand-built", AccessTokenTTL: time.Minute, RefreshTokenTTL: time.Hour,
 		MinPasswordLen: 8, BcryptCost: testBcryptCost, ResetTokenTTL: time.Hour, MagicLinkTTL: time.Hour,
@@ -65,10 +67,9 @@ func TestIssueSessionOnRegister_DefaultsOnInZeroX(t *testing.T) {
 		cfg  Config
 		want bool
 	}{
-		{"DefaultConfig", testConfig(testSecret), true},
-		{"a hand-built Config that does not set it", handBuilt, true},
-		{"explicitly false", func() Config { c := handBuilt; c.IssueSessionOnRegister = boolPtr(false); return c }(), false},
-		{"explicitly true", func() Config { c := handBuilt; c.IssueSessionOnRegister = boolPtr(true); return c }(), true},
+		{"DefaultConfig", plain, false},
+		{"a hand-built Config", handBuilt, false},
+		{"explicitly true", func() Config { c := handBuilt; c.IssueSessionOnRegister = true; return c }(), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, err := NewService(tc.cfg, NewMemoryUserStore(), NewMemorySessionStore())
@@ -84,16 +85,20 @@ func TestIssueSessionOnRegister_DefaultsOnInZeroX(t *testing.T) {
 			}
 		})
 	}
-	for _, tc := range []struct {
-		opt  bool
-		want bool
-	}{{false, false}, {true, true}} {
-		a, err := newTestAuth(WithIssueSessionOnRegister(tc.opt))
+	a, err := New(WithBcryptCost(testBcryptCost))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.service.cfg.IssueSessionOnRegister {
+		t.Fatal("New() has the option on")
+	}
+	for _, opt := range []bool{false, true} {
+		a, err := New(WithBcryptCost(testBcryptCost), WithIssueSessionOnRegister(opt))
 		if err != nil {
-			t.Fatalf("newTestAuth: %v", err)
+			t.Fatalf("New: %v", err)
 		}
-		if got := a.service.cfg.issueSessionOnRegister(); got != tc.want {
-			t.Fatalf("WithIssueSessionOnRegister(%v) resolves to %v", tc.opt, got)
+		if a.service.cfg.IssueSessionOnRegister != opt {
+			t.Fatalf("WithIssueSessionOnRegister(%v) left %v", opt, a.service.cfg.IssueSessionOnRegister)
 		}
 	}
 }
@@ -128,7 +133,7 @@ func TestRegister_OnOpensTheLoginsSession(t *testing.T) {
 
 // Off: the reference's answer — the account and nothing else.
 func TestRegister_OffCreatesTheAccountOnly(t *testing.T) {
-	svc, _, events := registerSessionService(t, func(c *Config) { c.IssueSessionOnRegister = boolPtr(false) })
+	svc, _, events := registerSessionService(t, func(c *Config) { c.IssueSessionOnRegister = false })
 	user, tokens, err := svc.Register(context.Background(), RegisterInput{Email: "off@example.com", Password: "password1", TenantID: "t1"})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
@@ -238,7 +243,7 @@ func TestIssueSessionOnRegister_StrictIsLoggedOnce(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var lines []string
 			cfg := testConfig(testSecret)
-			cfg.IssueSessionOnRegister = boolPtr(tc.on)
+			cfg.IssueSessionOnRegister = tc.on
 			cfg.EmailVerificationMode = tc.mode
 			cfg.Logger = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
 			svc, err := NewService(cfg, NewMemoryUserStore(), NewMemorySessionStore())

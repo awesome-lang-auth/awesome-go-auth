@@ -578,8 +578,11 @@ func csrfCookieSpec() CookieSpec {
 }
 
 func testRegister(t *testing.T, mount Mounter) {
+	// These two pin the delivery when the registration opens a session, which
+	// it does only under Config.IssueSessionOnRegister; the default, the
+	// reference's answer, is pinned in RegisterSession.
 	t.Run("cookie mode sets cookies and returns no tokens", func(t *testing.T) {
-		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithIssueSessionOnRegister(true))
 		rec := env.Do(env.Request(http.MethodPost, "/register", credentials("reg@example.com")))
 
 		AssertStatus(t, rec, http.StatusCreated)
@@ -597,7 +600,7 @@ func testRegister(t *testing.T, mount Mounter) {
 	})
 
 	t.Run("bearer mode returns tokens and sets no cookies", func(t *testing.T) {
-		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithIssueSessionOnRegister(true))
 		req := env.Request(http.MethodPost, "/register", credentials("regbearer@example.com"))
 		req.Header.Set(auth.AuthStrategyHeader, auth.AuthStrategyBearer)
 		rec := env.Do(req)
@@ -1063,7 +1066,7 @@ func testCookieNames(t *testing.T, mount Mounter) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := auth.DefaultHTTPConfig()
 			tc.mutate(&cfg)
-			env := NewEnv(t, mount, cfg)
+			env := NewEnv(t, mount, cfg, auth.WithIssueSessionOnRegister(true))
 			rec := env.Do(env.Request(http.MethodPost, "/register", credentials("names@example.com")))
 			AssertStatus(t, rec, http.StatusCreated)
 

@@ -231,14 +231,14 @@ func WithRequire2FA(enabled bool) Option {
 // successful POST <prefix>/register also logs the new account in, as a
 // successful POST <prefix>/login would.
 //
-//	auth.WithIssueSessionOnRegister(false) // the reference's answer: 201 {success, userId}, no session
+//	auth.WithIssueSessionOnRegister(true) // register also logs the new account in
 //
-// On by default for every 0.x release, which is how this port has always
-// behaved; the default becomes off at v1.0.0. The email-verification gate and
-// a required second factor win over it — see Config.IssueSessionOnRegister.
+// Off by default, the reference's answer: 201 {success, userId} and no
+// session. The email-verification gate and a required second factor win over
+// it — see Config.IssueSessionOnRegister.
 func WithIssueSessionOnRegister(enabled bool) Option {
 	return func(b *authBuilder) error {
-		b.cfg.IssueSessionOnRegister = &enabled
+		b.cfg.IssueSessionOnRegister = enabled
 		return nil
 	}
 }

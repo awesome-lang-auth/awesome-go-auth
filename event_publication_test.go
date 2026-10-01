@@ -207,7 +207,7 @@ func publicationSites() []publicationSite {
 				// event is the only one: with it on, the session the registration
 				// opens raises identity.auth.login.success after it, as a login
 				// does — TestRegister_OnOpensTheLoginsSession pins that.
-				h.svc.cfg.IssueSessionOnRegister = boolPtr(false)
+				h.svc.cfg.IssueSessionOnRegister = false
 				h.reset()
 				h.register(t, "created@example.com")
 			},
