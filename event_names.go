@@ -137,8 +137,9 @@ const (
 	// EventAuthOAuthConflict is raised three times, once per conflict site
 	// (node-auth auth.router.ts:1480, :1530, :1580), and is the one name raised
 	// on a path that ends in a redirect rather than a JSON body. It carries no
-	// user id — there is no user yet — and spreads the error's own data under
-	// the provider.
+	// user id — there is no user yet — and carries the provider, the address
+	// (cut to 320 UTF-16 code units) and the provider account id, the three
+	// keys oauthConflictEventData picks (router-events.ts:54-67 at 1.10.8).
 	EventAuthOAuthConflict = "identity.auth.oauth.conflict"
 
 	// ---- Tenant --------------------------------------------------------------

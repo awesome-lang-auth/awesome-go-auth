@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (behaviour) — the default OAuth provisioning policy answers an
+  address another account holds with the account conflict, not a link**
+  (#36). `DefaultOAuthProvisioning()` is now `{AutoCreate: true, OnEmailMatch:
+  "conflict"}`, and an empty `OnEmailMatch` means `"conflict"` too, so a policy
+  that leaves the mode out can never link by address. It applies to every
+  wiring whose `OAuthWiring.Provisioning` is nil and to
+  `OAuthService.HandleCallback`. Through 0.12.0 the default was `"link"`: a
+  provider account nobody had linked, asserting an address that an account
+  already held, was linked to that account and signed into it, whether or not
+  the provider had verified the address. Against a provider that lets a user
+  type any address, that handed the account to whoever registered the
+  victim's address there. The new default is the `findOrCreateUser` the
+  reference documents (its `README.detailed.md`, "OAuth Strategies"). The
+  callback stashes the conflict when `OAuthWiring.PendingLinks` is set and
+  redirects to `/account-conflict`, and the link is made only after
+  `/link-request` and `/link-verify` have proven the address by mail. Account
+  creation and existing provider links are unchanged.
+
+  A host that relied on linking by address sets `OnEmailMatch: "link"`
+  explicitly (or calls `HandleCallbackWithPolicy` with it). It should add
+  `RequireVerifiedEmail: true` unless every provider it uses verifies
+  addresses. `"link"` itself is unchanged and applies no verification check of
+  its own. The `oauth-provisioning-is-a-policy-not-a-function` compatibility
+  note now describes the new default.
+
+  The conflict redirect and event now match the reference at 1.10.8. The
+  `Location` is built on the state's bare origin (or the default site URL),
+  not on the post-login redirect, so a flow begun with `return_path` no longer
+  lands on `<origin><return_path><prefix>/account-conflict`. The new
+  `OAuthCompleteResult.ConflictOrigin` carries that origin, and the net/http
+  adapter (which the chi, gin and echo adapters mount) uses it. `provider` and
+  `email` are escaped as `encodeURIComponent` escapes them, so an apostrophe
+  stays bare and a space is `%20`. The `identity.auth.oauth.conflict` event
+  cuts `email` to 320 UTF-16 code units, as the reference's
+  `oauthConflictEventData` does.
+
 ### Fixed
 - **`README_DETAILED.md` §HTTP Adapters now documents the adapters that exist
   (#16).** The section showed `chi.New(svc)`, `gin.New(svc)`, `echo.New(svc)`

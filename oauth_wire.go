@@ -482,7 +482,7 @@ func resolveOAuthRedirect(state oauthState, allowed []string, siteURL string) st
 // resolveOAuthConflictOrigin is the reference's conflictOrigin: the state's
 // origin when the allowlist admits it (an empty allowlist admits any), the
 // default site URL otherwise — and, unlike resolveOAuthRedirect, never the
-// state's return path (node-auth auth.router.ts:1992-1995 at 1.10.8, repeated
+// state's return path (auth.router.ts:1992-1995 at 1.10.8, repeated
 // at :2072-2075 and :2154-2157). The conflict page lives under the API prefix
 // on the site's root, wherever the login was meant to land afterwards.
 func resolveOAuthConflictOrigin(state oauthState, allowed []string, siteURL string) string {
@@ -610,13 +610,13 @@ type OAuthCompleteResult struct {
 	Tokens AuthTokens
 	// RedirectTo is where a successful callback sends the browser: the
 	// reference's resolveOAuthRedirect, the state's origin with its return path
-	// appended (node-auth auth.router.ts:671 at 1.10.8).
+	// appended (auth.router.ts:671 at 1.10.8).
 	RedirectTo string
 	// ConflictOrigin is the site URL an account conflict's redirect is built on
 	// (AccountConflictLink). It is not RedirectTo: the reference's conflict
 	// branch takes the state's bare origin when the allowlist admits it and the
 	// default site URL otherwise, and never appends the return path
-	// (node-auth auth.router.ts:1992-1995, :2072-2075, :2154-2157 at 1.10.8).
+	// (auth.router.ts:1992-1995, :2072-2075, :2154-2157 at 1.10.8).
 	// It is set on every result whose state verified, conflict or not.
 	ConflictOrigin string
 }
