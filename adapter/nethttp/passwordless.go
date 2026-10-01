@@ -1,9 +1,6 @@
 package nethttp
 
 import (
-	"encoding/json"
-	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -17,30 +14,14 @@ import (
 // second factor into no factor at all. Delivery is the service's job now, through
 // the senders on Config (see delivery.go), so the only thing the send routes owe
 // that seam is the precheck below.
-
-// decodeStepUpJSON decodes a request body and treats an absent one as a body
-// with every field omitted, which is what the reference does: express.json()
-// leaves req.body as {} when there is nothing to parse, and each route then
-// answers for the field it was missing — `email is required` on
-// /magic-link/send, INVALID_MAGIC_LINK on /magic-link/verify,
-// INVALID_ACCESS_TOKEN on /2fa/verify. Answering INVALID_BODY instead replaces
-// all of those with one status a client cannot act on.
 //
+// Bodies are decoded with auth.DecodeOptionalJSON, the decoder every
+// body-reading route of the four adapters shares. An absent body is a body with
+// every field omitted, which is what the reference does: express.json() leaves
+// req.body as {} when there is nothing to parse, and each route then answers
+// for the field it was missing — `email is required` on /magic-link/send,
+// INVALID_MAGIC_LINK on /magic-link/verify, INVALID_ACCESS_TOKEN on /2fa/verify.
 // Malformed JSON is still 400 INVALID_BODY; only emptiness is tolerated.
-func decodeStepUpJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	if r.Body == nil {
-		return true
-	}
-	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		if errors.Is(err, io.EOF) {
-			return true
-		}
-		auth.WriteHTTPError(w, auth.HTTPErrInvalidBody)
-		return false
-	}
-	return true
-}
 
 type magicLinkSendRequest struct {
 	Email     string `json:"email"`
@@ -93,7 +74,7 @@ type twoFactorVerifyRequest struct {
 // MagicLinkSend handles POST <prefix>/magic-link/send.
 func (a *Adapter) MagicLinkSend(w http.ResponseWriter, r *http.Request) {
 	var req magicLinkSendRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	email, tenantID := req.Email, req.TenantID
@@ -139,7 +120,7 @@ func (a *Adapter) MagicLinkSend(w http.ResponseWriter, r *http.Request) {
 // MagicLinkVerify handles POST <prefix>/magic-link/verify.
 func (a *Adapter) MagicLinkVerify(w http.ResponseWriter, r *http.Request) {
 	var req magicLinkVerifyRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	in := auth.MagicLinkVerifyInput{Token: req.Token}
@@ -177,7 +158,7 @@ func (a *Adapter) SMSSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req smsSendRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	userID, tenantID := strings.TrimSpace(req.UserID), req.TenantID
@@ -209,7 +190,10 @@ func (a *Adapter) SMSSend(w http.ResponseWriter, r *http.Request) {
 		auth.WriteHTTPError(w, auth.HTTPErrUserNotFound)
 		return
 	}
-	if strings.TrimSpace(user.PhoneNumber) == "" {
+	// Untrimmed, as the reference tests it (`if (!user.phoneNumber)`,
+	// auth.router.ts:1830 at v1.10.8): a number of only spaces is stored as sent
+	// since #35, and it is a number here too.
+	if user.PhoneNumber == "" {
 		auth.WriteHTTPError(w, auth.HTTPErrPhoneNotSet)
 		return
 	}
@@ -223,7 +207,7 @@ func (a *Adapter) SMSSend(w http.ResponseWriter, r *http.Request) {
 // SMSVerify handles POST <prefix>/sms/verify.
 func (a *Adapter) SMSVerify(w http.ResponseWriter, r *http.Request) {
 	var req smsVerifyRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	userID, tenantID := strings.TrimSpace(req.UserID), req.TenantID
@@ -253,7 +237,7 @@ func (a *Adapter) TwoFactorSetup(w http.ResponseWriter, r *http.Request) {
 		auth.WriteHTTPError(w, auth.HTTPErrNoAccessToken)
 		return
 	}
-	setup, err := a.auth.StartTOTPEnrolment(r.Context(), user.ID, user.TenantID)
+	setup, err := a.auth.NewTOTPEnrolment(user.Email)
 	if err != nil {
 		auth.WriteServiceError(w, err)
 		return
@@ -271,7 +255,7 @@ func (a *Adapter) TwoFactorVerifySetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req twoFactorSetupRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	if err := a.auth.VerifyTOTPSetup(r.Context(), user.ID, user.TenantID, req.Secret, req.Token); err != nil {
@@ -285,7 +269,7 @@ func (a *Adapter) TwoFactorVerifySetup(w http.ResponseWriter, r *http.Request) {
 // a tempToken into a session.
 func (a *Adapter) TwoFactorVerify(w http.ResponseWriter, r *http.Request) {
 	var req twoFactorVerifyRequest
-	if !decodeStepUpJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	// Both arguments are the same envelope: this route has no missing-tempToken
@@ -312,28 +296,12 @@ func (a *Adapter) TwoFactorDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Re-read the user rather than trust the access token: a require2FA flag
-	// set after the token was issued still has to be honoured.
-	//
-	// A failed re-read is not an error here. The reference reads the user with
-	// optional chaining (`currentUser?.require2FA`, auth.router.ts:884-885), so a
-	// token whose user the store no longer has falls through to the disable
-	// instead of 404ing — and the disable itself then reports whatever the store
-	// says. Reachable only if the user vanishes between the middleware's lookup
-	// and this one, but a 404 here would be the port inventing a status.
-	//
-	// Note the asymmetry with the settings read below, deliberately: this term
-	// fails OPEN and that one fails closed. `err != nil` here covers a user store
-	// that is merely down as well as a user that is gone, so a transient outage
-	// lets a user whose record carries require2FA disable the factor. The
-	// reference does distinguish them — a findById that *throws* reaches
-	// handleError and becomes 500, and only a null user falls through — and this
-	// port does not, because Auth.FindUser reports both as an error. Matching the
-	// reference here needs a not-found sentinel the user-store interface does not
-	// have; until it does, the fail-closed rule stated below is the rule for the
-	// settings read and not for this one.
-	fresh, err := a.auth.FindUser(r.Context(), user.ID, "", user.TenantID)
-	if err == nil && fresh.Require2FA {
-		auth.WriteHTTPError(w, auth.HTTPErrTwoFactorRequiredForUser)
+	// set after the token was issued still has to be honoured. The re-read fails
+	// closed — a missing user is 404, any other read failure 500 — because since
+	// #31 no gate has read the row before this handler; see
+	// auth.Auth.TwoFactorDisableUserRefusal.
+	if herr, refused := a.auth.TwoFactorDisableUserRefusal(r.Context(), user.ID, user.TenantID); refused {
+		auth.WriteHTTPError(w, herr)
 		return
 	}
 	// The system-wide term is second, as it is in the reference, where the

@@ -62,6 +62,12 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 	if cfg.BcryptCost != 0 && cfg.BcryptCost < bcrypt.DefaultCost {
 		svc.logf("auth: bcrypt cost %d is below the default %d; password hashes will be cheaper to crack", cfg.BcryptCost, bcrypt.DefaultCost)
 	}
+	// Both are legal together, and the gate wins (see registerIssuesSession),
+	// so a deployment that expected registration to log people in is told once
+	// why it does not.
+	if cfg.issueSessionOnRegister() && svc.emailVerificationMode() == EmailVerificationModeStrict {
+		svc.logf("auth: IssueSessionOnRegister is on, but EmailVerificationMode is strict: POST /register issues no session for an unverified account; it logs in after verifying the address")
+	}
 	return svc, nil
 }
 
@@ -69,7 +75,8 @@ func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-// Register creates a user and opens a session for them.
+// Register creates a user and, when Config.IssueSessionOnRegister allows it,
+// opens a session for them.
 //
 // The two fields are required, and their absence is refused before any store is
 // touched — the order the default register handler on the private dev line
@@ -90,8 +97,12 @@ func normalizeEmail(email string) string {
 // it can only refuse a request the dev line would have turned into an account
 // with no usable address.
 //
-// A successful call also opens a session, which the published reference does
-// not: see the register-issues-a-session entry in CompatibilityNotes.
+// Whether a successful call also opens a session is the instance's choice,
+// Config.IssueSessionOnRegister — on by default in 0.x, off from v1.0.0 and in
+// the reference — and even when it is on, the account must be one POST /login
+// would log straight in (see registerIssuesSession). When no session is opened
+// the returned AuthTokens is the zero value. See the register-issues-a-session
+// entry in CompatibilityNotes.
 func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTokens, error) {
 	var zeroTokens AuthTokens
 	in.Email = normalizeEmail(in.Email)
@@ -127,18 +138,11 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTok
 	if err != nil {
 		return User{}, zeroTokens, fmt.Errorf("auth: create user: %w", err)
 	}
-
-	tokens, err := s.newSessionTokens(ctx, created)
-	if err != nil {
-		return User{}, zeroTokens, err
-	}
-	// node-auth auth.router.ts:813, the last thing POST /register does before it
-	// answers 201. Publishing here rather than straight after CreateUser keeps
-	// the dev line's rule that only the success path raises: there, anything
-	// that throws between the register handler and the publish leaves the
-	// account created and the event unraised — the welcome mail is the one
-	// candidate — and here the extra session this port opens is (see the
-	// register-issues-a-session deviation).
+	// node-auth auth.router.ts:813: identity.user.created, once the account
+	// exists. It comes before the session, in the order the family's
+	// implementation of the option in awesome-node-auth takes (publishRouterEvent,
+	// then completeLocalLogin): a session that fails to open leaves the account
+	// created and announced, and the error returned.
 	s.publish(ctx, func() Event {
 		return Event{
 			Name:   EventUserCreated,
@@ -146,7 +150,36 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTok
 			Data:   map[string]any{"email": created.Email, "method": registerMethodDefault},
 		}
 	})
+	if !s.registerIssuesSession(created) {
+		return created, zeroTokens, nil
+	}
+	// The login's own tail: the same session row and the same
+	// identity.auth.login.success with method "local" a password login raises.
+	tokens, err := s.completeLocalLogin(ctx, created)
+	if err != nil {
+		return User{}, zeroTokens, err
+	}
 	return created, tokens, nil
+}
+
+// registerIssuesSession reports whether Register opens a session for the
+// account it has just created: Config.IssueSessionOnRegister is on, and
+// POST /login would log this account straight in — its email-verification
+// gate lets it through and no second factor is required of it. The two
+// predicates are loginPassword's own, so the registration can never be more
+// permissive than the login (#21, the family spec's "email verification wins").
+func (s *Service) registerIssuesSession(user User) bool {
+	if !s.cfg.issueSessionOnRegister() {
+		return false
+	}
+	return !s.emailVerificationBlocksLogin(user) && !s.requiresTwoFactor(user)
+}
+
+// emailVerificationBlocksLogin is the login's email-verification gate: an
+// unverified address may log in only under EmailVerificationModeLazy. It is
+// shared by loginPassword and registerIssuesSession so the two cannot drift.
+func (s *Service) emailVerificationBlocksLogin(user User) bool {
+	return !user.IsEmailVerified && s.emailVerificationMode() != EmailVerificationModeLazy
 }
 
 // Login verifies a password and issues a session, reporting a 2FA-gated account
@@ -278,30 +311,24 @@ func (s *Service) Logout(ctx context.Context, refreshToken string) error {
 	return nil
 }
 
-// Authenticate verifies an access token and returns the user it names. The
-// token's signature, type, issuer and lifetime are checked, the session is
-// validated when Config.SessionCheckOn is "allcalls", and the user is loaded
-// from the UserStore; the failure sentinels are Me's — ErrInvalidToken,
-// ErrSessionNotFound, ErrSessionRevoked. It is what the adapters' Middleware
-// calls for every request to a protected route.
+// Authenticate verifies an access token and returns the user it names, read
+// from the UserStore. The token's signature, type, issuer and lifetime are
+// checked, the session is validated when Config.SessionCheckOn is "allcalls",
+// and the user is loaded; the failure sentinels are ErrInvalidToken — for a
+// user the store no longer has, too — ErrSessionNotFound and ErrSessionRevoked.
+//
+// It is not the adapters' auth gate any more: since #31 their Middleware calls
+// VerifyAccess, which reads no user store, as the reference's authMiddleware
+// does. Authenticate stays for the callers that need the stored row behind a
+// token — the IdP's userinfo endpoint, the identity half of POST /link-request —
+// and for a host that wants deletion to take effect on its own routes at once.
 //
 // The user comes back with the optional stores' enrichment — metadata, roles,
-// permissions, tenants — because host handlers behind the middleware read those
-// off UserFromContext for their own authorisation decisions, and each is a
-// local store read that never fails the request: a store error is logged and
-// the field left empty, as it always was. What Authenticate does not do is run
-// Config.BuildTokenClaims, so CustomClaims is nil. The builder is a mint-time
-// hook — with a ClaimsWebhook behind it, a network round trip — and what it
-// computed is already inside the token the request carried; running it again
-// on every request would make each protected route pay for a claim set nothing
-// reads. Me is the call that runs it, for the one route whose body is the
-// profile. This is also where the reference draws the line: its authMiddleware
-// verifies the token and hands the route the verified payload as req.user
-// (auth.middleware.ts:44-61). It does consult the session store — the allcalls
-// check at :47-53 and the last-active touch at :56-58 — but never the user
-// store and never buildTokenPayload; only its /me calls buildPayload again.
-// Authenticate reads the user store in addition, because the Go middleware
-// hands the route a User rather than a payload.
+// permissions, tenants — each a local store read that never fails the request:
+// a store error is logged and the field left empty. What Authenticate does not
+// do is run Config.BuildTokenClaims, so CustomClaims is nil: the builder is a
+// mint-time hook — with a ClaimsWebhook behind it, a network round trip — and
+// Me is the call that runs it, for the one route whose body is the profile.
 func (s *Service) Authenticate(ctx context.Context, accessToken string) (User, error) {
 	claims, err := s.parseToken(accessToken, "access")
 	if err != nil {
@@ -317,18 +344,81 @@ func (s *Service) Authenticate(ctx context.Context, accessToken string) (User, e
 	return s.enrichFromStores(ctx, user), nil
 }
 
-// Me is Authenticate plus the custom claims: the profile GET /me renders, with
-// CustomClaims filled from Config.BuildTokenClaims so that the body reflects
-// the hook the way the reference's /me does — its body is buildPayload(user)
-// (auth.router.ts:656-680). A builder failure is logged and leaves CustomClaims
-// nil rather than failing the call, as it always has: /me is a read, and a read
-// should not go dark because a mint-time hook is down.
-func (s *Service) Me(ctx context.Context, accessToken string) (User, error) {
-	user, err := s.Authenticate(ctx, accessToken)
+// VerifyAccess verifies an access token and returns the principal it carries,
+// built from the verified claims without reading the UserStore. It is what the
+// adapters' Middleware calls for every request to a protected route.
+//
+// This is the reference's authMiddleware (awesome-node-auth v1.10.8
+// auth.middleware.ts:44-61): it verifies the token, consults the session store
+// only for the allcalls check, and hands the route the verified payload as
+// req.user. It never reads the user store, so a token whose user has since been
+// deleted still reaches the handler, and each handler answers for the missing
+// user itself — GET /me, /change-password, /send-verification-email and
+// /change-email/request with the reference's 404 "User not found" (#31).
+//
+// The checks are Authenticate's up to the user lookup, with the same sentinels:
+// ErrInvalidToken for a token that does not verify, and, under
+// SessionCheckOn "allcalls", ErrSessionNotFound or ErrSessionRevoked for a
+// session that is gone — SESSION_REVOKED on the wire, unchanged. The principal
+// is UserFromRS256Claims of the payload: the six base claims (sub, email,
+// role, loginProvider, isEmailVerified, isTotpEnabled) plus tid. CustomClaims
+// is nil, as Authenticate leaves it. Fields the token cannot carry —
+// PasswordHash, FirstName, PhoneNumber, CreatedAt and the rest of the stored
+// row — are zero; a handler that needs them reads the store, as the
+// reference's handlers do.
+//
+// The optional stores' enrichment is kept: Metadata, Roles, Permissions and
+// Tenants are filled as Authenticate fills them, keyed by the token's subject,
+// because host handlers behind the middleware read them off UserFromContext for
+// their own authorisation decisions. It is the one read the reference's gate
+// does not make, and it cannot fail the request.
+//
+// The consequence is the reference's, and it is a posture: deleting a user no
+// longer locks out an access token already issued to them. The token keeps
+// passing the gate until it expires — Config.AccessTokenTTL — unless
+// SessionCheckOn is "allcalls" and the session was revoked, which is what
+// Service.DeleteAccount does first.
+func (s *Service) VerifyAccess(ctx context.Context, accessToken string) (User, error) {
+	claims, payload, err := s.accessTokenPayload(accessToken)
 	if err != nil {
 		return User{}, err
 	}
-	return s.enrichCustomClaims(ctx, user), nil
+	if err := s.validateSessionForAccess(ctx, claims); err != nil {
+		return User{}, err
+	}
+	user := UserFromRS256Claims(payload)
+	// CustomClaims stays nil, as Authenticate leaves it: the payload is not
+	// re-exposed as claims a host route could echo back, and the hook's
+	// output is Me's to render.
+	user.CustomClaims = nil
+	return s.enrichFromStores(ctx, user), nil
+}
+
+// Me is the profile GET /me renders: the token verified as VerifyAccess
+// verifies it, the user then read from the UserStore, and CustomClaims filled
+// from Config.BuildTokenClaims, so that the body reflects the hook the way the
+// reference's /me does — its body is buildPayload(user) (auth.router.ts:656-680).
+//
+// A user the store no longer has is ErrUserNotFound, the reference's
+// 404 {"error":"User not found"} (awesome-node-auth v1.10.8
+// auth.router.ts:1182-1185): its gate lets the token through and the handler's
+// own findById misses. Before #31 this was ErrInvalidToken. A builder failure
+// is logged and leaves CustomClaims nil rather than failing the call, as it
+// always has: /me is a read, and a read should not go dark because a mint-time
+// hook is down.
+func (s *Service) Me(ctx context.Context, accessToken string) (User, error) {
+	claims, err := s.parseToken(accessToken, "access")
+	if err != nil {
+		return User{}, err
+	}
+	if err := s.validateSessionForAccess(ctx, claims); err != nil {
+		return User{}, err
+	}
+	user, err := s.users.GetUserByID(ctx, claims.Sub, claims.Tid)
+	if err != nil {
+		return User{}, userLookupError(err)
+	}
+	return s.enrichCustomClaims(ctx, s.enrichFromStores(ctx, user)), nil
 }
 
 // The `data.method` values the dev line writes on identity.auth.login.success
@@ -548,16 +638,57 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 	return ps.ClearResetToken(ctx, user.ID, user.TenantID)
 }
 
+// ChangePassword replaces a user's password, or sets the first one of an
+// account that has none — the reference's POST /change-password
+// (awesome-node-auth v1.10.8 auth.router.ts:1465-1500), in its order:
+//
+//  1. the user is looked up; a missing one is ErrUserNotFound, the
+//     reference's 404, and any other store failure is an opaque error, its
+//     500 (#31);
+//  2. an empty NewPassword is ErrNewPasswordRequired, whatever the account;
+//  3. an account that has a password must present it, and an empty or wrong
+//     CurrentPassword is ErrInvalidCredentials. "Has a password" is what
+//     POST /login would check: a stored hash, compared locally and then — when
+//     it does not verify — through Config.PasswordVerifier, exactly as
+//     loginPassword does, migration included; and, when a verifier is
+//     configured, an account with no stored hash too, because its credential
+//     may live behind the verifier (a row not migrated yet, or one the
+//     verifier keeps owning with migrated=false). Only an account with no
+//     stored hash on a deployment with no verifier is passwordless — OAuth-only,
+//     magic-link-only — and it skips the comparison and sets its first password
+//     with NewPassword alone, because the reference's compare sits inside
+//     `if (user.password)`. Its CurrentPassword is then ignored, not compared;
+//  4. the port's password policy, which the reference does not have (the
+//     password-policy-on-reset-and-change deviation): a NewPassword shorter
+//     than Config.MinPasswordLen is ErrWeakPassword. It runs last so that it
+//     never outranks an answer the reference gives.
+//
+// The passwordless case of step 3 is a posture, and it is the reference's:
+// whoever holds a valid access token of a passwordless account can give that
+// account a password. A caller that wants a stronger proof for that case has to
+// ask for it before calling here (#30). The decision reads the stored hash, so
+// the UserStore must return PasswordHash from GetUserByID; a store that leaves
+// it out makes every account look passwordless.
 func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) error {
-	if len(in.NewPassword) < s.cfg.MinPasswordLen {
-		return ErrWeakPassword
-	}
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return ErrInvalidCredentials
+		return userLookupError(err)
 	}
-	if !verifyPassword(in.CurrentPassword, user.PasswordHash) {
-		return ErrInvalidCredentials
+	if in.NewPassword == "" {
+		return ErrNewPasswordRequired
+	}
+	if user.PasswordHash != "" || s.cfg.PasswordVerifier != nil {
+		if in.CurrentPassword == "" {
+			return ErrInvalidCredentials
+		}
+		if !verifyPassword(in.CurrentPassword, user.PasswordHash) {
+			if _, err := s.verifyThroughPasswordVerifier(ctx, user, in.CurrentPassword); err != nil {
+				return err
+			}
+		}
+	}
+	if len(in.NewPassword) < s.cfg.MinPasswordLen {
+		return ErrWeakPassword
 	}
 	ps, ok := s.users.(UserPasswordStore)
 	if !ok {
@@ -633,55 +764,92 @@ func (s *Service) SendMagicLink(ctx context.Context, in MagicLinkSendInput) (str
 	return magicToken, nil
 }
 
+// VerifyMagicLink is the passwordless login: it consumes the link, marks the
+// owner's address verified, and opens a session for them — the reference's
+// mode='login' branch of POST /magic-link/verify (awesome-node-auth v1.10.8
+// auth.router.ts:1756-1767).
+//
+// The email-verification side effect belongs to this wrapper and to nothing
+// else. The reference applies it in the router's login branch only
+// (:1758-1761); its 2fa branch (:1727-1754) has no such call, because a second
+// factor is not proof of address ownership. ConsumeMagicLink therefore never
+// applies it, and VerifyMagicLinkForUser — the second-factor wrapper — does not
+// either.
+//
+// A caller that has to decide something after learning who the link belongs to
+// uses ConsumeMagicLink and then CompleteMagicLinkLogin instead.
 func (s *Service) VerifyMagicLink(ctx context.Context, in MagicLinkVerifyInput) (User, AuthTokens, error) {
-	return s.verifyMagicLink(ctx, in, "")
-}
-
-// verifyMagicLink consumes a magic link and issues a session for its owner.
-//
-// requireUserID, when set, is the identity the link has to belong to — the
-// step-up flow, where the link is a second factor for a user the caller has
-// already identified. It is checked *before* anything is issued, so a refused
-// request leaves no session behind, and before the email-verification side
-// effect, which the reference applies only on the login path
-// (auth.router.ts:1158-1164 versus the 2fa branch at :1134-1156). The link is
-// still consumed either way: the reference burns it inside the strategy before
-// the router compares ids (magic-link.strategy.ts:50), so a mismatch costs the
-// link there too.
-//
-// See VerifyMagicLinkForUser for the exported entry point.
-func (s *Service) verifyMagicLink(ctx context.Context, in MagicLinkVerifyInput, requireUserID string) (User, AuthTokens, error) {
-	ms, ok := s.users.(MagicLinkStore)
-	if !ok {
-		return User{}, AuthTokens{}, ErrFeatureNotSupported
-	}
-	user, err := ms.GetUserByMagicLinkTokenHash(ctx, hashToken(in.Token))
-	if err != nil || user.MagicLinkTokenExpiresAt == nil || s.now().After(user.MagicLinkTokenExpiresAt.Add(s.cfg.ClockSkew)) {
-		return User{}, AuthTokens{}, ErrInvalidToken
-	}
-	if err := ms.ClearMagicLinkToken(ctx, user.ID, user.TenantID); err != nil {
+	user, err := s.ConsumeMagicLink(ctx, in)
+	if err != nil {
 		return User{}, AuthTokens{}, err
 	}
-	if requireUserID != "" && user.ID != requireUserID {
-		return User{}, AuthTokens{}, ErrMagicLinkOwnerMismatch
-	}
-	if requireUserID == "" && !user.IsEmailVerified {
+	if !user.IsEmailVerified {
 		if evs, ok := s.users.(EmailVerificationStore); ok {
 			_ = evs.MarkEmailVerified(ctx, user.ID, user.TenantID, true)
 		}
 		user.IsEmailVerified = true
 	}
-	tokens, sessionID, err := s.issueSession(ctx, user)
+	tokens, err := s.CompleteMagicLinkLogin(ctx, user)
 	if err != nil {
 		return User{}, AuthTokens{}, err
+	}
+	return user, tokens, nil
+}
+
+// ConsumeMagicLink verifies a magic link and burns it, and does nothing else:
+// no session, no token, no event, and no change to the user's email-verified
+// flag. It answers the link's owner, so the caller can decide what to do with
+// them — refuse, gate on tenant membership or a risk score, ask for another
+// factor — before anything exists in the store. CompleteMagicLinkLogin is the
+// call that issues the session once the caller has decided to.
+//
+// This is the reference's magicLinkStrategy.verify
+// (awesome-node-auth v1.10.8 magic-link.strategy.ts:36-52), which the router
+// calls before it compares identities and before it reaches issueTokens
+// (auth.router.ts:1741-1747). The link is single-use from here on whatever the
+// caller decides next, as in the reference, which clears it inside verify
+// (:50): a refused request still costs the link.
+//
+// An unknown link and an expired one both answer ErrInvalidToken; see
+// HTTPErrInvalidMagicLink for the reference's split between the two. A store
+// that cannot hold magic links answers ErrFeatureNotSupported.
+func (s *Service) ConsumeMagicLink(ctx context.Context, in MagicLinkVerifyInput) (User, error) {
+	ms, ok := s.users.(MagicLinkStore)
+	if !ok {
+		return User{}, ErrFeatureNotSupported
+	}
+	user, err := ms.GetUserByMagicLinkTokenHash(ctx, hashToken(in.Token))
+	if err != nil || user.MagicLinkTokenExpiresAt == nil || s.now().After(user.MagicLinkTokenExpiresAt.Add(s.cfg.ClockSkew)) {
+		return User{}, ErrInvalidToken
+	}
+	if err := ms.ClearMagicLinkToken(ctx, user.ID, user.TenantID); err != nil {
+		return User{}, err
+	}
+	return user, nil
+}
+
+// CompleteMagicLinkLogin opens a session for a user whose magic link the caller
+// has already consumed with ConsumeMagicLink, and raises
+// identity.auth.login.success with `method: "magic-link"` — the reference's
+// issueTokens and publish that close both branches of POST /magic-link/verify
+// (awesome-node-auth v1.10.8 auth.router.ts:1747-1752 and :1762-1767).
+//
+// It checks nothing about user: the proof is the link ConsumeMagicLink burned,
+// and the decision to honour it is the caller's. Pass the User that
+// ConsumeMagicLink returned, not one looked up some other way. It does not mark
+// the address verified; VerifyMagicLink does that for the login path.
+func (s *Service) CompleteMagicLinkLogin(ctx context.Context, user User) (AuthTokens, error) {
+	tokens, sessionID, err := s.issueSession(ctx, user)
+	if err != nil {
+		return AuthTokens{}, err
 	}
 	// node-auth auth.router.ts:1267 and :1282 — two publication points, one
 	// here. The dev line writes POST /magic-link/verify as two branches of one
 	// route, the step-up branch that checks the temp token and the direct-login
 	// branch that does not, and each ends with its own issueTokens and its own
 	// publish; the two payloads are identical, `method: "magic-link"` and no
-	// per-branch key. This port has those branches as requireUserID set or
-	// empty, and they converge here, so one publication covers both.
+	// per-branch key. This port has those branches as VerifyMagicLink and
+	// VerifyMagicLinkForUser, and both end here, so one publication covers both.
 	//
 	// It is deliberately not `magic-link-2fa` for the step-up branch. Both dev
 	// line sites write the same literal, and a subscriber that needed to tell
@@ -694,7 +862,7 @@ func (s *Service) verifyMagicLink(ctx context.Context, in MagicLinkVerifyInput, 
 			Data:      map[string]any{"method": loginMethodMagicLink},
 		}
 	})
-	return user, tokens, nil
+	return tokens, nil
 }
 
 // SendSMSCode mints a one-time code, stores its hash and delivers it through
@@ -778,7 +946,7 @@ func (s *Service) SendVerificationEmailToken(ctx context.Context, in EmailVerifi
 	}
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return "", ErrInvalidCredentials
+		return "", userLookupError(err)
 	}
 	if user.IsEmailVerified {
 		return "", nil
@@ -819,7 +987,7 @@ func (s *Service) VerifyEmail(ctx context.Context, in VerifyEmailInput) error {
 	//
 	// The other place this port marks an address verified raises nothing, and
 	// that is the dev line's shape too: the first magic-link login verifies the
-	// address as a side effect (verifyMagicLink above, node-auth
+	// address as a side effect (VerifyMagicLink above, node-auth
 	// auth.router.ts:1277-1280) and publishes only the login.
 	s.publish(ctx, func() Event {
 		return Event{Name: EventUserEmailVerified, UserID: user.ID}
@@ -827,7 +995,24 @@ func (s *Service) VerifyEmail(ctx context.Context, in VerifyEmailInput) error {
 	return nil
 }
 
+// RequestEmailChange mints an email-change token for the user and mails it to
+// the new address. It refuses a store that cannot hold a pending change
+// (ErrFeatureNotSupported), an address already in use (ErrUserExists) and a
+// user the store no longer has (ErrUserNotFound), before anything is stored.
+//
+// It does not refuse an account with no password; Auth.RequestEmailChange,
+// the HTTP surface, does, as the reference's route does.
 func (s *Service) RequestEmailChange(ctx context.Context, in ChangeEmailRequestInput) (string, error) {
+	return s.requestEmailChange(ctx, in, false)
+}
+
+// requestEmailChange is RequestEmailChange with the reference's
+// PASSWORD_REQUIRED guard as an option. With requirePassword the refusals come
+// in the reference's order (awesome-node-auth v1.10.8 auth.router.ts:1575-1601):
+// the store capability, the address in use (409), the missing user (404), and
+// then an account whose only credential is the address itself
+// (ErrPasswordRequired, 403) — all four before anything is stored.
+func (s *Service) requestEmailChange(ctx context.Context, in ChangeEmailRequestInput, requirePassword bool) (string, error) {
 	ecs, ok := s.users.(EmailChangeStore)
 	if !ok {
 		return "", ErrFeatureNotSupported
@@ -838,7 +1023,10 @@ func (s *Service) RequestEmailChange(ctx context.Context, in ChangeEmailRequestI
 	}
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return "", ErrInvalidCredentials
+		return "", userLookupError(err)
+	}
+	if requirePassword && user.PasswordHash == "" {
+		return "", ErrPasswordRequired
 	}
 	token, err := randomToken(32)
 	if err != nil {
@@ -1120,6 +1308,12 @@ func (s *Service) ListAllRoles(ctx context.Context) ([]string, error) {
 // atomic needs a store-level patch primitive, which is a breaking interface
 // change and its own item; silently erasing a field on every single partial call
 // is the failure this closes.
+//
+// Both names are stored exactly as submitted: nothing is trimmed. The reference
+// hands the parsed body to userStore.updateProfile untouched (awesome-node-auth
+// v1.10.8 auth.router.ts:1214-1215), so a name sent with surrounding whitespace
+// keeps it and GET /me answers it back as sent. A store that wants normalised
+// names normalises them itself (#35).
 func (s *Service) UpdateProfile(ctx context.Context, in UpdateProfileInput) (User, error) {
 	accountStore, ok := s.users.(UserAccountStore)
 	if !ok {
@@ -1138,7 +1332,7 @@ func (s *Service) UpdateProfile(ctx context.Context, in UpdateProfileInput) (Use
 			lastName = &current.LastName
 		}
 	}
-	updated, err := accountStore.UpdateProfile(ctx, in.UserID, in.TenantID, strings.TrimSpace(*firstName), strings.TrimSpace(*lastName))
+	updated, err := accountStore.UpdateProfile(ctx, in.UserID, in.TenantID, *firstName, *lastName)
 	if err != nil {
 		return User{}, fmt.Errorf("auth: update profile: %w", err)
 	}

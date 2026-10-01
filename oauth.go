@@ -124,6 +124,35 @@ type OAuthLinkedAccount struct {
 }
 
 // LinkedAccountStore persists OAuth provider associations per user.
+//
+// A (Provider, ProviderID) pair is bound to at most one link: FindByProvider
+// answers with a single OAuthLinkedAccount, so the pair is the store's natural
+// key. Save is an upsert on that key, and every other lookup has to agree with
+// it afterwards:
+//
+//   - Saving a pair that is already bound replaces the existing link, whatever
+//     its ID and whichever user held it. The replaced link is gone from every
+//     lookup: FindByProvider answers with the new one, ListForUser of the
+//     previous owner no longer lists it, and Delete of its old ID is a no-op.
+//   - Saving an ID that already exists replaces that link, and the pair and user
+//     it used to have stop answering for it.
+//
+// Save does not refuse a pair held by another user. This is the reference's
+// contract: ILinkedAccountsStore.linkAccount is documented as idempotent on
+// (provider, providerAccountId) and returns nothing but a rejection on failure
+// (awesome-node-auth v1.10.8 linked-accounts-store.interface.ts:58-63), and
+// every store it ships upserts (examples/in-memory-user-store.ts:210-222,
+// sqlite-user-store.example.ts:360-373, mysql-user-store.example.ts:421-436,
+// mongodb-user-store.example.ts:375-381). A provider account that already
+// belongs to somebody else is a conflict the OAuth flow detects before it
+// links anything (OAUTH_ACCOUNT_CONFLICT), not an error the store raises; a
+// caller that needs to refuse a re-point checks FindByProvider first.
+//
+// The one shape difference is the key: the reference's SQL examples key rows
+// on (user_id, provider, provider_account_id), so two users could each hold a
+// row for the same provider account there, while this interface keeps one
+// binding per pair. A host store backed by SQL implements Save as an upsert on
+// (provider, provider_id) — a unique index on the pair, not on the triple.
 type LinkedAccountStore interface {
 	Save(ctx context.Context, link OAuthLinkedAccount) error
 	FindByProvider(ctx context.Context, provider, providerID string) (OAuthLinkedAccount, error)
@@ -774,21 +803,60 @@ func NewMemoryLinkedAccounts() *MemoryLinkedAccounts {
 func (m *MemoryLinkedAccounts) Save(_ context.Context, link OAuthLinkedAccount) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Collect whatever the new link supersedes, so the three indexes cannot
+	// disagree afterwards (see the LinkedAccountStore contract): the link that
+	// held this (provider, providerID) pair, and the previous version of this
+	// ID, which may have had a different pair or a different owner.
+	superseded := make(map[string]OAuthLinkedAccount, 2)
+	if held, ok := m.byPrv[link.Provider][link.ProviderID]; ok {
+		superseded[held.ID] = held
+	}
+	if old, ok := m.byID[link.ID]; ok {
+		superseded[old.ID] = old
+	}
+	owners := make(map[string]bool, 2)
+	for _, old := range superseded {
+		delete(m.byID, old.ID)
+		if prv := m.byPrv[old.Provider]; prv != nil {
+			delete(prv, old.ProviderID)
+			if len(prv) == 0 {
+				delete(m.byPrv, old.Provider)
+			}
+		}
+		owners[old.UserID] = true
+	}
+	// One pass over each affected owner's list. A superseded link held by the
+	// same user keeps its place — the first such entry becomes the new link, as
+	// the reference's in-memory store replaces in place — and every other
+	// superseded entry, in that list or anybody else's, is dropped.
+	replaced := false
+	for owner := range owners {
+		links := m.byUsr[owner]
+		out := make([]OAuthLinkedAccount, 0, len(links))
+		for _, l := range links {
+			if _, gone := superseded[l.ID]; !gone {
+				out = append(out, l)
+				continue
+			}
+			if owner == link.UserID && !replaced {
+				out = append(out, link)
+				replaced = true
+			}
+		}
+		if len(out) == 0 {
+			delete(m.byUsr, owner)
+		} else {
+			m.byUsr[owner] = out
+		}
+	}
 	m.byID[link.ID] = link
 	if m.byPrv[link.Provider] == nil {
 		m.byPrv[link.Provider] = make(map[string]OAuthLinkedAccount)
 	}
 	m.byPrv[link.Provider][link.ProviderID] = link
-	// Replace existing entry for the same ID to prevent duplicates.
-	links := m.byUsr[link.UserID]
-	for i, l := range links {
-		if l.ID == link.ID {
-			links[i] = link
-			m.byUsr[link.UserID] = links
-			return nil
-		}
+	if !replaced {
+		m.byUsr[link.UserID] = append(m.byUsr[link.UserID], link)
 	}
-	m.byUsr[link.UserID] = append(links, link)
 	return nil
 }
 

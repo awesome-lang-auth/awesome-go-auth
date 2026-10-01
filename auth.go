@@ -227,6 +227,22 @@ func WithRequire2FA(enabled bool) Option {
 	}
 }
 
+// WithIssueSessionOnRegister sets Config.IssueSessionOnRegister: whether a
+// successful POST <prefix>/register also logs the new account in, as a
+// successful POST <prefix>/login would.
+//
+//	auth.WithIssueSessionOnRegister(false) // the reference's answer: 201 {success, userId}, no session
+//
+// On by default for every 0.x release, which is how this port has always
+// behaved; the default becomes off at v1.0.0. The email-verification gate and
+// a required second factor win over it — see Config.IssueSessionOnRegister.
+func WithIssueSessionOnRegister(enabled bool) Option {
+	return func(b *authBuilder) error {
+		b.cfg.IssueSessionOnRegister = &enabled
+		return nil
+	}
+}
+
 // WithTwoFactorAppName sets Config.TwoFactorAppName: the issuer an
 // authenticator app shows for a TOTP enrolment made through POST
 // <prefix>/2fa/setup. It is the reference's `twoFactor.appName`.
@@ -613,10 +629,17 @@ func (a *Auth) Me(ctx context.Context, accessToken string) (User, error) {
 	return a.service.Me(ctx, accessToken)
 }
 
-// Authenticate delegates to Service.Authenticate: Me without the custom-claim
-// enrichment, which is what the adapters' Middleware calls.
+// Authenticate delegates to Service.Authenticate: the token verified and the
+// user read from the store, without the custom-claim enrichment.
 func (a *Auth) Authenticate(ctx context.Context, accessToken string) (User, error) {
 	return a.service.Authenticate(ctx, accessToken)
+}
+
+// VerifyAccess delegates to Service.VerifyAccess: the token verified and the
+// principal built from its claims, with no user-store read. It is what the
+// adapters' Middleware calls.
+func (a *Auth) VerifyAccess(ctx context.Context, accessToken string) (User, error) {
+	return a.service.VerifyAccess(ctx, accessToken)
 }
 
 // UpdateProfile delegates to Service.UpdateProfile.

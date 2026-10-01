@@ -134,8 +134,24 @@ var ErrMagicLinkOwnerMismatch = errors.New("auth: magic link belongs to another 
 // The link is consumed even on a mismatch, matching the reference, which burns
 // it in the strategy before the router compares ids
 // (magic-link.strategy.ts:50 versus auth.router.ts:1150-1152).
+//
+// It never marks the address verified: a second factor is not proof of address
+// ownership, and the reference's 2fa branch has no such call. It is
+// ConsumeMagicLink, the owner comparison, and CompleteMagicLinkLogin — the
+// general split, with the one predicate the routes need built in.
 func (s *Service) VerifyMagicLinkForUser(ctx context.Context, in MagicLinkVerifyInput, userID string) (User, AuthTokens, error) {
-	return s.verifyMagicLink(ctx, in, userID)
+	user, err := s.ConsumeMagicLink(ctx, in)
+	if err != nil {
+		return User{}, AuthTokens{}, err
+	}
+	if user.ID != userID {
+		return User{}, AuthTokens{}, ErrMagicLinkOwnerMismatch
+	}
+	tokens, err := s.CompleteMagicLinkLogin(ctx, user)
+	if err != nil {
+		return User{}, AuthTokens{}, err
+	}
+	return user, tokens, nil
 }
 
 // tokenTypeTemp marks the step-up token.
@@ -199,17 +215,31 @@ type TOTPSetup struct {
 	OTPAuthURL string `json:"otpauthUrl"`
 }
 
-// StartTOTPEnrolment mints an enrolment secret and its provisioning URI.
+// StartTOTPEnrolment mints an enrolment secret and its provisioning URI for a
+// user it reads from the store; a user the store does not have is
+// ErrInvalidCredentials.
 func (s *Service) StartTOTPEnrolment(ctx context.Context, userID, tenantID string) (TOTPSetup, error) {
 	user, err := s.users.GetUserByID(ctx, userID, tenantID)
 	if err != nil {
 		return TOTPSetup{}, ErrInvalidCredentials
 	}
+	return s.NewTOTPEnrolment(user.Email)
+}
+
+// NewTOTPEnrolment mints an enrolment secret and its provisioning URI for the
+// account named email, reading no store. It is what POST <prefix>/2fa/setup
+// calls with the address the access token carries: the reference's route labels
+// the URI with req.user.email, the verified payload, and never looks the user up
+// (awesome-node-auth v1.10.8 auth.router.ts:1369-1375). So a token whose user
+// has been deleted is answered 200 there, and here (#31). Nothing is stored:
+// the secret becomes the user's only when POST <prefix>/2fa/verify-setup
+// confirms a code against it.
+func (s *Service) NewTOTPEnrolment(email string) (TOTPSetup, error) {
 	secret, err := generateTOTPSecret()
 	if err != nil {
 		return TOTPSetup{}, err
 	}
-	return TOTPSetup{Secret: secret, OTPAuthURL: totpProvisioningURI(secret, user.Email, s.cfg.totpIssuer())}, nil
+	return TOTPSetup{Secret: secret, OTPAuthURL: totpProvisioningURI(secret, email, s.cfg.totpIssuer())}, nil
 }
 
 // totpProvisioningURI renders the otpauth:// URI an authenticator app scans:
@@ -471,6 +501,18 @@ func (a *Auth) VerifyMagicLinkForUser(ctx context.Context, in MagicLinkVerifyInp
 	return a.service.VerifyMagicLinkForUser(ctx, in, userID)
 }
 
+// ConsumeMagicLink delegates to Service.ConsumeMagicLink: verify and burn the
+// link, issue nothing, so the caller can refuse before a session exists.
+func (a *Auth) ConsumeMagicLink(ctx context.Context, in MagicLinkVerifyInput) (User, error) {
+	return a.service.ConsumeMagicLink(ctx, in)
+}
+
+// CompleteMagicLinkLogin delegates to Service.CompleteMagicLinkLogin: open the
+// session for a user ConsumeMagicLink returned, once the caller has decided to.
+func (a *Auth) CompleteMagicLinkLogin(ctx context.Context, user User) (AuthTokens, error) {
+	return a.service.CompleteMagicLinkLogin(ctx, user)
+}
+
 // SendSMSCode delegates to Service.SendSMSCode.
 func (a *Auth) SendSMSCode(ctx context.Context, in SMSCodeSendInput) (string, error) {
 	return a.service.SendSMSCode(ctx, in)
@@ -486,6 +528,13 @@ func (a *Auth) StartTOTPEnrolment(ctx context.Context, userID, tenantID string) 
 	return a.service.StartTOTPEnrolment(ctx, userID, tenantID)
 }
 
+// NewTOTPEnrolment delegates to Service.NewTOTPEnrolment. The adapters' POST
+// <prefix>/2fa/setup calls it with the email of the principal the auth
+// middleware verified.
+func (a *Auth) NewTOTPEnrolment(email string) (TOTPSetup, error) {
+	return a.service.NewTOTPEnrolment(email)
+}
+
 // VerifyTOTPSetup delegates to Service.VerifyTOTPSetup.
 func (a *Auth) VerifyTOTPSetup(ctx context.Context, userID, tenantID, secret, code string) error {
 	return a.service.VerifyTOTPSetup(ctx, userID, tenantID, secret, code)
@@ -499,4 +548,34 @@ func (a *Auth) VerifyTOTP(ctx context.Context, userID, tenantID, code string) (U
 // DisableTOTP delegates to Service.DisableTOTP.
 func (a *Auth) DisableTOTP(ctx context.Context, userID, tenantID string) error {
 	return a.service.DisableTOTP(ctx, userID, tenantID)
+}
+
+// TwoFactorDisableUserRefusal is the per-user term of POST <prefix>/2fa/disable,
+// the one the four adapters share: it re-reads the user the access token names
+// and reports the envelope to answer with, and true, when the disable must be
+// refused. It is the reference's `currentUser?.require2FA` check
+// (awesome-node-auth v1.10.8 auth.router.ts:1440-1445), run first, before the
+// system-wide term.
+//
+// It fails closed. A user who must keep the factor is 403 2FA_REQUIRED. A user
+// the store does not have — deleted, or no longer in the token's tenant — is
+// 404 "User not found", and any other read failure is the generic 500, logged.
+// The reference's optional chaining would fall through to the disable for a
+// missing user, but that fall-through was only ever reachable in this port
+// behind a gate that had just read the same row; since the gate reads no user
+// store (#31) it would hold for the whole lifetime of an access token, through
+// a store outage or a tenant move, and a failed read is not permission to drop
+// a second factor.
+func (a *Auth) TwoFactorDisableUserRefusal(ctx context.Context, userID, tenantID string) (HTTPError, bool) {
+	fresh, err := a.service.users.GetUserByID(ctx, userID, tenantID)
+	switch {
+	case errors.Is(err, ErrUserNotFound):
+		return HTTPErrUserNotFound, true
+	case err != nil:
+		a.service.logf("auth: 2fa/disable could not re-read user %q; the disable is refused with a generic 500: %v", userID, err)
+		return HTTPErrInternal, true
+	case fresh.Require2FA:
+		return HTTPErrTwoFactorRequiredForUser, true
+	}
+	return HTTPError{}, false
 }

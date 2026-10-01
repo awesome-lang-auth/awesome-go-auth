@@ -59,7 +59,34 @@ type Config struct {
 	EmailVerificationMode string
 	EmailChangeTTL        time.Duration
 	TempTokenTTL          time.Duration
-	Require2FA            bool
+	// IssueSessionOnRegister decides whether POST <prefix>/register — and
+	// Service.Register — also logs the new account in: when true, a successful
+	// registration opens a session exactly as a successful POST <prefix>/login
+	// does (the same cookies in cookie mode, the same accessToken and
+	// refreshToken body fields in bearer mode, the same session row, the same
+	// identity.auth.login.success event); when false, the registration answers
+	// 201 {"success":true,"userId":"…"} and nothing else, and the client logs
+	// in afterwards. It is the family's instance-admin option of that name
+	// (awesome-go-auth #21); the reference's own default is false.
+	//
+	// It is a pointer so that unset is not the same as off. Nil — what
+	// DefaultConfig leaves, and what a Config built by hand has unless it says
+	// otherwise — means the release default, which is on for every 0.x release,
+	// because this port always opened a session on registration and nothing may
+	// change for a deployment that does not touch it. The default flips to off
+	// at v1.0.0. A pointer to false is the reference's answer today, a pointer
+	// to true keeps the session past v1.0.0; WithIssueSessionOnRegister sets
+	// either.
+	//
+	// Even when true, no session is issued to an account POST <prefix>/login
+	// would not log straight in: an unverified address under
+	// EmailVerificationModeStrict (the verification gate wins; NewService logs
+	// once when both are configured), or an account a second factor is
+	// required of (Require2FA, for a new account). The registration then
+	// answers the plain 201 and the account logs in through the login's own
+	// gates.
+	IssueSessionOnRegister *bool
+	Require2FA             bool
 	// TwoFactorAppName is the issuer an authenticator app files a TOTP
 	// enrolment under: the `issuer` of the otpauth:// URI POST <prefix>/2fa/setup
 	// returns, and the prefix of its label. It is the reference's
@@ -257,4 +284,18 @@ func (c Config) validate() error {
 		return errors.New("auth: email and temp token ttl must be > 0")
 	}
 	return nil
+}
+
+// defaultIssueSessionOnRegister is what an unset Config.IssueSessionOnRegister
+// means in this release: on, for every 0.x release, as this port always
+// behaved. It becomes false at v1.0.0, the reference's default.
+const defaultIssueSessionOnRegister = true
+
+// issueSessionOnRegister resolves Config.IssueSessionOnRegister: the value it
+// points at, or the release default when it is nil.
+func (c Config) issueSessionOnRegister() bool {
+	if c.IssueSessionOnRegister == nil {
+		return defaultIssueSessionOnRegister
+	}
+	return *c.IssueSessionOnRegister
 }

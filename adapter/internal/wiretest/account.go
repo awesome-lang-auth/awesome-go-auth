@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -576,6 +577,23 @@ func testUpdateProfile(t *testing.T, mount Mounter) {
 		}
 	})
 
+	// The names are stored as sent (#35). The reference passes the parsed body
+	// to userStore.updateProfile untouched (awesome-node-auth v1.10.8
+	// auth.router.ts:1214-1215); the port used to trim both.
+	t.Run("names are stored as sent, whitespace included", func(t *testing.T) {
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+		login, csrf := loginSession(t, env, "spacedprofile@example.com")
+
+		req := Replay(env.Request(http.MethodPatch, "/profile", map[string]string{"firstName": "  Mario  ", "lastName": " Rossi"}), login)
+		req.Header.Set(auth.CSRFHeaderName, csrf)
+		AssertStatus(t, env.Do(req), http.StatusOK)
+
+		me := meBody(t, env, login)
+		if me["firstName"] != "  Mario  " || me["lastName"] != " Rossi" {
+			t.Fatalf("names = %q / %q, want %q / %q", me["firstName"], me["lastName"], "  Mario  ", " Rossi")
+		}
+	})
+
 	// The reference runs behind express.json(), which leaves req.body = {} for a
 	// request with no body; §3.5 then reads two optional fields off it, so a
 	// bodyless PATCH is a 200 no-op. The four adapters used to disagree here —
@@ -674,6 +692,28 @@ func testAddPhone(t *testing.T, mount Mounter) {
 		}
 	})
 
+	// Stored as sent (#35): the reference passes the body value to
+	// userStore.updatePhoneNumber untouched (awesome-node-auth v1.10.8
+	// auth.router.ts:1229-1234). A number of only whitespace is a stored value
+	// there, not a clear — null is the clear — so it is one here too.
+	for _, number := range []string{" +39 012 345 ", " "} {
+		t.Run("stored as sent: "+strconv.Quote(number), func(t *testing.T) {
+			env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+			_, tokens := env.Seed("spacedphone@example.com")
+
+			req := env.Request(http.MethodPost, "/add-phone", map[string]string{"phoneNumber": number})
+			req.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+			rec := env.Do(req)
+			AssertStatus(t, rec, http.StatusOK)
+			AssertKeys(t, Body(t, rec), "success")
+
+			me := env.Do(bearerRequest(http.MethodGet, env.Config.Prefix()+"/me", tokens.AccessToken))
+			if got := Body(t, me)["phoneNumber"]; got != number {
+				t.Fatalf("phoneNumber = %q, want %q stored as sent", got, number)
+			}
+		})
+	}
+
 	t.Run("cookie mode without X-CSRF-Token", func(t *testing.T) {
 		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
 		login, _ := loginSession(t, env, "phonecsrf@example.com")
@@ -756,9 +796,11 @@ func testDeleteAccount(t *testing.T, mount Mounter) {
 			AssertCleared(t, rec, name)
 		}
 
-		// The user record is gone, so the access token no longer resolves.
+		// The user record is gone. The access token still verifies — the gate
+		// reads no user store, as the reference's does — and /me's own lookup
+		// misses: the reference's 404 (auth.router.ts:1182-1185 at v1.10.8, #31).
 		me := env.Do(Replay(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+"/me", nil), login))
-		AssertError(t, me, http.StatusForbidden, "Invalid or expired access token", "")
+		AssertError(t, me, http.StatusNotFound, "User not found", "")
 
 		// And the session was revoked before the record was deleted, so the
 		// refresh credential reports the family's fast-logout code.
@@ -800,7 +842,7 @@ func testDeleteAccount(t *testing.T, mount Mounter) {
 		}
 
 		me := env.Do(bearerRequest(http.MethodGet, env.Config.Prefix()+"/me", tokens.AccessToken))
-		AssertError(t, me, http.StatusForbidden, "Invalid or expired access token", "")
+		AssertError(t, me, http.StatusNotFound, "User not found", "")
 	})
 
 	// No credential at all: the reference's authMiddleware answers

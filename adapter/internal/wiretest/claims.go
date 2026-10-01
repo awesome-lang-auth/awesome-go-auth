@@ -86,7 +86,7 @@ func RunProtectedRouteSkipsClaimsHook(t *testing.T, mount Mounter, protect Prote
 		t.Fatalf("the route saw email %v, want the token's user (body %s)", body["email"], rec.Body.String())
 	}
 	if body["customClaims"] != nil {
-		t.Errorf("the middleware handed the route customClaims %v; Authenticate leaves them nil", body["customClaims"])
+		t.Errorf("the middleware handed the route customClaims %v; VerifyAccess leaves them nil", body["customClaims"])
 	}
 	if got := counter.Calls(); got != 0 {
 		t.Fatalf("the middleware ran Config.BuildTokenClaims %d times on a host route, want 0", got)

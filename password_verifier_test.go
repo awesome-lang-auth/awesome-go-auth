@@ -621,3 +621,80 @@ func TestPasswordVerifierFailuresReachTheLogger(t *testing.T) {
 		t.Fatalf("the password reached the log: %q", joined)
 	}
 }
+
+// legacyVerifier accepts exactly one password for an account marked as held by
+// the old system, and says no to everything else — the marker-gated shape the
+// PasswordVerifier doc asks for. Here the marker is the address.
+func legacyVerifier(marked, password string, migrated bool) PasswordVerifier {
+	return func(_ context.Context, user User, candidate string) (bool, bool, error) {
+		if user.Email != marked {
+			return false, false, nil
+		}
+		return candidate == password, migrated, nil
+	}
+}
+
+// TestChangePasswordConsultsTheVerifierLikeTheLogin pins review finding 1 on
+// #30: an account whose password lives behind Config.PasswordVerifier — no
+// local hash, or a hash that is only a migration marker — is not passwordless.
+// It must present its current password and pass it through the verifier,
+// exactly as POST /login does for it; a token alone does not replace it.
+func TestChangePasswordConsultsTheVerifierLikeTheLogin(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		migrated bool
+		hash     string // what the row holds for the legacy account
+	}{
+		{"no local hash, verifier keeps the credential", false, ""},
+		{"no local hash, verifier migrates", true, ""},
+		{"a marker hash that is not bcrypt", false, "legacy:marker"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryUserStore()
+			svc := newVerifierSvcWithStore(t, legacyVerifier("legacy@example.com", "old-secret", tc.migrated), store)
+			user := seedUser(t, svc, "legacy@example.com")
+			if tc.hash != "" {
+				if err := store.UpdatePassword(ctx, user.ID, user.TenantID, tc.hash); err != nil {
+					t.Fatalf("seed marker: %v", err)
+				}
+			}
+
+			for _, current := range []string{"", "not-the-old-one"} {
+				err := svc.ChangePassword(ctx, ChangePasswordInput{UserID: user.ID, TenantID: "t1", CurrentPassword: current, NewPassword: "attacker1"})
+				if !errors.Is(err, ErrInvalidCredentials) {
+					t.Fatalf("currentPassword %q: %v, want ErrInvalidCredentials", current, err)
+				}
+			}
+			if _, _, err := svc.Login(ctx, LoginInput{Email: "legacy@example.com", Password: "attacker1", TenantID: "t1"}); err == nil {
+				t.Fatal("a refused change still set the password")
+			}
+
+			if err := svc.ChangePassword(ctx, ChangePasswordInput{UserID: user.ID, TenantID: "t1", CurrentPassword: "old-secret", NewPassword: "newpassword1"}); err != nil {
+				t.Fatalf("change with the verifier-held password: %v", err)
+			}
+			if _, _, err := svc.Login(ctx, LoginInput{Email: "legacy@example.com", Password: "newpassword1", TenantID: "t1"}); err != nil {
+				t.Fatalf("login with the new password: %v", err)
+			}
+		})
+	}
+}
+
+// With a verifier configured, an account without a hash that the verifier does
+// not hold either cannot be told apart from one it does, so it is refused
+// rather than trusted: the fail-closed side of the same rule. With no verifier
+// the reference's passwordless path applies unchanged.
+func TestChangePasswordWithoutAHashOnlyPasswordlessWithoutAVerifier(t *testing.T) {
+	ctx := context.Background()
+	withVerifier := newVerifierSvc(t, legacyVerifier("someone-else@example.com", "x", false))
+	oauthOnly := seedUser(t, withVerifier, "oauth@example.com")
+	if err := withVerifier.ChangePassword(ctx, ChangePasswordInput{UserID: oauthOnly.ID, TenantID: "t1", NewPassword: "initialpw1"}); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("with a verifier configured: %v, want ErrInvalidCredentials", err)
+	}
+
+	without := newVerifierSvc(t, nil)
+	plain := seedUser(t, without, "oauth@example.com")
+	if err := without.ChangePassword(ctx, ChangePasswordInput{UserID: plain.ID, TenantID: "t1", NewPassword: "initialpw1"}); err != nil {
+		t.Fatalf("without a verifier: %v, want the first password set", err)
+	}
+}

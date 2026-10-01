@@ -7,6 +7,215 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Verify a magic link without opening a session (#32):
+  `Service.ConsumeMagicLink` and `Service.CompleteMagicLinkLogin`**, with
+  `Auth` delegates. `ConsumeMagicLink` verifies the link, burns it and answers
+  its owner — no session, no token, no event, no change to the email-verified
+  flag — so a caller can refuse on a predicate of its own (tenant membership, a
+  device binding, a risk score) before anything is in the store.
+  `CompleteMagicLinkLogin` then opens the session and raises
+  `identity.auth.login.success` with `method: "magic-link"`. This is the
+  reference's order: the strategy verifies and clears the link, and the router
+  decides before it reaches `issueTokens` (`magic-link.strategy.ts:36-52`,
+  `auth.router.ts:1741-1747` at v1.10.8). `VerifyMagicLink` and
+  `VerifyMagicLinkForUser` are now built on the two and answer exactly as
+  before, on every route. The email-verified side effect lives in
+  `VerifyMagicLink`, the login wrapper, and is no longer inferred from whether
+  an owner id was passed, which also settles #33.
+- **Registration may open a session, chosen by the instance admin (#21):
+  `Config.IssueSessionOnRegister` and `WithIssueSessionOnRegister(bool)`.**
+  The family option of the same name (the family spec "register may open a
+  session"). On, a successful `POST <prefix>/register` delivers a session
+  exactly as a successful `POST /login` does — the access and refresh cookies
+  in cookie mode, `accessToken` and `refreshToken` in the body in bearer mode,
+  a session row, and `identity.auth.login.success` raised after
+  `identity.user.created`; off, it answers the reference's
+  `201 {"success":true,"userId":"…"}` and nothing else. The field is a
+  `*bool`, so that unset is not the same as off: unset — what `DefaultConfig`
+  leaves, and what a hand-built `Config` has unless it says otherwise — means
+  **on** for every 0.x release, which is how the port always behaved, so no
+  deployment that does not touch it sees a change. The compatibility note
+  `register-issues-a-session` now describes the option and its default.
+
+  Even with the option on, the login's gates now win, and this changes what a
+  deployment that uses them sees: under `EmailVerificationModeStrict` the new,
+  unverified account gets the plain `201` and no session — registration used
+  to hand out exactly the access token `POST /login` refuses with
+  `403 EMAIL_NOT_VERIFIED` — and under `Require2FA` the registration no longer
+  skips the second factor either. The service logs once at startup when the
+  option and strict are configured together. A refused registration never
+  issues anything. `identity.auth.login.success` is new on the registration
+  path, and `identity.user.created` is now raised before the session is
+  opened, not after. Adapters write the answer through the new
+  `HTTPConfig.WriteRegistration`.
+
+  **Planned for v1.0.0:** the unset default flips to off, the reference's. A
+  deployment that wants registration to log people in will have to say
+  `WithIssueSessionOnRegister(true)`.
+
+### Changed
+- **`Service.ChangePassword` lets an account with no password set one (#30).**
+  An OAuth-only or magic-link-only account used to get
+  `ErrInvalidCredentials` from the service whatever it sent, because the
+  current password was compared unconditionally. The service now follows the
+  reference's `/change-password` (`auth.router.ts:1465-1500` at v1.10.8): the
+  comparison runs only when the account has a password, and an account
+  without one sets its first password with `NewPassword` alone. An account
+  that has a password keeps the check, and an absent current password is
+  refused like a wrong one. `(*Auth).ChangePassword`, which used to carry the
+  passwordless half for the HTTP route only, is now a plain delegate, and the
+  passwordless path now raises `identity.user.password.changed` as the
+  reference does.
+
+  **Security consequence, the reference's own:** whoever holds a valid access
+  token of a passwordless account can now give that account a password
+  through the service, as they already could through the HTTP route. An
+  embedder that calls `Service.ChangePassword` directly and wants a stronger
+  proof for that case has to ask for it before the call.
+
+  "Has a password" is what `POST /login` would check, so an account whose
+  credential lives behind `Config.PasswordVerifier` is not passwordless: a
+  current password that does not verify against the stored hash is passed to
+  the verifier, as the login passes it (migration included), and with a
+  verifier configured an account with no stored hash at all must present its
+  current password and pass it there too — its credential may be a row not
+  migrated yet, or one the verifier keeps owning. Only an account with no hash
+  on a deployment with no verifier sets its first password without one; on a
+  deployment with a verifier such an account uses `POST /forgot-password`.
+  `UserStore.GetUserByID` must return `PasswordHash` for this decision, and its
+  contract now says so.
+
+  The route also takes the reference's v1.10.8 order: an absent `newPassword`
+  is `400 {"error":"New password is required"}` for every account, before the
+  current password is looked at (the service returns the new
+  `ErrNewPasswordRequired`). An account with a password used to get the
+  port-only `400 WEAK_PASSWORD` there. The port's password policy now runs
+  last, so a wrong current password is `401` even when the new one is too
+  short.
+
+- **BREAKING (behaviour) — the auth gate trusts the access token and reads no
+  user store (#31).**
+  Every adapter's `Middleware()` used to resolve the user through the store,
+  so a valid, unexpired access token whose user had been deleted got
+  `403 "Invalid or expired access token"` on every protected route. It now
+  calls the new `Service.VerifyAccess` (and `Auth.VerifyAccess`), which
+  verifies the token, keeps the `SessionCheckOn=allcalls` check — a revoked
+  session is still `401 SESSION_REVOKED` — and builds the user from the
+  verified claims, as the reference's `createAuthMiddleware` does
+  (`auth.middleware.ts:44-61` at v1.10.8). Each handler answers for a missing
+  user itself: `GET /me`, `/change-password`, `/send-verification-email` and
+  `/change-email/request` answer the reference's
+  `404 {"error":"User not found"}` (`auth.router.ts:1182-1185`, `:1471-1474`,
+  `:1519-1521`, `:1591-1594`), and `/2fa/setup` answers `200`, labelling the
+  enrolment with the address the token carries (the new
+  `Service.NewTOTPEnrolment`), as the reference reads `req.user.email`.
+  Only a missing row is the 404: `UserStore.GetUserByID` now reports one with
+  `ErrUserNotFound` (`MemoryUserStore` does), and any other store failure on
+  those routes is the reference's generic `500`, as its throwing `findById` is
+  — a host store that reports a missing row with an error of its own gets the
+  `500` until it returns `ErrUserNotFound`. Routes whose handler writes the
+  user store without looking the user up first answer what the store answers;
+  with `MemoryUserStore`, which refuses a write to a missing row, that is the
+  detail-free `500 {"error":"Internal server error"}` on `PATCH /profile`,
+  `POST /add-phone`, `POST /2fa/verify-setup` and `DELETE /account`, with no
+  event raised. `POST /2fa/disable` re-reads the user and fails closed: a
+  missing user (deleted, or no longer in the token's tenant) is `404`, any
+  other read failure `500`, never a fall-through to the disable (the new
+  `Auth.TwoFactorDisableUserRefusal`, which the four adapters share).
+
+  What this breaks for host code behind `Middleware()`. The user a handler
+  reads with `UserFromContext` is now the token's principal, not the stored
+  row:
+  - built from the token: `ID`, `TenantID`, `Email`, `Role`, `LoginProvider`,
+    `IsEmailVerified`, `IsTOTPEnabled` — each **as of the token's mint**, so a
+    role demotion, a verified address or a tenant move shows on host routes
+    only after the next refresh, at most `AccessTokenTTL` later; a
+    `BuildTokenClaims` hook that overrides `role` or `email` now decides them
+    in context, and a non-string `role` claim reads as `""`;
+  - from the optional stores, as before: `Metadata`, `Roles`, `Permissions`,
+    `Tenants`;
+  - zero, always: `IsAdmin` (so a `user.IsAdmin` check now always answers
+    false), `Require2FA`, `TOTPSecret`, `PasswordHash` (so a
+    `PasswordHash == ""` test now answers "passwordless" for everyone),
+    `FirstName`, `LastName`, `PhoneNumber`, `CreatedAt` and the other
+    stored-row fields.
+
+  Host code that authorises on any of those must read the store itself, or
+  call `Auth.Authenticate` (which still loads the stored row); admin checks
+  belong behind the admin guard, which does its own store read. `Service.Me`
+  returns the new `ErrUserNotFound` for a deleted user, where it returned
+  `ErrInvalidToken`. And deleting a user no longer locks out the access tokens
+  already issued to them: they keep passing the gate until they expire, unless
+  `SessionCheckOn` is `allcalls` and the session was revoked, which
+  `DeleteAccount` does first. That is the reference's posture.
+  `Service.Authenticate` is unchanged and still reads the store, for the IdP's
+  `userinfo`, `/link-request`, and any host that wants deletion to take effect
+  at once on its own routes.
+
+  `ErrUserNotFound` matches `ErrInvalidCredentials` under `errors.Is`, which
+  `ChangePassword`, `SendVerificationEmailToken` and `RequestEmailChange`
+  returned for a missing user before, so a caller testing for it still
+  matches there.
+  `/change-email/request` now checks `PASSWORD_REQUIRED` against the stored
+  row inside `Auth.RequestEmailChange` (the new `ErrPasswordRequired`), after
+  the `409` and the `404` as in the reference, where it used to run first; an
+  address in use is therefore `409` even for an account with no password.
+  `Service.RequestEmailChange` itself does not make that check, as before.
+
+### Deprecated
+- **`ChangeEmailInlineError` (#31).** `Auth.RequestEmailChange` makes the
+  check itself now, against the stored row and in the reference's order; the
+  user in context carries no password hash, so the helper would refuse every
+  account. The adapters no longer call it.
+- **`ChangePasswordInlineError` (#30).** `Service.ChangePassword` makes the
+  check itself now, for every account and in the reference's order, and the
+  adapters no longer call it.
+
+### Fixed
+- **An empty request body is no longer `400 INVALID_BODY` on `/register`,
+  `/login`, `/link-request` and `/link-verify` (#34).** The reference reads
+  `req.body ?? {}` on every route since v1.10.5, so a bodyless request reaches
+  each route's own per-field check. The port now does the same on all four
+  adapters: `/register` answers `400 INVALID_INPUT`, `/link-request`
+  `400 EMAIL_REQUIRED`, `/link-verify` `400 TOKEN_REQUIRED`. The adapters used
+  to disagree, since echo's binder tolerated a zero-length body and the other
+  three did not. Every body-reading auth route now decodes through the one
+  shared `auth.DecodeOptionalJSON`, and the per-adapter step-up helpers are
+  gone. Malformed JSON is still `400 INVALID_BODY` everywhere.
+
+  `/login` also gains the reference's presence check. A body with no email or
+  no password, an empty body included, now answers
+  `400 {"error":"Email and password are required"}` with no code, where it
+  used to answer `401 INVALID_CREDENTIALS` (`auth.router.ts:996-1000` at
+  v1.10.8). The check runs in the route before the service, so it raises no
+  `identity.auth.login.failed` event, as in the reference. `Service.Login`
+  itself is unchanged.
+- **`MemoryLinkedAccounts.Save` no longer leaves a stale link behind when it
+  re-points a binding (#37).** Saving a `(provider, providerID)` pair that
+  another user held, under a new id, overwrote the pair's lookup but left the
+  old owner's `ListForUser` entry in place, where no id could reach or delete
+  it. `Save` is now an upsert on the pair: whatever it supersedes — the link
+  that held the pair, or the previous version of the same id — is gone from
+  `FindByProvider`, `ListForUser` and `Delete` alike. It still does not refuse
+  the re-point, because the reference's `linkAccount` is an idempotent upsert
+  that raises no conflict of its own (`linked-accounts-store.interface.ts:58-63`
+  at v1.10.8). The contract is now written on `LinkedAccountStore`, so a host
+  store knows it keys on the pair.
+- **Profile names and the phone number are stored as sent (#35).**
+  `Service.UpdateProfile` trimmed `firstName` and `lastName`, and
+  `Service.UpdatePhoneNumber` trimmed the number, so `PATCH /profile` and
+  `POST /add-phone` stored something other than what the client sent. The
+  reference passes both to its store untouched (`auth.router.ts:1214-1215` and
+  `:1229-1234` at v1.10.8), and now so does the port. One consequence is
+  visible: a phone number of only whitespace used to be trimmed to the empty
+  string and so cleared the number; it is now stored as sent, as in the
+  reference, where only `null` clears. A store that wants normalised values
+  normalises them itself. `POST /sms/send` and the login challenge's
+  `available2faMethods` now test the stored number untrimmed too, as the
+  reference does (`auth.router.ts:1830`, `:1015`) and as `Service.SendSMSCode`
+  already did, so a number of only spaces is a number there as well.
+
 ## [0.12.0] - 2026-09-30
 
 The admin user detail across tenants, and the deprecation of the one exported

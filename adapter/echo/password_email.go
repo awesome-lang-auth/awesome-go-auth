@@ -91,10 +91,6 @@ func (ad *Adapter) changePassword(c echo.Context) error {
 	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
-	if httpErr, invalid := auth.ChangePasswordInlineError(user, req.CurrentPassword, req.NewPassword); invalid {
-		auth.WriteHTTPError(c.Response(), httpErr)
-		return nil
-	}
 	in := auth.ChangePasswordInput{
 		UserID:          user.ID,
 		TenantID:        user.TenantID,
@@ -169,10 +165,6 @@ func (ad *Adapter) changeEmailRequest(c echo.Context) error {
 		EmailLang string `json:"emailLang"`
 	}
 	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
-		return nil
-	}
-	if httpErr, refused := auth.ChangeEmailInlineError(user); refused {
-		auth.WriteHTTPError(c.Response(), httpErr)
 		return nil
 	}
 	in := auth.ChangeEmailRequestInput{

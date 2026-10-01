@@ -1,8 +1,6 @@
 package gin
 
 import (
-	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -18,22 +16,11 @@ import (
 // handlers drop it: putting it in the response body would turn a second factor
 // into no factor at all. The service delivers it through the senders on Config
 // (see delivery.go); the send routes owe that seam only the /sms/send precheck.
-
-// bindStepUpJSON binds a request body and treats an absent one as a body with
-// every field omitted — the reference's behaviour, where express.json() leaves
-// req.body as {} and each route answers for the field it was missing rather
-// than for the body. Malformed JSON is still 400 INVALID_BODY.
 //
-// The four adapters have to agree on this: echo's binder already returns nil for
-// a zero-length body, so before this helper an empty body was tolerated on echo
-// and refused on the other three.
-func bindStepUpJSON(c *gin.Context, dst any) bool {
-	if err := c.ShouldBindJSON(dst); err != nil && !errors.Is(err, io.EOF) {
-		auth.WriteHTTPError(c.Writer, auth.HTTPErrInvalidBody)
-		return false
-	}
-	return true
-}
+// Bodies are decoded with auth.DecodeOptionalJSON, the decoder every body-reading
+// route of the four adapters shares: an absent body is a body with every field
+// omitted, as express.json() leaves req.body as {}, and malformed JSON is 400
+// INVALID_BODY.
 
 func (ad *Adapter) magicLinkSend(c *gin.Context) {
 	var req struct {
@@ -43,7 +30,7 @@ func (ad *Adapter) magicLinkSend(c *gin.Context) {
 		TenantID  string `json:"tenantId"`
 		EmailLang string `json:"emailLang"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
 	email, tenantID := req.Email, req.TenantID
@@ -86,7 +73,7 @@ func (ad *Adapter) magicLinkVerify(c *gin.Context) {
 		Mode      string `json:"mode"`
 		TempToken string `json:"tempToken"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
 	in := auth.MagicLinkVerifyInput{Token: req.Token}
@@ -127,7 +114,7 @@ func (ad *Adapter) smsSend(c *gin.Context) {
 		TempToken string `json:"tempToken"`
 		TenantID  string `json:"tenantId"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
 	userID, tenantID := strings.TrimSpace(req.UserID), req.TenantID
@@ -158,7 +145,7 @@ func (ad *Adapter) smsSend(c *gin.Context) {
 		auth.WriteHTTPError(c.Writer, auth.HTTPErrUserNotFound)
 		return
 	}
-	if strings.TrimSpace(user.PhoneNumber) == "" {
+	if user.PhoneNumber == "" {
 		auth.WriteHTTPError(c.Writer, auth.HTTPErrPhoneNotSet)
 		return
 	}
@@ -177,7 +164,7 @@ func (ad *Adapter) smsVerify(c *gin.Context) {
 		TempToken string `json:"tempToken"`
 		TenantID  string `json:"tenantId"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
 	userID, tenantID := strings.TrimSpace(req.UserID), req.TenantID
@@ -206,7 +193,7 @@ func (ad *Adapter) twoFactorSetup(c *gin.Context) {
 		auth.WriteHTTPError(c.Writer, auth.HTTPErrNoAccessToken)
 		return
 	}
-	setup, err := ad.auth.StartTOTPEnrolment(c.Request.Context(), user.ID, user.TenantID)
+	setup, err := ad.auth.NewTOTPEnrolment(user.Email)
 	if err != nil {
 		auth.WriteServiceError(c.Writer, err)
 		return
@@ -226,7 +213,7 @@ func (ad *Adapter) twoFactorVerifySetup(c *gin.Context) {
 		Token  string `json:"token"`
 		Secret string `json:"secret"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
 	if err := ad.auth.VerifyTOTPSetup(c.Request.Context(), user.ID, user.TenantID, req.Secret, req.Token); err != nil {
@@ -241,7 +228,7 @@ func (ad *Adapter) twoFactorVerify(c *gin.Context) {
 		TempToken string `json:"tempToken"`
 		TOTPCode  string `json:"totpCode"`
 	}
-	if !bindStepUpJSON(c, &req) {
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
 		return
 	}
 	// Both arguments are the same envelope: this route has no missing-tempToken
@@ -267,14 +254,10 @@ func (ad *Adapter) twoFactorDisable(c *gin.Context) {
 		return
 	}
 	// Re-read the user rather than trust the access token: a require2FA flag set
-	// after the token was issued still has to be honoured. A failed re-read falls
-	// through rather than 404ing, matching the reference's optional chaining
-	// (`currentUser?.require2FA`, auth.router.ts:884-885). That makes this term
-	// fail OPEN where the settings term below fails closed — the asymmetry, and
-	// why it stands, is written out in adapter/nethttp/passwordless.go.
-	fresh, err := ad.auth.FindUser(c.Request.Context(), user.ID, "", user.TenantID)
-	if err == nil && fresh.Require2FA {
-		auth.WriteHTTPError(c.Writer, auth.HTTPErrTwoFactorRequiredForUser)
+	// after the token was issued still has to be honoured. Fails closed; see
+	// auth.Auth.TwoFactorDisableUserRefusal.
+	if herr, refused := ad.auth.TwoFactorDisableUserRefusal(c.Request.Context(), user.ID, user.TenantID); refused {
+		auth.WriteHTTPError(c.Writer, herr)
 		return
 	}
 	// The system-wide term is second, as in the reference (per-user at :884-888,
