@@ -240,9 +240,10 @@ type OAuthWiring struct {
 	// declarative stand-in for the abstract findOrCreateUser the reference makes
 	// every integrator write (generic-oauth.strategy.ts:169-172). It is a
 	// pointer so that nil means DefaultOAuthProvisioning: a deployment that
-	// leaves it unset keeps exactly the behaviour it had before the policy
-	// existed (create missing accounts, link a matching address), and one that
-	// sets it is taken at its word, AutoCreate false included. WithOAuth
+	// leaves it unset creates missing accounts and answers an address another
+	// account already holds with the reference's account conflict, never a
+	// link (it linked through 0.12.0, issue #36), and one that sets it is taken
+	// at its word, AutoCreate false included. WithOAuth
 	// validates it, so an unknown OnEmailMatch or a FieldMap that does not
 	// compile fails at construction.
 	Provisioning *OAuthProvisioning
@@ -478,6 +479,19 @@ func resolveOAuthRedirect(state oauthState, allowed []string, siteURL string) st
 	return fromState + cleanPath
 }
 
+// resolveOAuthConflictOrigin is the reference's conflictOrigin: the state's
+// origin when the allowlist admits it (an empty allowlist admits any), the
+// default site URL otherwise — and, unlike resolveOAuthRedirect, never the
+// state's return path (auth.router.ts:1992-1995 at 1.10.8, repeated
+// at :2072-2075 and :2154-2157). The conflict page lives under the API prefix
+// on the site's root, wherever the login was meant to land afterwards.
+func resolveOAuthConflictOrigin(state oauthState, allowed []string, siteURL string) string {
+	if originAllowed(state.O, allowed) {
+		return state.O
+	}
+	return siteURL
+}
+
 // originAllowed mirrors the reference: an empty allowlist allows everything, and
 // a non-empty one is an exact `allowedOrigins.includes(origin)` — no trailing
 // slash normalisation, no case folding.
@@ -592,9 +606,19 @@ type OAuthCompleteInput struct {
 
 // OAuthCompleteResult carries the issued session and where to send the browser.
 type OAuthCompleteResult struct {
-	User       User
-	Tokens     AuthTokens
+	User   User
+	Tokens AuthTokens
+	// RedirectTo is where a successful callback sends the browser: the
+	// reference's resolveOAuthRedirect, the state's origin with its return path
+	// appended (auth.router.ts:671 at 1.10.8).
 	RedirectTo string
+	// ConflictOrigin is the site URL an account conflict's redirect is built on
+	// (AccountConflictLink). It is not RedirectTo: the reference's conflict
+	// branch takes the state's bare origin when the allowlist admits it and the
+	// default site URL otherwise, and never appends the return path
+	// (auth.router.ts:1992-1995, :2072-2075, :2154-2157 at 1.10.8).
+	// It is set on every result whose state verified, conflict or not.
+	ConflictOrigin string
 }
 
 // OAuthComplete verifies the state, exchanges the code with the PKCE verifier
@@ -633,9 +657,10 @@ func (a *Auth) OAuthComplete(ctx context.Context, in OAuthCompleteInput) (OAuthC
 	}
 
 	redirectTo := resolveOAuthRedirect(state, a.allowedOrigins(), a.defaultSiteURL())
+	conflictOrigin := resolveOAuthConflictOrigin(state, a.allowedOrigins(), a.defaultSiteURL())
 	info, err := wiring.Service.ExchangeCodePKCE(ctx, in.Provider, in.Code, pkceVerifier(secret, state.N))
 	if err != nil {
-		return OAuthCompleteResult{RedirectTo: redirectTo}, err
+		return OAuthCompleteResult{RedirectTo: redirectTo, ConflictOrigin: conflictOrigin}, err
 	}
 	// linkToUserID is deliberately empty: the callback resolves the identity
 	// through the provider account, exactly as the reference does. Nothing on the
@@ -650,7 +675,7 @@ func (a *Auth) OAuthComplete(ctx context.Context, in OAuthCompleteInput) (OAuthC
 		// sequence in both trees.
 		a.publishOAuthConflict(ctx, in.Provider, err)
 		a.stashAccountConflict(ctx, wiring, in.Provider, meta.TenantID, err)
-		return OAuthCompleteResult{RedirectTo: redirectTo}, err
+		return OAuthCompleteResult{RedirectTo: redirectTo, ConflictOrigin: conflictOrigin}, err
 	}
 	// node-auth auth.router.ts:1444, the publish at the end of handleOAuthLogin
 	// — one site there serving three callback routes, and one here serving every
@@ -680,7 +705,7 @@ func (a *Auth) OAuthComplete(ctx context.Context, in OAuthCompleteInput) (OAuthC
 			Data:      map[string]any{"provider": provider, "redirectTo": redirectTo},
 		}
 	})
-	return OAuthCompleteResult{User: user, Tokens: tokens, RedirectTo: redirectTo}, nil
+	return OAuthCompleteResult{User: user, Tokens: tokens, RedirectTo: redirectTo, ConflictOrigin: conflictOrigin}, nil
 }
 
 // publishOAuthConflict raises identity.auth.oauth.conflict for a callback that
@@ -701,6 +726,12 @@ func (a *Auth) OAuthComplete(ctx context.Context, in OAuthCompleteInput) (OAuthC
 // populates both whenever it is constructed at all (oauth.go:683), so they are
 // written unconditionally rather than omitted when empty.
 //
+// The address is cut to 320 UTF-16 code units, as the reference's
+// oauthConflictEventData does through eventEmail (router-events.ts:13, :46-48,
+// :54-67 at 1.10.8). It comes from the provider rather than from a request
+// body, so the cap is reached only by a provider asserting a pathological
+// address, but the payload is the reference's whatever the address.
+//
 // A non-conflict failure publishes nothing. The dev line's catch tests the
 // error code before it publishes, so a provider that returned a 500, a state
 // that did not verify and a refusal from the provisioning policy all pass
@@ -715,7 +746,7 @@ func (a *Auth) publishOAuthConflict(ctx context.Context, provider string, err er
 			Name: EventAuthOAuthConflict,
 			Data: map[string]any{
 				"provider":          provider,
-				"email":             conflict.Email,
+				"email":             eventEmail(conflict.Email),
 				"providerAccountId": conflict.ProviderAccountID,
 			},
 		}
@@ -760,21 +791,21 @@ func (a *Auth) stashAccountConflict(ctx context.Context, wiring *OAuthWiring, pr
 }
 
 // AccountConflictLink is the Location the callback answers an account conflict
-// with: the reference's buildUiLink(siteUrl, "/account-conflict?…")
-// (auth.router.ts:261-271, :1352-1354). siteURL is the origin the state
-// resolved to — OAuthCompleteResult.RedirectTo, which is the same
-// resolveOAuthRedirect value the reference passes — and the query is its
-// literal one, provider first, then code, then the address when there is one.
+// with: the reference's buildUiLink(conflictOrigin, "/account-conflict?…")
+// (auth.router.ts:365-375, :2000-2002 at 1.10.8). siteURL is
+// OAuthCompleteResult.ConflictOrigin — the state's bare origin or the default
+// site URL, never the return path the success redirect appends — and the query
+// is the reference's literal one, provider first, then code, then the address
+// when there is one.
 //
-// The escaping is Go's url.QueryEscape where the reference calls
-// encodeURIComponent. The two agree on every character an address or a provider
-// name can hold in practice; they differ on a space (+ against %20) and on
-// !~*'(), which QueryEscape percent-encodes and encodeURIComponent leaves
-// alone. Both forms decode to the same string.
+// Both values are escaped as JavaScript's encodeURIComponent escapes them
+// (escapeURIComponent), so the Location is the reference's byte for byte: an
+// apostrophe, which an address's local part may hold, stays bare, and a space
+// is %20 rather than url.QueryEscape's +.
 func (c HTTPConfig) AccountConflictLink(siteURL, provider, email string) string {
-	path := "/account-conflict?provider=" + url.QueryEscape(provider) + "&code=" + CodeOAuthAccountConflict
+	path := "/account-conflict?provider=" + escapeURIComponent(provider) + "&code=" + CodeOAuthAccountConflict
 	if email != "" {
-		path += "&email=" + url.QueryEscape(email)
+		path += "&email=" + escapeURIComponent(email)
 	}
 	return c.UILink(siteURL, path)
 }
@@ -1108,4 +1139,29 @@ func (m *MemoryPendingLinks) Delete(_ context.Context, key string) error {
 	defer m.mu.Unlock()
 	delete(m.entries, key)
 	return nil
+}
+
+// maxEventEmailLength is the reference's MAX_EVENT_EMAIL_LENGTH
+// (router-events.ts:13 at 1.10.8), counted as JavaScript counts a string's
+// length: in UTF-16 code units.
+const maxEventEmailLength = 320
+
+// eventEmail is the reference's eventEmail for a string: the value cut to
+// maxEventEmailLength UTF-16 code units (router-events.ts:46-48). Where the
+// cut would fall inside a surrogate pair, JavaScript's slice keeps the lone
+// high surrogate, which no Go string can hold; this cuts before the pair
+// instead, one code unit shorter.
+func eventEmail(email string) string {
+	units := 0
+	for i, r := range email {
+		n := 1
+		if r > 0xFFFF {
+			n = 2 // a surrogate pair
+		}
+		if units+n > maxEventEmailLength {
+			return email[:i]
+		}
+		units += n
+	}
+	return email
 }
