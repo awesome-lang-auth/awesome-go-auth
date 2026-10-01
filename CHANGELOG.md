@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`README_DETAILED.md` §HTTP Adapters now documents the adapters that exist
+  (#16).** The section showed `chi.New(svc)`, `gin.New(svc)`, `echo.New(svc)`
+  and `adapt.RequireAuth`, and claimed a list of per-route handlers that every
+  adapter provides. None of these exist. It now documents what the code has:
+  - `nethttp`, `gin` and `echo` take an `*auth.Auth` through
+    `New`/`NewWithConfig`. `chi` has only package functions.
+  - Routes are mounted as a whole by `Mount`/`MountWithConfig`.
+  - The middleware and the context reader each adapter exposes.
+  - Only `nethttp.Adapter` exports individual handlers, and `Mount` is the
+    supported way to serve them.
+
+  Every sample compiles against this release. The admin note under
+  `HTTPConfig.RateLimiter` said no admin router existed. It now describes
+  `AdminOptions.RateLimiter`, which covers the promote route only. The `Config`
+  listing had three wrong defaults. They now match `DefaultConfig`:
+  `RefreshTokenTTL` is 30d, not 7d. `ClockSkew` is 30s, not 5s.
+  `EmailChangeTTL` is 1h, not 24h. The listing also gains `Issuer`'s default
+  and the `TempTokenTTL`, `Uploads` and `Events` fields it was missing.
+  Documentation only; no code changes.
+
 ## [0.12.0] - 2026-09-30
 
 The admin user detail across tenants, and the deprecation of the one exported

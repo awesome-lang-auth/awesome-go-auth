@@ -172,17 +172,18 @@ lands the behaviour changes and the entry is retired.
 ```go
 type Config struct {
     Secret                string                        // HMAC secret (min 32 bytes)
-    Issuer                string
+    Issuer                string                        // default: "awesome-go-auth"
     AccessTokenTTL        time.Duration                 // default: 15m
-    RefreshTokenTTL       time.Duration                 // default: 7d
+    RefreshTokenTTL       time.Duration                 // default: 30d
     SessionCheckOn        string                        // allcalls|refresh|none (default: refresh)
     ResetTokenTTL         time.Duration                 // default: 1h
     MagicLinkTTL          time.Duration                 // default: 15m
     SMSCodeTTL            time.Duration                 // default: 10m
     EmailVerificationTTL  time.Duration                 // default: 24h
     EmailVerificationMode string                        // none|lazy|strict (default: none)
-    EmailChangeTTL        time.Duration                 // default: 24h
-    ClockSkew             time.Duration                 // default: 5s
+    EmailChangeTTL        time.Duration                 // default: 1h
+    TempTokenTTL          time.Duration                 // default: 5m; the step-up token a 2FA challenge hands the client
+    ClockSkew             time.Duration                 // default: 30s
     MinPasswordLen        int                           // default: 8
     BcryptCost            int                           // default: bcrypt.DefaultCost (10); 0 means unset
     Require2FA            bool
@@ -196,7 +197,9 @@ type Config struct {
     SendEmailChange       EmailChangeSender             // optional; POST /auth/change-email/request
     SendEmailChanged      EmailChangedSender            // optional; the notice POST /auth/change-email/confirm mails to the old address
     Templates             TemplateStore                 // optional; run-time overrides of the built-in mail templates — see Mailer
+    Uploads               UploadStore                   // optional; no default — see UploadStore and MemoryUploadStore
     Settings              SettingsStore                 // optional; the admin-flipped runtime settings — see Runtime settings
+    Events                *EventBus                     // optional; WithEventBus sets it — see Event Bus
     SiteURLs              []string                      // first = canonical link base; all = origin allowlist — see Delivery
     Logger                func(format string, args ...any)
 }
@@ -3149,46 +3152,174 @@ type Event struct {
 
 ## HTTP Adapters
 
+Four packages serve the auth router, one per framework. Each takes the
+`*auth.Auth` that `auth.New` or `auth.NewWithConfig` returns, not a `*Service`,
+and each mounts the **whole** route set in one call. Routes are not wired one
+by one. The four mount the same routes and write byte-identical bodies and
+cookies through the shared wire helpers. The conformance suite in
+`adapter/internal/wiretest` runs every case against all four.
+
+| Package | `Mount` takes | Constructor | `Middleware` shape | Principal read by |
+|---|---|---|---|---|
+| `adapter/nethttp` | `*http.ServeMux` | `New(a)`, `NewWithConfig(a, cfg)` → `*Adapter` | `func(http.Handler) http.Handler` | `nethttp.UserFromContext(ctx)` |
+| `adapter/chi` | `chi.Router` | none: package functions only | `func(http.Handler) http.Handler` | `auth.UserFromContext(ctx)` (chi reuses the net/http handlers and middleware) |
+| `adapter/gin` | `gin.IRoutes` | `New(a)`, `NewWithConfig(a, cfg)` → `*Adapter` | `gin.HandlerFunc` | `UserFromContext(c *gin.Context)` |
+| `adapter/echo` | `*echo.Group` | `New(a)`, `NewWithConfig(a, cfg)` → `*Adapter` | `echo.MiddlewareFunc` | `UserFromContext(c echo.Context)` |
+
+`nethttp.UserFromContext` is `auth.UserFromContext`; either name works on
+net/http and chi.
+
 ### `adapter/nethttp`
 
 ```go
-adapt := nethttp.New(svc)
-mux.HandleFunc("/auth/register", adapt.Register)
-mux.Handle("/auth/me", adapt.Middleware(meHandler))
+a, err := auth.New(auth.WithSecret("change-me-in-production-32bytes!!"))
+if err != nil {
+	log.Fatal(err)
+}
+
+mux := http.NewServeMux()
+nethttp.Mount(mux, a) // every auth route, under /auth
+
+// A route of the host's own, behind the access-token middleware.
+profile := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	user, _ := nethttp.UserFromContext(r.Context())
+	auth.WriteJSON(w, http.StatusOK, map[string]string{"id": user.ID})
+})
+mux.Handle("GET /api/profile", nethttp.Middleware(a)(profile))
+```
+
+With other wire conventions, build the adapter and mount it. `Middleware()` on
+the `*Adapter` returns the middleware; it is not the middleware itself:
+
+```go
+cfg := auth.DefaultHTTPConfig()
+cfg.APIPrefix = "/api/auth"
+
+mux := http.NewServeMux()
+adapt := nethttp.NewWithConfig(a, cfg)
+adapt.Mount(mux) // every auth route, under /api/auth
+mux.Handle("GET /api/profile", adapt.Middleware()(profile))
 ```
 
 ### `adapter/chi`
 
+There is no `chi.New` and no adapter value. The package is `Mount`,
+`MountWithConfig`, `Middleware` and `ResourceServerMiddleware`:
+
 ```go
-adapt := chi.New(svc)
-r.Post("/auth/register", adapt.Register)
-r.With(adapt.RequireAuth).Get("/auth/me", adapt.Me)
+import (
+	"github.com/go-chi/chi/v5"
+	auth "github.com/nik2208/awesome-go-auth"
+	chiAdapter "github.com/nik2208/awesome-go-auth/adapter/chi"
+)
+
+r := chi.NewRouter()
+chiAdapter.Mount(r, a) // every auth route, under /auth
+
+r.With(chiAdapter.Middleware(a)).Get("/api/profile", func(w http.ResponseWriter, r *http.Request) {
+	user, _ := auth.UserFromContext(r.Context())
+	auth.WriteJSON(w, http.StatusOK, map[string]string{"id": user.ID})
+})
 ```
 
 ### `adapter/gin`
 
+The adapter's package name is also `gin`, so import it under another name.
+`gin.Default` below is the framework's constructor:
+
 ```go
-adapt := gin.New(svc)
-r.POST("/auth/register", adapt.Register)
-r.GET("/auth/me", adapt.RequireAuth(), adapt.Me)
+import (
+	"github.com/gin-gonic/gin"
+	auth "github.com/nik2208/awesome-go-auth"
+	ginAdapter "github.com/nik2208/awesome-go-auth/adapter/gin"
+)
+
+r := gin.Default()
+ginAdapter.Mount(r, a) // every auth route, under /auth
+
+r.GET("/api/profile", ginAdapter.Middleware(a), func(c *gin.Context) {
+	user, _ := ginAdapter.UserFromContext(c)
+	c.JSON(http.StatusOK, gin.H{"id": user.ID})
+})
+```
+
+The same through an adapter value:
+
+```go
+adapt := ginAdapter.NewWithConfig(a, auth.DefaultHTTPConfig())
+adapt.Mount(r)
+r.GET("/api/profile", adapt.Middleware(), profile)
 ```
 
 ### `adapter/echo`
 
+The package name `echo` clashes in the same way; `echo.New` below is the
+framework's. `Mount` takes an `*echo.Group`, so pass `e.Group("")` to mount at
+the root:
+
 ```go
-adapt := echo.New(svc)
-e.POST("/auth/register", adapt.Register)
-e.GET("/auth/me", adapt.Me, adapt.RequireAuth())
+import (
+	"github.com/labstack/echo/v4"
+	auth "github.com/nik2208/awesome-go-auth"
+	echoAdapter "github.com/nik2208/awesome-go-auth/adapter/echo"
+)
+
+e := echo.New()
+echoAdapter.Mount(e.Group(""), a) // every auth route, under /auth
+
+e.GET("/api/profile", func(c echo.Context) error {
+	user, _ := echoAdapter.UserFromContext(c)
+	return c.JSON(http.StatusOK, map[string]string{"id": user.ID})
+}, echoAdapter.Middleware(a))
 ```
 
-All adapters provide at minimum: `Register`, `Login`, `Refresh`, `Logout`, `Me`, `ForgotPassword`, `ResetPassword`, `SendMagicLink`, `VerifyMagicLink`, `ChangePassword`, `SetupTOTP`, `VerifyTOTP`, `ListSessions`, `RequireAuth` middleware.
+The same through an adapter value:
 
-Each adapter also exports two middlewares for the host's own routes, in its own
-framework's shape: `Middleware(a)`, which verifies this instance's HS256 session
-token, and `ResourceServerMiddleware(a, cfg)`, which verifies a bearer token
-against a remote JWKS and falls back to the local cookie — see
-[Resource server mode](#resource-server-mode). Both put the principal where that
-adapter's `UserFromContext` reads it.
+```go
+adapt := echoAdapter.NewWithConfig(a, auth.DefaultHTTPConfig())
+adapt.Mount(e.Group(""))
+e.GET("/api/profile", profile, adapt.Middleware())
+```
+
+### What every adapter provides
+
+All four adapters provide the same package-level functions:
+
+- `Mount(router, a)` and `MountWithConfig(router, a, cfg auth.HTTPConfig)`.
+  They register the auth routes under `HTTPConfig.Prefix()` (`/auth` by
+  default), relative to the router they are given. `Mount` is
+  `MountWithConfig` with `auth.DefaultHTTPConfig()`. Some routes depend on the
+  configuration:
+  - The JWKS document and the four OIDC endpoints are mounted only under
+    `auth.WithIDP`.
+  - The hosted UI is mounted only under `UI.Enabled`.
+  - The OpenAPI document and Swagger UI are mounted only under `Docs.Enabled`.
+  - The admin console is mounted only when `AdminMounted()` reports it, at
+    `Admin.Path` rather than under the prefix.
+  - The tools router is mounted only when `ToolsMounted()` reports it, at
+    `Tools.Path`.
+  - Under `ResourceServer`, the credential routes are left out
+    (`auth.ResourceServerGatedRoutes`).
+- `Middleware(a)` verifies this instance's HS256 access token and puts the user
+  in the context.
+- `ResourceServerMiddleware(a, cfg auth.ResourceServerConfig)` verifies a
+  bearer token against a remote JWKS. Without a bearer header, it verifies the local
+  access-token cookie. See [Resource server mode](#resource-server-mode).
+
+Both middlewares come in each framework's own shape and put the principal where
+the table above reads it. The `*Adapter` of `nethttp`, `gin` and `echo` also
+has `Config()`, which returns the resolved `HTTPConfig`, and the methods
+`Mount(router)` and `Middleware()`.
+
+Only `nethttp.Adapter` exports the individual route handlers (`Register`,
+`Login`, `Refresh`, `Logout`, `Me`, `ForgotPassword`, `MagicLinkSend`,
+`TwoFactorSetup`, `Sessions`, …) and the `…Handler()` constructors
+(`OAuthAuthorizeHandler`, `UIHandler`, `AdminHandler`, …). The gin and echo
+adapters keep theirs unexported. The handler methods are bare. `Mount` wraps
+each of their routes in the event-context carrier, the rate-limiter slot and
+the CSRF middleware, and adds the access-token middleware where the route needs
+it. A handler method mounted by hand gets none of these, so `Mount` is the
+supported way to serve the routes.
 
 ### `HTTPConfig.RateLimiter` — the rate-limiter slot
 
@@ -3259,18 +3390,23 @@ budget shared across the router.
 behaviour when the option is absent — it collapses to an empty middleware list
 (`:468`). Nothing else in the wire contract changes either way.
 
-> **Note for the admin router.** The family's private development line carries a
-> second, separate slot on its admin router (`AdminOptions.rateLimiter`,
-> `admin.router.ts:211`, collapsed to an empty list the same way at `:577`) and
-> spreads it onto exactly one route, `POST /users/:id/promote` (`:1030`); its
-> admin login route (`:614`) carries none. That path is relative to the admin
-> router's own mount, which the host app chooses and which defaults to `/admin`
-> (`admin.router.ts:190`, `openapi.ts:674`) — it is not under
-> `HTTPConfig.APIPrefix`. Those line numbers are in that private tree, not in
-> `auth.ReferenceRevision`, whose admin router carries no rate-limiter slot at
-> all. No admin route exists in this port yet, so nothing is wired here;
-> whoever lands the admin router should mount the promote route behind
-> `HTTPConfig.RateLimiter`.
+> **Note for the admin router.** `HTTPConfig.RateLimiter` does not cover the
+> admin console. The console has its own separate slot,
+> `HTTPConfig.Admin.RateLimiter` (`AdminOptions.RateLimiter`, `admin.go`). It is
+> applied to exactly one route, `POST <admin>/users/{id}/promote`, ahead of that
+> route's guard. The console's login route and every other admin route carry no
+> limiter. The console mounts at `Admin.Path`, `/admin` by default, not under
+> `HTTPConfig.APIPrefix`. This mirrors the family's private development line.
+> That line declares `AdminOptions.rateLimiter` (`admin.router.ts:205-211`) and
+> collapses it to an empty list when it is absent (`:577`). It spreads the slot
+> onto the promote route only (`:1030`) and leaves the admin login without one
+> (`:614`). Those line numbers are in that private tree, not in
+> `auth.ReferenceRevision`, whose admin router has no rate-limiter slot at all.
+> The route and the slot are registered together as the deviation
+> `admin-promote-route-comes-from-the-development-line` in
+> [README.md](README.md). Like `HTTPConfig.RateLimiter`, the field is a
+> constructor called at mount time. A host that passes the same limiter to both
+> slots gets one shared budget.
 
 ---
 
