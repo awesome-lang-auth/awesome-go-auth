@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -71,43 +70,6 @@ func (s require2FAUserStore) GetUserByID(ctx context.Context, id, tenantID strin
 		user.Require2FA = true
 	}
 	return user, err
-}
-
-// losableUserStore serves the first `gate` id lookups from the backing store and
-// fails every one after that. It is the only way to reach the /2fa/disable
-// re-read failure over HTTP: the access-token middleware reads the same user by
-// the same id, so a store that simply never had the user refuses the request
-// before the handler runs.
-type losableUserStore struct {
-	*auth.MemoryUserStore
-	mu    sync.Mutex
-	count int
-	gate  int
-	armed bool
-}
-
-// arm resets the counter and starts failing id lookups after gate of them.
-func (s *losableUserStore) arm(gate int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.count, s.gate, s.armed = 0, gate, gate > 0
-}
-
-func (s *losableUserStore) lookups() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.count
-}
-
-func (s *losableUserStore) GetUserByID(ctx context.Context, id, tenantID string) (auth.User, error) {
-	s.mu.Lock()
-	s.count++
-	lost := s.armed && s.count > s.gate
-	s.mu.Unlock()
-	if lost {
-		return auth.User{}, errors.New("user not found")
-	}
-	return s.MemoryUserStore.GetUserByID(ctx, id, tenantID)
 }
 
 // failingSettingsStore is a settings store that is never reachable, which is
@@ -761,6 +723,26 @@ func testSMSOTP(t *testing.T, mount Mounter) {
 		AssertError(t, rec, http.StatusBadRequest, "User does not have a phone number configured", auth.CodePhoneNotSet)
 	})
 
+	// A number stored as sent (#35) is tested as the reference tests it,
+	// untrimmed (`if (!user.phoneNumber)`, auth.router.ts:1830 at v1.10.8): one
+	// of only spaces is a number, and the code is sent to it.
+	t.Run("send to a user whose number is only spaces", func(t *testing.T) {
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+		user, tokens := env.Seed("spacephone@example.com")
+		add := env.Request(http.MethodPost, "/add-phone", map[string]string{"phoneNumber": " "})
+		add.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+		AssertStatus(t, env.Do(add), http.StatusOK)
+
+		rec := env.Do(env.Request(http.MethodPost, "/sms/send", map[string]any{
+			"userId": user.ID, "tenantId": testTenant,
+		}))
+		AssertStatus(t, rec, http.StatusOK)
+		AssertKeys(t, Body(t, rec), "success")
+		if n := len(env.Delivered.SMSCodes); n != 1 {
+			t.Fatalf("%d SMS code(s) delivered, want 1", n)
+		}
+	})
+
 	t.Run("send in 2fa mode without a tempToken", func(t *testing.T) {
 		env, _ := newPhoneEnv(t, mount)
 		rec := env.Do(env.Request(http.MethodPost, "/sms/send", map[string]any{"mode": auth.StepUpMode}))
@@ -1108,29 +1090,6 @@ func testTwoFactor(t *testing.T, mount Mounter) {
 
 		rec := env.Do(passwordlessBearer(env.Request(http.MethodPost, "/2fa/disable", nil), tokens.AccessToken))
 		AssertError(t, rec, http.StatusForbidden, "Cannot disable 2FA: required for your account", auth.CodeTwoFactorRequired)
-	})
-
-	// The reference reads the per-user flag with optional chaining
-	// (`currentUser?.require2FA`, auth.router.ts:884-885), so a user the store no
-	// longer returns is not a 404 — the handler falls through to the disable. Only
-	// reachable if the user disappears between the middleware's lookup and the
-	// handler's re-read, which is what the store double below arranges: the
-	// calibration request measures how many id lookups an authenticated request
-	// costs before the handler runs, so the failure lands on exactly the re-read.
-	t.Run("disable falls through when the re-read loses the user", func(t *testing.T) {
-		store := &losableUserStore{MemoryUserStore: auth.NewMemoryUserStore()}
-		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithUserStore(store))
-		_, tokens := env.Seed("vanishing@example.com")
-
-		store.arm(0)
-		me := env.Do(passwordlessBearer(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+"/me", nil), tokens.AccessToken))
-		AssertStatus(t, me, http.StatusOK)
-		gate := store.lookups()
-
-		store.arm(gate)
-		rec := env.Do(passwordlessBearer(env.Request(http.MethodPost, "/2fa/disable", nil), tokens.AccessToken))
-		AssertStatus(t, rec, http.StatusOK)
-		AssertKeys(t, Body(t, rec), "success")
 	})
 
 	t.Run("disable refuses under a system-wide policy", func(t *testing.T) {

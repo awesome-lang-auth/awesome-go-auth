@@ -272,7 +272,9 @@ func (s *Service) availableTwoFactorMethods(user User) []string {
 	if user.IsTOTPEnabled && strings.TrimSpace(user.TOTPSecret) != "" {
 		methods = append(methods, TwoFactorMethodTOTP)
 	}
-	if _, ok := s.users.(SMSStore); ok && s.cfg.SendSMSCode != nil && strings.TrimSpace(user.PhoneNumber) != "" {
+	// Untrimmed, as the reference tests it (`if (user.phoneNumber && config.sms)`,
+	// auth.router.ts:1015 at v1.10.8), and as /sms/send and Service.SendSMSCode do.
+	if _, ok := s.users.(SMSStore); ok && s.cfg.SendSMSCode != nil && user.PhoneNumber != "" {
 		methods = append(methods, TwoFactorMethodSMS)
 	}
 	if _, ok := s.users.(MagicLinkStore); ok && s.cfg.SendMagicLink != nil {

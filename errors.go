@@ -39,20 +39,32 @@ var (
 	// Service.ChangePassword.
 	ErrNewPasswordRequired = errors.New("auth: new password is required")
 
-	// ErrUserNotFound is an authenticated request whose user the UserStore no
-	// longer has: the token verified, and the row it names is gone. It is the
-	// reference's `404 {"error":"User not found"}` on the routes whose handler
-	// looks the user up itself — GET /me, /change-password,
-	// /send-verification-email, /change-email/request (awesome-node-auth v1.10.8
-	// auth.router.ts:1182-1185, :1471-1474, :1519-1521, :1591-1594) — which the
-	// port can reach since its auth gate stopped reading the user store (#31).
+	// ErrUserNotFound is a user the UserStore does not have. It is two things:
 	//
-	// It wraps ErrInvalidCredentials, the sentinel ChangePassword,
-	// SendVerificationEmailToken and RequestEmailChange returned for a missing
-	// user before it existed, so a caller testing errors.Is(err,
-	// ErrInvalidCredentials) on those three still matches. Test for
-	// ErrUserNotFound first to tell the two apart.
-	ErrUserNotFound = fmt.Errorf("%w: user not found", ErrInvalidCredentials)
+	//   - the sentinel a UserStore returns, or wraps, from GetUserByID when no row
+	//     matches the id and tenant — MemoryUserStore does — so that the service
+	//     can tell a missing user from a store that failed;
+	//   - what the service answers an authenticated request with when the token
+	//     verified and the row it names is gone: the reference's
+	//     `404 {"error":"User not found"}` on the routes whose handler looks the
+	//     user up itself — GET /me, /change-password, /send-verification-email,
+	//     /change-email/request (awesome-node-auth v1.10.8
+	//     auth.router.ts:1182-1185, :1471-1474, :1519-1521, :1591-1594) — which
+	//     the port can reach since its auth gate stopped reading the user store
+	//     (#31).
+	//
+	// Only a store error that is ErrUserNotFound becomes the 404. Any other
+	// GetUserByID failure on those routes is the reference's generic 500: its
+	// findById throwing reaches handleError, and only a null user is the 404. A
+	// host UserStore that reports a missing row with an error of its own gets
+	// the 500 there until it returns ErrUserNotFound.
+	//
+	// It matches ErrInvalidCredentials under errors.Is, the sentinel
+	// ChangePassword, SendVerificationEmailToken and RequestEmailChange returned
+	// for a missing user before it existed, so a caller testing for that on
+	// those three still matches. Test for ErrUserNotFound first to tell the two
+	// apart.
+	ErrUserNotFound error = userNotFoundError{}
 
 	// ErrPasswordRequired is an email change requested for an account whose
 	// only credential is the address itself: it has no password, and may not
@@ -75,3 +87,27 @@ var (
 	// error. Their one sentinel, ErrDeliveryFailed, lives beside them in
 	// delivery_password_email.go.
 )
+
+// userNotFoundError is ErrUserNotFound's type: its own message, and a match for
+// ErrInvalidCredentials under errors.Is.
+type userNotFoundError struct{}
+
+func (userNotFoundError) Error() string { return "auth: user not found" }
+
+func (userNotFoundError) Is(target error) bool { return target == ErrInvalidCredentials }
+
+// errUserLookup marks a GetUserByID failure that is not ErrUserNotFound. It is
+// unexported: HTTPErrorFor and the route mappers answer it with their default,
+// the generic 500, and AccessHTTPError, which would otherwise answer 403, tests
+// for it. The store's own error is folded in with %v, not %w, so no sentinel it
+// happens to wrap can pick a different wire answer.
+var errUserLookup = errors.New("auth: user lookup failed")
+
+// userLookupError is what a route answers for a failed GetUserByID:
+// ErrUserNotFound for a missing user, errUserLookup for anything else.
+func userLookupError(err error) error {
+	if errors.Is(err, ErrUserNotFound) {
+		return ErrUserNotFound
+	}
+	return fmt.Errorf("%w: %v", errUserLookup, err)
+}

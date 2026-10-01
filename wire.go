@@ -244,6 +244,10 @@ func AccessHTTPError(err error) HTTPError {
 		return HTTPErrSessionRevoked
 	case errors.Is(err, ErrUserNotFound):
 		return HTTPErrUserNotFound
+	case errors.Is(err, errUserLookup):
+		// Service.Me's store read failed for a reason other than a missing row:
+		// the reference's findById throwing, which handleError answers 500.
+		return HTTPErrInternal
 	}
 	return HTTPErrInvalidAccessToken
 }

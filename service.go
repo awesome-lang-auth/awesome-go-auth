@@ -65,7 +65,7 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 	// Both are legal together, and the gate wins (see registerIssuesSession),
 	// so a deployment that expected registration to log people in is told once
 	// why it does not.
-	if cfg.IssueSessionOnRegister && svc.emailVerificationMode() == EmailVerificationModeStrict {
+	if cfg.issueSessionOnRegister() && svc.emailVerificationMode() == EmailVerificationModeStrict {
 		svc.logf("auth: IssueSessionOnRegister is on, but EmailVerificationMode is strict: POST /register issues no session for an unverified account; it logs in after verifying the address")
 	}
 	return svc, nil
@@ -169,7 +169,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTok
 // predicates are loginPassword's own, so the registration can never be more
 // permissive than the login (#21, the family spec's "email verification wins").
 func (s *Service) registerIssuesSession(user User) bool {
-	if !s.cfg.IssueSessionOnRegister {
+	if !s.cfg.issueSessionOnRegister() {
 		return false
 	}
 	return !s.emailVerificationBlocksLogin(user) && !s.requiresTwoFactor(user)
@@ -416,7 +416,7 @@ func (s *Service) Me(ctx context.Context, accessToken string) (User, error) {
 	}
 	user, err := s.users.GetUserByID(ctx, claims.Sub, claims.Tid)
 	if err != nil {
-		return User{}, ErrUserNotFound
+		return User{}, userLookupError(err)
 	}
 	return s.enrichCustomClaims(ctx, s.enrichFromStores(ctx, user)), nil
 }
@@ -643,33 +643,49 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // (awesome-node-auth v1.10.8 auth.router.ts:1465-1500), in its order:
 //
 //  1. the user is looked up; a missing one is ErrUserNotFound, the
-//     reference's 404 (#31);
+//     reference's 404, and any other store failure is an opaque error, its
+//     500 (#31);
 //  2. an empty NewPassword is ErrNewPasswordRequired, whatever the account;
-//  3. only an account that has a password must present it: an empty or wrong
-//     CurrentPassword is ErrInvalidCredentials. An account with no stored
-//     password — OAuth-only, magic-link-only — skips the comparison and sets
-//     its first password with NewPassword alone, because the reference's
-//     compare sits inside `if (user.password)`. CurrentPassword is then
-//     ignored, not compared;
+//  3. an account that has a password must present it, and an empty or wrong
+//     CurrentPassword is ErrInvalidCredentials. "Has a password" is what
+//     POST /login would check: a stored hash, compared locally and then — when
+//     it does not verify — through Config.PasswordVerifier, exactly as
+//     loginPassword does, migration included; and, when a verifier is
+//     configured, an account with no stored hash too, because its credential
+//     may live behind the verifier (a row not migrated yet, or one the
+//     verifier keeps owning with migrated=false). Only an account with no
+//     stored hash on a deployment with no verifier is passwordless — OAuth-only,
+//     magic-link-only — and it skips the comparison and sets its first password
+//     with NewPassword alone, because the reference's compare sits inside
+//     `if (user.password)`. Its CurrentPassword is then ignored, not compared;
 //  4. the port's password policy, which the reference does not have (the
 //     password-policy-on-reset-and-change deviation): a NewPassword shorter
 //     than Config.MinPasswordLen is ErrWeakPassword. It runs last so that it
 //     never outranks an answer the reference gives.
 //
-// Step 3 is a posture, and it is the reference's: whoever holds a valid access
-// token of a passwordless account can give that account a password. A caller
-// that wants a stronger proof for that case has to ask for it before calling
-// here (#30).
+// The passwordless case of step 3 is a posture, and it is the reference's:
+// whoever holds a valid access token of a passwordless account can give that
+// account a password. A caller that wants a stronger proof for that case has to
+// ask for it before calling here (#30). The decision reads the stored hash, so
+// the UserStore must return PasswordHash from GetUserByID; a store that leaves
+// it out makes every account look passwordless.
 func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) error {
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return ErrUserNotFound
+		return userLookupError(err)
 	}
 	if in.NewPassword == "" {
 		return ErrNewPasswordRequired
 	}
-	if user.PasswordHash != "" && !verifyPassword(in.CurrentPassword, user.PasswordHash) {
-		return ErrInvalidCredentials
+	if user.PasswordHash != "" || s.cfg.PasswordVerifier != nil {
+		if in.CurrentPassword == "" {
+			return ErrInvalidCredentials
+		}
+		if !verifyPassword(in.CurrentPassword, user.PasswordHash) {
+			if _, err := s.verifyThroughPasswordVerifier(ctx, user, in.CurrentPassword); err != nil {
+				return err
+			}
+		}
 	}
 	if len(in.NewPassword) < s.cfg.MinPasswordLen {
 		return ErrWeakPassword
@@ -930,7 +946,7 @@ func (s *Service) SendVerificationEmailToken(ctx context.Context, in EmailVerifi
 	}
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return "", ErrUserNotFound
+		return "", userLookupError(err)
 	}
 	if user.IsEmailVerified {
 		return "", nil
@@ -1007,7 +1023,7 @@ func (s *Service) requestEmailChange(ctx context.Context, in ChangeEmailRequestI
 	}
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
-		return "", ErrUserNotFound
+		return "", userLookupError(err)
 	}
 	if requirePassword && user.PasswordHash == "" {
 		return "", ErrPasswordRequired

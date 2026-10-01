@@ -69,10 +69,14 @@ type Config struct {
 	// in afterwards. It is the family's instance-admin option of that name
 	// (awesome-go-auth #21); the reference's own default is false.
 	//
-	// DefaultConfig sets it to true for every 0.x release, because this port
-	// always opened a session on registration and nothing may change for a
-	// deployment that does not touch it; the default flips to false at v1.0.0.
-	// A Config built without DefaultConfig starts from the zero value, false.
+	// It is a pointer so that unset is not the same as off. Nil — what
+	// DefaultConfig leaves, and what a Config built by hand has unless it says
+	// otherwise — means the release default, which is on for every 0.x release,
+	// because this port always opened a session on registration and nothing may
+	// change for a deployment that does not touch it. The default flips to off
+	// at v1.0.0. A pointer to false is the reference's answer today, a pointer
+	// to true keeps the session past v1.0.0; WithIssueSessionOnRegister sets
+	// either.
 	//
 	// Even when true, no session is issued to an account POST <prefix>/login
 	// would not log straight in: an unverified address under
@@ -80,8 +84,8 @@ type Config struct {
 	// once when both are configured), or an account a second factor is
 	// required of (Require2FA, for a new account). The registration then
 	// answers the plain 201 and the account logs in through the login's own
-	// gates. WithIssueSessionOnRegister sets it.
-	IssueSessionOnRegister bool
+	// gates.
+	IssueSessionOnRegister *bool
 	Require2FA             bool
 	// TwoFactorAppName is the issuer an authenticator app files a TOTP
 	// enrolment under: the `issuer` of the otpauth:// URI POST <prefix>/2fa/setup
@@ -234,9 +238,6 @@ func DefaultConfig(secret string) Config {
 		EmailVerificationMode: EmailVerificationModeNone,
 		EmailChangeTTL:        1 * time.Hour,
 		TempTokenTTL:          5 * time.Minute,
-		// On for 0.x, as this port has always behaved; off from v1.0.0, the
-		// reference's default. See Config.IssueSessionOnRegister.
-		IssueSessionOnRegister: true,
 	}
 }
 
@@ -283,4 +284,18 @@ func (c Config) validate() error {
 		return errors.New("auth: email and temp token ttl must be > 0")
 	}
 	return nil
+}
+
+// defaultIssueSessionOnRegister is what an unset Config.IssueSessionOnRegister
+// means in this release: on, for every 0.x release, as this port always
+// behaved. It becomes false at v1.0.0, the reference's default.
+const defaultIssueSessionOnRegister = true
+
+// issueSessionOnRegister resolves Config.IssueSessionOnRegister: the value it
+// points at, or the release default when it is nil.
+func (c Config) issueSessionOnRegister() bool {
+	if c.IssueSessionOnRegister == nil {
+		return defaultIssueSessionOnRegister
+	}
+	return *c.IssueSessionOnRegister
 }

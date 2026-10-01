@@ -147,7 +147,7 @@ func (ad *Adapter) smsSend(c echo.Context) error {
 		auth.WriteHTTPError(c.Response(), auth.HTTPErrUserNotFound)
 		return nil
 	}
-	if strings.TrimSpace(user.PhoneNumber) == "" {
+	if user.PhoneNumber == "" {
 		auth.WriteHTTPError(c.Response(), auth.HTTPErrPhoneNotSet)
 		return nil
 	}
@@ -261,14 +261,10 @@ func (ad *Adapter) twoFactorDisable(c echo.Context) error {
 		return nil
 	}
 	// Re-read the user rather than trust the access token: a require2FA flag set
-	// after the token was issued still has to be honoured. A failed re-read falls
-	// through rather than 404ing, matching the reference's optional chaining
-	// (`currentUser?.require2FA`, auth.router.ts:884-885). That makes this term
-	// fail OPEN where the settings term below fails closed — the asymmetry, and
-	// why it stands, is written out in adapter/nethttp/passwordless.go.
-	fresh, err := ad.auth.FindUser(c.Request().Context(), user.ID, "", user.TenantID)
-	if err == nil && fresh.Require2FA {
-		auth.WriteHTTPError(c.Response(), auth.HTTPErrTwoFactorRequiredForUser)
+	// after the token was issued still has to be honoured. Fails closed; see
+	// auth.Auth.TwoFactorDisableUserRefusal.
+	if herr, refused := ad.auth.TwoFactorDisableUserRefusal(c.Request().Context(), user.ID, user.TenantID); refused {
+		auth.WriteHTTPError(c.Response(), herr)
 		return nil
 	}
 	// The system-wide term is second, as in the reference (per-user at :884-888,

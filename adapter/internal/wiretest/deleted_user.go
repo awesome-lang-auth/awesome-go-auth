@@ -18,10 +18,13 @@ package wiretest
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	auth "github.com/nik2208/awesome-go-auth"
 )
@@ -113,6 +116,10 @@ func testDeletedUser(t *testing.T, mount Mounter) {
 		AssertKeys(t, Body(t, rec), "sessions")
 	})
 
+	t.Run("store writes", func(t *testing.T) { testDeletedUserStoreWrites(t, mount) })
+	t.Run("a user-store read failure", func(t *testing.T) { testUserStoreReadFailure(t, mount) })
+	t.Run("POST /2fa/disable after a tenant move", func(t *testing.T) { testTwoFactorDisableTenantMove(t, mount) })
+
 	// The gate's own refusal is unchanged: under allcalls a revoked session is
 	// SESSION_REVOKED before any handler runs, whether or not the user exists.
 	t.Run("a revoked session is still SESSION_REVOKED under allcalls", func(t *testing.T) {
@@ -129,4 +136,116 @@ func testDeletedUser(t *testing.T, mount Mounter) {
 			AssertError(t, rec, http.StatusUnauthorized, "Session has been revoked", auth.CodeSessionRevoked)
 		}
 	})
+}
+
+// recordEvents subscribes to every event on a new bus and returns the option
+// that wires it and the list it fills.
+func recordEvents() (auth.Option, *[]auth.Event) {
+	bus := auth.NewEventBus()
+	var (
+		mu  sync.Mutex
+		got []auth.Event
+	)
+	bus.Subscribe(auth.EventBusWildcard, func(ev auth.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, ev)
+	})
+	return auth.WithEventBus(bus), &got
+}
+
+// testDeletedUserStoreWrites pins the routes whose handler writes the user
+// store without looking the user up first. The reference's answer there is its
+// store's: MemoryUserStore refuses a write to a missing row, so each is the
+// generic, detail-free 500 — the body is exactly {"error":"Internal server
+// error"} — and no event is raised. /2fa/disable, which re-reads the user
+// first, fails closed with the 404.
+func testDeletedUserStoreWrites(t *testing.T, mount Mounter) {
+	for _, tc := range []struct {
+		name, method, route string
+		body                func() any
+	}{
+		{"PATCH /profile", http.MethodPatch, "/profile", func() any { return map[string]string{"firstName": "Mario", "lastName": "Rossi"} }},
+		{"POST /add-phone", http.MethodPost, "/add-phone", func() any { return map[string]string{"phoneNumber": "+390123456789"} }},
+		{"POST /2fa/verify-setup", http.MethodPost, "/2fa/verify-setup", func() any {
+			const secret = "JBSWY3DPEHPK3PXP"
+			return map[string]string{"secret": secret, "token": totpCode(t, secret, time.Now())}
+		}},
+		{"DELETE /account", http.MethodDelete, "/account", func() any { return nil }},
+	} {
+		t.Run(tc.name+" answers the store's 500, with no detail", func(t *testing.T) {
+			bus, events := recordEvents()
+			env, tokens := deletedUserEnv(t, mount, bus)
+			*events = nil
+			rec := env.Do(bearer(env.Request(tc.method, tc.route, tc.body()), tokens))
+			AssertError(t, rec, http.StatusInternalServerError, "Internal server error", "")
+			if len(*events) != 0 {
+				t.Fatalf("a failed write raised %d event(s)", len(*events))
+			}
+		})
+	}
+
+	t.Run("POST /2fa/disable fails closed with 404 User not found", func(t *testing.T) {
+		bus, events := recordEvents()
+		env, tokens := deletedUserEnv(t, mount, bus)
+		*events = nil
+		rec := env.Do(bearer(env.Request(http.MethodPost, "/2fa/disable", nil), tokens))
+		AssertError(t, rec, http.StatusNotFound, "User not found", "")
+		if len(*events) != 0 {
+			t.Fatalf("a refused disable raised %d event(s)", len(*events))
+		}
+	})
+}
+
+// brokenReadUserStore answers every GetUserByID with a store failure that is
+// not ErrUserNotFound — an outage, not a missing row. Registration and login
+// never read by id, so a user can still be seeded and logged in.
+type brokenReadUserStore struct{ *auth.MemoryUserStore }
+
+func (brokenReadUserStore) GetUserByID(context.Context, string, string) (auth.User, error) {
+	return auth.User{}, errors.New("user store unavailable")
+}
+
+// A store read that fails for any reason other than a missing row is the
+// reference's 500 (its findById throwing reaches handleError), never the 404
+// that would tell a client the account is gone.
+func testUserStoreReadFailure(t *testing.T, mount Mounter) {
+	for _, tc := range []struct {
+		name, method, route string
+		body                any
+	}{
+		{"GET /me", http.MethodGet, "/me", nil},
+		{"POST /change-password", http.MethodPost, "/change-password", map[string]string{"currentPassword": "password1", "newPassword": "newpassword1"}},
+		{"POST /send-verification-email", http.MethodPost, "/send-verification-email", nil},
+		{"POST /change-email/request", http.MethodPost, "/change-email/request", map[string]string{"newEmail": "free@example.com"}},
+		{"POST /2fa/disable", http.MethodPost, "/2fa/disable", nil},
+	} {
+		t.Run(tc.name+" answers 500", func(t *testing.T) {
+			env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithUserStore(brokenReadUserStore{auth.NewMemoryUserStore()}))
+			_, tokens := env.Seed("outage@example.com")
+			rec := env.Do(bearer(env.Request(tc.method, tc.route, tc.body), tokens))
+			AssertError(t, rec, http.StatusInternalServerError, "Internal server error", "")
+		})
+	}
+}
+
+// A user moved to another tenant after the token was minted is not the user
+// the token names: the re-read is scoped by the token's tenant, misses, and
+// the disable is refused even though the moved row carries require2FA.
+func testTwoFactorDisableTenantMove(t *testing.T, mount Mounter) {
+	store := auth.NewMemoryUserStore()
+	env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithUserStore(store))
+	user, tokens := env.Seed("moved@example.com")
+	ctx := context.Background()
+	if err := store.DeleteUser(ctx, user.ID, user.TenantID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	moved := user
+	moved.TenantID = "t2"
+	moved.Require2FA = true
+	if _, err := store.CreateUser(ctx, moved); err != nil {
+		t.Fatalf("recreate in t2: %v", err)
+	}
+	rec := env.Do(bearer(env.Request(http.MethodPost, "/2fa/disable", nil), tokens))
+	AssertError(t, rec, http.StatusNotFound, "User not found", "")
 }

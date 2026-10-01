@@ -136,6 +136,19 @@ func testRegisterSession(t *testing.T, mount Mounter) {
 		}
 	})
 
+	// A required second factor wins too: under Require2FA the login would
+	// answer a challenge, so the registration must not hand out a full session.
+	for _, mode := range bearerModes {
+		t.Run("on, Require2FA issues nothing, "+mode.name, func(t *testing.T) {
+			env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithIssueSessionOnRegister(true), auth.WithRequire2FA(true))
+			req := env.Request(http.MethodPost, "/register", credentials("need2fa@example.com"))
+			if mode.bearer {
+				req.Header.Set(auth.AuthStrategyHeader, auth.AuthStrategyBearer)
+			}
+			assertRegisteredWithoutSession(t, env, env.Do(req), mode.bearer)
+		})
+	}
+
 	// Email verification wins: under strict the login would refuse the new,
 	// unverified account with 403 EMAIL_NOT_VERIFIED, so the registration must
 	// not hand it the credential the gate withholds — the bypass #21 was filed
@@ -143,7 +156,8 @@ func testRegisterSession(t *testing.T, mount Mounter) {
 	for _, mode := range bearerModes {
 		t.Run("on, strict email verification issues nothing, "+mode.name, func(t *testing.T) {
 			env := registerSessionEnv(t, mount, func(c *auth.Config) {
-				c.IssueSessionOnRegister = true
+				on := true
+				c.IssueSessionOnRegister = &on
 				c.EmailVerificationMode = auth.EmailVerificationModeStrict
 			})
 			req := env.Request(http.MethodPost, "/register", credentials("strict@example.com"))

@@ -414,8 +414,7 @@ func testChangePassword(t *testing.T, mount Mounter) {
 	// At v1.10.8 the missing-newPassword refusal is unconditional: it runs before
 	// the comparison and for an account with a password too
 	// (auth.router.ts:1476-1479). The port used to answer that account's request
-	// with the port-only 400 WEAK_PASSWORD, or with 401 when the current
-	// password was wrong as well.
+	// with the port-only 400 WEAK_PASSWORD, whatever the current password.
 	for _, current := range []string{"password1", "wrongpassword"} {
 		t.Run("an absent newPassword gets 400 whatever the current password: "+current, func(t *testing.T) {
 			env, _ := storeEnv(t, mount, auth.DefaultHTTPConfig())
