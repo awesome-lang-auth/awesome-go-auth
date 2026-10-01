@@ -65,7 +65,7 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 	// Both are legal together, and the gate wins (see registerIssuesSession),
 	// so a deployment that expected registration to log people in is told once
 	// why it does not.
-	if cfg.issueSessionOnRegister() && svc.emailVerificationMode() == EmailVerificationModeStrict {
+	if cfg.IssueSessionOnRegister && svc.emailVerificationMode() == EmailVerificationModeStrict {
 		svc.logf("auth: IssueSessionOnRegister is on, but EmailVerificationMode is strict: POST /register issues no session for an unverified account; it logs in after verifying the address")
 	}
 	return svc, nil
@@ -98,8 +98,8 @@ func normalizeEmail(email string) string {
 // with no usable address.
 //
 // Whether a successful call also opens a session is the instance's choice,
-// Config.IssueSessionOnRegister — on by default in 0.x, off from v1.0.0 and in
-// the reference — and even when it is on, the account must be one POST /login
+// Config.IssueSessionOnRegister — off by default, as in the reference — and
+// even when it is on, the account must be one POST /login
 // would log straight in (see registerIssuesSession). When no session is opened
 // the returned AuthTokens is the zero value. See the register-issues-a-session
 // entry in CompatibilityNotes.
@@ -169,7 +169,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTok
 // predicates are loginPassword's own, so the registration can never be more
 // permissive than the login (#21, the family spec's "email verification wins").
 func (s *Service) registerIssuesSession(user User) bool {
-	if !s.cfg.issueSessionOnRegister() {
+	if !s.cfg.IssueSessionOnRegister {
 		return false
 	}
 	return !s.emailVerificationBlocksLogin(user) && !s.requiresTwoFactor(user)

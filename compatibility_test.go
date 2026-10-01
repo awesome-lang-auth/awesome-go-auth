@@ -125,19 +125,15 @@ var wantClaims = map[string][]string{
 		"MinRefreshInterval", "invalidateCache", "RS256", "401",
 	},
 	"csrf-cookie-not-reissued-with-tokens": {"Set-Cookie", "setTokenCookies"},
-	// Both halves of the difference; the option that decides it, its 0.x
-	// default and the release that flips it (an entry that lost "v1.0.0" would
-	// read as a permanent divergence, one that lost the option as a difference
-	// with no way back); and — the part that must survive every reword — that
-	// the email verification gate wins over the option, which is what
-	// nik2208/awesome-go-auth#21 was filed about. An entry that kept the wire
-	// facts but lost the gate would read as if a strict deployment could still
-	// hand out the credential its login withholds.
+	// Both answers; that the default is the reference's and the session is an
+	// opt-in addition (an entry that lost "off by default" would read as a
+	// divergence every deployment carries); and — the part that must survive
+	// every reword — that the email verification gate wins over the option,
+	// which is what nik2208/awesome-go-auth#21 was filed about.
 	"register-issues-a-session": {
 		"201", "userId", "accessToken", "refreshToken", "Set-Cookie",
-		"sendTokens", "POST /login",
-		"Config.IssueSessionOnRegister", "WithIssueSessionOnRegister(false)",
-		"DefaultConfig", "v1.0.0", "issueSessionOnRegister",
+		"sendTokens", "POST /login", "off by default",
+		"Config.IssueSessionOnRegister", "WithIssueSessionOnRegister(true)", "issueSessionOnRegister",
 		"email verification gate wins", "EmailVerificationModeStrict", "EMAIL_NOT_VERIFIED",
 		"nik2208/awesome-go-auth#21", "cases_register_test.go",
 	},

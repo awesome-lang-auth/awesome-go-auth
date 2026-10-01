@@ -27,7 +27,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	_, tokens, err := service.Register(context.Background(), auth.RegisterInput{
+	ctx := context.Background()
+	if _, _, err := service.Register(ctx, auth.RegisterInput{
+		Email:    "alice@example.com",
+		Password: "supersecurepassword",
+		TenantID: "tenant-1",
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	// Registration opens no session unless Config.IssueSessionOnRegister is on,
+	// as in the reference: log in for the token pair.
+	_, tokens, err := service.Login(ctx, auth.LoginInput{
 		Email:    "alice@example.com",
 		Password: "supersecurepassword",
 		TenantID: "tenant-1",
@@ -568,71 +579,52 @@ revision the whole contract was extracted from.
   unknown `kid` then invalidates and refetches, as the reference does. Nothing
   else in the verifier changes.
 
-### `register` opens a session by default in 0.x, where the reference only creates the account — `Config.IssueSessionOnRegister`, until v1.0.0
+### `register` can also open a session, when the instance opts in — `Config.IssueSessionOnRegister`, off by default
 
 `register-issues-a-session`
 
 - **Surface**: `POST <prefix>/register`.
-- **This port**: Whether a successful registration also logs the new account in
-  is the instance administrator's choice, `Config.IssueSessionOnRegister`
-  (`WithIssueSessionOnRegister`), and left unset — as `DefaultConfig` leaves it,
-  and as a hand-built `Config` has it unless it says otherwise — it is **on**
-  for every 0.x release, because this port always opened a session here. On, the
-  registration delivers a session exactly as a successful `POST /login` does,
-  through the same delivery switch: in cookie mode the response is
-  `201 {"success": true, "userId": "…"}` plus `Set-Cookie` for `accessToken` and
-  `refreshToken`, and in bearer mode (`X-Auth-Strategy: bearer`) the same body
-  with top-level `accessToken` and `refreshToken` fields and no cookies at all;
-  a refresh session row is created and `identity.auth.login.success` is raised
-  after `identity.user.created`, so `GET <prefix>/me` answers on the credential
-  the registration returned. Off, the answer is the reference's:
-  `201 {"success": true, "userId": "…"}` and nothing else. Even on, no session
-  is issued to an account `POST /login` would not log straight in: under
+- **This port**: By default answers what the reference answers:
+  `201 {"success": true, "userId": "…"}` and nothing else — no `Set-Cookie`, no
+  token, no session row; the client logs in with `POST /login` afterwards.
+  `Config.IssueSessionOnRegister` (`WithIssueSessionOnRegister(true)`) is an
+  addition the instance administrator may turn on: the registration then also
+  delivers a session exactly as a successful `POST /login` does, through the
+  same delivery switch — in cookie mode `Set-Cookie` for `accessToken` and
+  `refreshToken` beside the same body, in bearer mode
+  (`X-Auth-Strategy: bearer`) top-level `accessToken` and `refreshToken` fields
+  and no cookies — with a refresh session row and `identity.auth.login.success`
+  raised after `identity.user.created`. Even on, no session is issued to an
+  account `POST /login` would not log straight in: under
   `EmailVerificationModeStrict` the new address is unverified and the login
-  would answer `403 EMAIL_NOT_VERIFIED`, and with `Config.Require2FA` it would
+  would answer `403 EMAIL_NOT_VERIFIED`, and under `Config.Require2FA` it would
   answer a challenge, so in both cases the registration answers the plain `201`
   — the email verification gate wins over the option, and the service logs once
   at startup when both are configured. A refused registration (`400`,
   `409 USER_EXISTS`) never issues anything.
-- **The reference**: Mounts the route at all only when the host supplies
-  `options.onRegister`; without it there is no `POST <prefix>/register` in the
-  reference and the path answers `404` where this port answers `201` (or
-  `400 INVALID_INPUT` for a body missing a credential). That unconditional mount
-  is a second, smaller difference on this surface, registered as
-  `register-route-is-always-mounted`. Where the reference *is* mounted it
-  answers `201 {"success": true, "userId": user.id}` and nothing else: the
-  register route never reaches `sendTokens` — the one function that writes
-  `setTokenCookies` or the body tokens — and never reaches `issueTokens`, so no
-  cookie is set, no token is returned and no session row is created
-  (`auth.router.ts:1259` at v1.10.8). The caller has to `POST /login` with the
-  credentials it just chose. The family's option of the same name,
-  `issueSessionOnRegister`, defaults to off there (`auth.router.ts:713-730`,
-  `auth.router.ts:726`, `auth.router.ts:399-406`).
-- **Why**: The option is an owner decision for the whole family (2026-09-30,
-  from
-  [nik2208/awesome-go-auth#21](https://github.com/nik2208/awesome-go-auth/issues/21)):
-  whether registration logs the account in is a deployment's choice, the same
-  knob in every backend, off by default because that is the reference's answer.
-  This port is the one exception until v1.0.0. It has always issued here, the
-  shipped clients read only `userId` and absorb a session without noticing —
-  `ng-awesome-node-auth` posts `withCredentials` and its next session check
-  succeeds, the Flutter client ignores every other field — and a 0.x release
-  must not log every existing deployment's new users out of their first screen.
-  What the unconditional issuance used to cost, a bypass of the email
-  verification gate (under strict a new account walked away with the access
-  token `POST /login` withheld), is closed whatever the option says, because the
-  login's own gates decide. `awesome-lambda-auth` keeps issuing by default
-  through its own knob, as its contract suite
-  (`test/contract/cases_register_test.go`) records.
-- **Matching the reference exactly**: `WithIssueSessionOnRegister(false)`, or
-  `IssueSessionOnRegister` pointing at `false` on the `Config`: the registration
-  then answers `201 {"success": true, "userId": "…"}` with no cookie, no token
-  and no session row. The field is a pointer so that unset is not off: a
-  `Config` that does not set it keeps the 0.x default.
-- **Planned for v1.0.0**: The default flips to off, the reference's, and this
-  entry retires: a deployment that wants registration to log people in then says
-  so with `WithIssueSessionOnRegister(true)`. It is a breaking change and the
-  v1.0.0 CHANGELOG will say so.
+- **The reference**: Has no such option at the pinned revision. Where its
+  register route is mounted (only with `options.onRegister`; see
+  `register-route-is-always-mounted`) it answers
+  `201 {"success": true, "userId": user.id}` and nothing else: the route never
+  reaches `sendTokens` — the one function that writes `setTokenCookies` or the
+  body tokens — nor `issueTokens`, so no cookie, no token and no session row
+  (`auth.router.ts:1259` at v1.10.8). The family's option of the same name,
+  `issueSessionOnRegister`, is off by default there too
+  (`auth.router.ts:713-730`, `auth.router.ts:726`, `auth.router.ts:399-406`).
+- **Why**: Whether registration logs the account in is a deployment's choice,
+  the same knob in every backend of the family (owner decision 2026-09-30, from
+  [nik2208/awesome-go-auth#21](https://github.com/nik2208/awesome-go-auth/issues/21)),
+  and its default is the reference's answer, so an unconfigured instance answers
+  what the reference answers. It is registered because turning it on puts
+  cookies, tokens and a session on a route that never carries them in the
+  reference. Until this release the port issued that session unconditionally,
+  which handed a strict deployment's new accounts exactly the access token
+  `POST /login` withholds; the option, and the login's gates winning over it,
+  close that. `awesome-lambda-auth` keeps issuing by default through its own
+  knob, as its contract suite (`test/contract/cases_register_test.go`) records.
+- **Matching the reference exactly**: Leave the option off, the default: the
+  registration answers `201 {"success": true, "userId": "…"}` with no cookie, no
+  token and no session row.
 
 ### `ui/config`: `features.verifyEmail` follows the effective verification mode
 

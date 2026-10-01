@@ -26,35 +26,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Registration may open a session, chosen by the instance admin (#21):
   `Config.IssueSessionOnRegister` and `WithIssueSessionOnRegister(bool)`.**
   The family option of the same name (the family spec "register may open a
-  session"). On, a successful `POST <prefix>/register` delivers a session
-  exactly as a successful `POST /login` does — the access and refresh cookies
-  in cookie mode, `accessToken` and `refreshToken` in the body in bearer mode,
-  a session row, and `identity.auth.login.success` raised after
-  `identity.user.created`; off, it answers the reference's
-  `201 {"success":true,"userId":"…"}` and nothing else. The field is a
-  `*bool`, so that unset is not the same as off: unset — what `DefaultConfig`
-  leaves, and what a hand-built `Config` has unless it says otherwise — means
-  **on** for every 0.x release, which is how the port always behaved, so no
-  deployment that does not touch it sees a change. The compatibility note
-  `register-issues-a-session` now describes the option and its default.
-
-  Even with the option on, the login's gates now win, and this changes what a
-  deployment that uses them sees: under `EmailVerificationModeStrict` the new,
-  unverified account gets the plain `201` and no session — registration used
-  to hand out exactly the access token `POST /login` refuses with
-  `403 EMAIL_NOT_VERIFIED` — and under `Require2FA` the registration no longer
-  skips the second factor either. The service logs once at startup when the
-  option and strict are configured together. A refused registration never
-  issues anything. `identity.auth.login.success` is new on the registration
-  path, and `identity.user.created` is now raised before the session is
-  opened, not after. Adapters write the answer through the new
-  `HTTPConfig.WriteRegistration`.
-
-  **Planned for v1.0.0:** the unset default flips to off, the reference's. A
-  deployment that wants registration to log people in will have to say
-  `WithIssueSessionOnRegister(true)`.
+  session"), **off by default**, as in the reference and in the spec: see the
+  `BREAKING (wire)` entry under Changed. On, a successful
+  `POST <prefix>/register` also delivers a session exactly as a successful
+  `POST /login` does — the access and refresh cookies in cookie mode,
+  `accessToken` and `refreshToken` in the body in bearer mode, a session row,
+  and `identity.auth.login.success` raised after `identity.user.created`.
+  Even on, the login's gates win: under `EmailVerificationModeStrict` the new,
+  unverified account gets the plain `201` and no session, and under
+  `Require2FA` the registration does not skip the second factor either. The
+  service logs once at startup when the option and strict are configured
+  together. A refused registration never issues anything. Adapters write the
+  answer through the new `HTTPConfig.WriteRegistration`. The compatibility
+  note `register-issues-a-session` now describes the option as an opt-in
+  addition: with it off, the port answers what the reference answers.
 
 ### Changed
+- **BREAKING (wire) — `POST <prefix>/register` no longer logs the new account in
+  by default (#21).** The port used to open a session on every successful
+  registration: cookies in cookie mode, `accessToken` and `refreshToken` in the
+  body in bearer mode, a session row. It now answers what the reference
+  answers, `201 {"success":true,"userId":"…"}` and nothing else, and the client
+  logs in with `POST /login` afterwards. `Service.Register` returns zero
+  `AuthTokens` unless the option is on. A deployment that wants the old
+  behaviour says `WithIssueSessionOnRegister(true)` (or
+  `IssueSessionOnRegister: true` on its `Config`); the login's gates — strict
+  email verification, `Require2FA` — still win over it. A client that relied
+  on being logged in straight after registering — the Angular client's next
+  session check used to succeed on the cookies the registration set — now goes
+  to its login form, as it does against the reference.
 - **`Service.ChangePassword` lets an account with no password set one (#30).**
   An OAuth-only or magic-link-only account used to get
   `ErrInvalidCredentials` from the service whatever it sent, because the

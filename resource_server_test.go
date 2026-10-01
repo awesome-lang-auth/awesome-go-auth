@@ -808,7 +808,7 @@ func TestUserFromRS256ClaimsReadsTheTokenAndNothingElse(t *testing.T) {
 // either — a resource server has no user table to reach into.
 func TestVerifyLocalAccessTokenReadsNoStore(t *testing.T) {
 	users := NewMemoryUserStore()
-	a, err := New(WithSecret("01234567890123456789012345678901"), WithUserStore(users))
+	a, err := New(WithSecret("01234567890123456789012345678901"), WithUserStore(users), WithIssueSessionOnRegister(true))
 	if err != nil {
 		t.Fatalf("auth.New: %v", err)
 	}
@@ -863,7 +863,7 @@ func TestResourceServerPrincipalSelectsOnTheBearerPrefix(t *testing.T) {
 	s := newJWKSTestServer(t, JWKS{Keys: []JWK{k1.jwk}})
 	client := newTestJWKSClient(s, newTestClock(), time.Hour)
 
-	a, err := New(WithSecret("01234567890123456789012345678901"))
+	a, err := New(WithSecret("01234567890123456789012345678901"), WithIssueSessionOnRegister(true))
 	if err != nil {
 		t.Fatalf("auth.New: %v", err)
 	}

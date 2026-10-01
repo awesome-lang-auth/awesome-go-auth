@@ -183,7 +183,7 @@ type Config struct {
     EmailVerificationTTL  time.Duration                 // default: 24h
     EmailVerificationMode string                        // none|lazy|strict (default: none)
     EmailChangeTTL        time.Duration                 // default: 24h
-    IssueSessionOnRegister *bool                        // nil = the release default: on in 0.x, off from v1.0.0 — see IssueSessionOnRegister
+    IssueSessionOnRegister bool                         // default: false, the reference's answer — see IssueSessionOnRegister
     ClockSkew             time.Duration                 // default: 5s
     MinPasswordLen        int                           // default: 8
     BcryptCost            int                           // default: bcrypt.DefaultCost (10); 0 means unset
@@ -236,15 +236,14 @@ in is the instance administrator's choice — the family option of the same name
 
 | `IssueSessionOnRegister` | `201` body | cookies / tokens | session row |
 |---|---|---|---|
-| unset (`DefaultConfig`, or a hand-built `Config` that does not set it) in every 0.x release, or `true` | `{"success": true, "userId": "…"}` | as `POST /login`: the access and refresh cookies, or `accessToken` / `refreshToken` in the body with `X-Auth-Strategy: bearer` | created, and `identity.auth.login.success` raised |
-| `false` — the reference's answer, and what unset means from v1.0.0 | `{"success": true, "userId": "…"}` | none | none |
+| `true` | `{"success": true, "userId": "…"}` | as `POST /login`: the access and refresh cookies, or `accessToken` / `refreshToken` in the body with `X-Auth-Strategy: bearer` | created, and `identity.auth.login.success` raised |
+| `false` — the default, and the reference's answer | `{"success": true, "userId": "…"}` | none | none |
 
 Even when it is `true`, the login's gates win: an account `POST /login` would not
 log straight in gets the plain `201` and no session — an unverified address under
 `EmailVerificationMode` `strict` (the service logs this once at startup when both
 are configured), or any account under `Require2FA`. A refused registration never
-issues anything. `WithIssueSessionOnRegister(false)` gives the reference's answer
-today. The field is a `*bool` so that unset is not the same as off.
+issues anything. `WithIssueSessionOnRegister(true)` turns it on.
 
 ### `TwoFactorAppName` and the TOTP parameters
 

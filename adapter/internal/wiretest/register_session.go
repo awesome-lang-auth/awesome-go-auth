@@ -6,7 +6,7 @@ package wiretest
 //
 // Off, the answer is the reference's: 201 {"success":true,"userId":"…"}, no
 // access or refresh cookie, no token, no session row (auth.router.ts:1259 at
-// v1.10.8). On — the 0.x default — the same status and fields plus a session
+// v1.10.8), and it is the default. On, the same status and fields plus a session
 // delivered exactly as POST /login delivers one. A refused registration never
 // issues anything, and a login gate the new account would not pass — strict
 // email verification — wins over the option.
@@ -72,19 +72,27 @@ func testRegisterSession(t *testing.T, mount Mounter) {
 		bearer bool
 	}{{"cookie mode", false}, {"bearer mode", true}}
 
-	for _, mode := range bearerModes {
-		t.Run("off answers the reference's 201 and nothing else, "+mode.name, func(t *testing.T) {
-			env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithIssueSessionOnRegister(false))
-			req := env.Request(http.MethodPost, "/register", credentials("off@example.com"))
-			if mode.bearer {
-				req.Header.Set(auth.AuthStrategyHeader, auth.AuthStrategyBearer)
-			}
-			assertRegisteredWithoutSession(t, env, env.Do(req), mode.bearer)
+	for _, tc := range []struct {
+		name string
+		opts []auth.Option
+	}{
+		{"by default", nil},
+		{"explicitly off", []auth.Option{auth.WithIssueSessionOnRegister(false)}},
+	} {
+		for _, mode := range bearerModes {
+			t.Run(tc.name+", the reference's 201 and nothing else, "+mode.name, func(t *testing.T) {
+				env := NewEnv(t, mount, auth.DefaultHTTPConfig(), tc.opts...)
+				req := env.Request(http.MethodPost, "/register", credentials("off@example.com"))
+				if mode.bearer {
+					req.Header.Set(auth.AuthStrategyHeader, auth.AuthStrategyBearer)
+				}
+				assertRegisteredWithoutSession(t, env, env.Do(req), mode.bearer)
 
-			// And the client logs in afterwards, as with the reference.
-			login := env.Do(env.Request(http.MethodPost, "/login", credentials("off@example.com")))
-			AssertStatus(t, login, http.StatusOK)
-		})
+				// And the client logs in afterwards, as with the reference.
+				login := env.Do(env.Request(http.MethodPost, "/login", credentials("off@example.com")))
+				AssertStatus(t, login, http.StatusOK)
+			})
+		}
 	}
 
 	t.Run("on, cookie mode: GET /me answers on the cookies it set", func(t *testing.T) {
@@ -156,8 +164,7 @@ func testRegisterSession(t *testing.T, mount Mounter) {
 	for _, mode := range bearerModes {
 		t.Run("on, strict email verification issues nothing, "+mode.name, func(t *testing.T) {
 			env := registerSessionEnv(t, mount, func(c *auth.Config) {
-				on := true
-				c.IssueSessionOnRegister = &on
+				c.IssueSessionOnRegister = true
 				c.EmailVerificationMode = auth.EmailVerificationModeStrict
 			})
 			req := env.Request(http.MethodPost, "/register", credentials("strict@example.com"))

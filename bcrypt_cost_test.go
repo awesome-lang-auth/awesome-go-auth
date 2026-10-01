@@ -30,6 +30,10 @@ const testSecret = "12345678901234567890123456789012"
 func testConfig(secret string) Config {
 	cfg := DefaultConfig(secret)
 	cfg.BcryptCost = testBcryptCost
+	// The suites seed users through Register and authenticate with the session
+	// it hands back, so the shared test config opts in to it. The default — off,
+	// the reference's answer — is pinned in register_session_test.go.
+	cfg.IssueSessionOnRegister = true
 	// Delivery is a precondition of the passwordless send calls, so a service
 	// built for a test about something else still has to satisfy it. See
 	// noopDelivery in delivery_test.go.
@@ -41,7 +45,7 @@ func testConfig(secret string) Config {
 // start here instead of at New. Options passed in are applied after, so a test
 // that wants a specific cost can still say so.
 func newTestAuth(opts ...Option) (*Auth, error) {
-	return New(append([]Option{WithBcryptCost(testBcryptCost)}, opts...)...)
+	return New(append([]Option{WithBcryptCost(testBcryptCost), WithIssueSessionOnRegister(true)}, opts...)...)
 }
 
 // TestUnconfiguredBcryptCostIsDefaultCost is the guard on the production
