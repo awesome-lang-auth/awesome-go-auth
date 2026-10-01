@@ -214,13 +214,18 @@ revision the whole contract was extracted from.
 - **This port**: Beside the JWKS route, an `Auth` built `WithIDP` serves the
   four OIDC endpoints of the authorization-code flow. `authorize` accepts PKCE
   as `S256` only and refuses `plain` with the RFC 6749 §4.1.2.1
-  `invalid_request` redirect. `token` authenticates the client by
-  `client_secret_basic` or `client_secret_post` — never both — verifies the
-  `code_verifier` of a code issued with a challenge, and implements two grants:
-  `authorization_code`, which returns the HS256 session access token and an
-  RS256 `id_token`, plus a `refresh_token` only when the code was granted
-  `offline_access`; and `refresh_token`, which rotates that opaque token on
-  every use and revokes its whole family when a used one comes back, when
+  `invalid_request` redirect. `token` is `POST` only and reads no credential or
+  token from the URL query; it authenticates the client by `client_secret_basic`
+  or `client_secret_post` — never both — or, for a public client registered
+  without a secret, by `client_id` alone, and such a client must use PKCE; it
+  requires the authorization request's `redirect_uri`, verifies the
+  `code_verifier` of a code issued with a challenge and refuses one for a code
+  issued without (the RFC 9700 §2.1.1 downgrade), revokes what a replayed code
+  produced, and implements two grants: `authorization_code`, which returns the
+  HS256 session access token and an RS256 `id_token`, plus a `refresh_token`
+  only when the code was granted `offline_access`; and `refresh_token` — unless
+  `IDPConfig.DisableRefreshTokenGrant` is set — which rotates that opaque token
+  on every use and revokes its whole family when a used one comes back, when
   another client presents it, or when its session has ended. Every `token`
   refusal is the RFC 6749 §5.2 JSON body (`invalid_request`, `invalid_client`,
   `invalid_grant`, `invalid_scope`, `unsupported_grant_type`) with
