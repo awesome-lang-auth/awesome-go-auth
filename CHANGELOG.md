@@ -7,6 +7,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Config.RefreshSecret` and `WithRefreshSecret` — a signing key of its own
+  for refresh tokens** (#25). It is the reference's `refreshTokenSecret`
+  (`auth-config.model.ts:148`, `token.service.ts:25-29`): set, it signs and
+  verifies every refresh token, while access tokens and the 2FA step-up token
+  stay on `Config.Secret`. A component holding the access secret can then no
+  longer mint refresh tokens, and rotating the refresh secret alone signs every
+  session out while access tokens already issued run to their expiry. Empty
+  means `Config.Secret`, which is how refresh tokens were signed until now, so
+  a deployment that does not set it sees no change. Setting it on a running
+  deployment invalidates every outstanding refresh token once. Recorded as the
+  `refresh-secret-falls-back-to-secret` deviation.
+
+  **Planned for v1.0.0:** node 1.10.3 refuses to construct its router when
+  `refreshTokenSecret === accessTokenSecret` and a session store is configured
+  (`auth.router.ts:843-844` at 1.10.8). This release does not, because every
+  deployment that predates `RefreshSecret` has the two equal; v1.0.0 will refuse
+  it, so a deployment should set `WithRefreshSecret` to a distinct value before
+  upgrading to it.
+- **The IdP token endpoint verifies PKCE, accepts `client_secret_basic` and
+  public clients, and implements the `refresh_token` grant** (#14). None of
+  it has a counterpart in the reference, whose IdP mode is the JWKS route
+  alone. The rules come from the specifications, and the surface is recorded
+  as the `idp-mode-adds-an-oauth-authorization-server` deviation.
+  - **PKCE.** A code issued with an `S256` `code_challenge` is redeemed only
+    with the matching `code_verifier` (RFC 7636 §4.6). A missing or wrong
+    verifier is `400 invalid_grant` and burns the code. Discovery advertises
+    `code_challenge_methods_supported: ["S256"]`.
+  - **`client_secret_basic`** beside `client_secret_post` (RFC 6749 §2.3.1),
+    both advertised in `token_endpoint_auth_methods_supported`. A request
+    using both is `400 invalid_request`. A failed Basic attempt is
+    `401 invalid_client` with `WWW-Authenticate: Basic`. Client secrets are now
+    compared in constant time.
+  - **Public clients.** An `IDPClient` with no `ClientSecret` authenticates by
+    `client_id` alone, and discovery then advertises `none`. Any secret it
+    presents is refused. It must use `S256` PKCE at `/authorize`
+    (RFC 9700 §2.1.1). It may hold refresh tokens because they rotate
+    (RFC 9700 §4.14.2).
+  - **The `refresh_token` grant.** A refresh token is issued only when the code
+    was granted `offline_access` (OIDC Core §11, now in `scopes_supported`).
+    - The token is opaque and single use. Each refresh returns a new one with
+      a new access token for the same session.
+    - A token is `400 invalid_grant`, and every token of that grant is revoked
+      (RFC 9700 §4.14.2), when it is presented again, presented by another
+      client, or presented after its session ended.
+    - A store error is a `500 server_error` and revokes nothing.
+    - `scope` narrows and never widens (`400 invalid_scope`).
+    - A grant lasts as long as its session, `Config.RefreshTokenTTL`.
+    - The state lives in the new `IDPRefreshTokenStore` interface, set as
+      `IDPConfig.RefreshTokens`. Its doc comment is the implementor's
+      contract, including the DynamoDB transaction a consume needs.
+      `MemoryIDPRefreshTokenStore` is the in-process default, and the IdP
+      logs once when it is serving from it.
+    - `IDPConfig.DisableRefreshTokenGrant` turns the grant off.
+    - Discovery advertises `grant_types_supported`, and lists
+      `refresh_token` only while the grant is served.
+  - **A replayed authorization code revokes the session and the refresh
+    tokens it produced** (RFC 6749 §4.1.2). This needs a code store that
+    implements the new optional `AuthCodeReplayStore`, which
+    `MemoryAuthCodeStore` does. With any other store a replay is refused as
+    before and nothing else happens.
+
+### Changed
+- **BREAKING (wire) — IdP `POST <prefix>/token` no longer returns the
+  session refresh token** (#14). The response used to always carry the
+  session's own HS256 refresh token, which worked at `POST <prefix>/refresh`
+  and `POST <prefix>/logout`. Now `refresh_token` is present only when the
+  code was granted `offline_access`, and it is the grant's opaque token,
+  redeemed at `token` with `grant_type=refresh_token`. Every code exchange
+  still opens a full session that lives `Config.RefreshTokenTTL`, 30 days by
+  default. Nothing the relying party holds can end that session: there is no
+  revocation endpoint (RFC 7009) yet, so it ends when it expires, when it is
+  revoked through the session or admin surface, or when its code is
+  replayed.
+  - **Who is affected:**
+    - relying parties that used the returned `refresh_token` at `/refresh`
+      or `/logout`: they ask for `offline_access` and use the refresh grant;
+    - every host that serves `/token` from more than one process. The grant
+      defaults to an in-process store, so it has to set
+      `IDPConfig.RefreshTokens` to a shared store or set
+      `IDPConfig.DisableRefreshTokenGrant`. That includes
+      **awesome-lambda-auth's IdP mode**: until it ships a DynamoDB
+      `IDPRefreshTokenStore`, a refresh fails whenever it reaches another
+      execution environment, and reuse detection works only within one.
+- **BREAKING (wire) — IdP `POST <prefix>/token` refusals are RFC 6749 §5.2
+  JSON** (#14). Refusals used to be a plain-text line with the error code.
+  Now they are `{"error":"invalid_grant","error_description":"…"}`, with
+  `Cache-Control: no-store` and `Pragma: no-cache` on every answer (§5.1,
+  §5.2). The status codes are unchanged except the one below.
+  - Every `invalid_grant` carries the same description, so it reveals
+    nothing about the state of a code or token; the reason is logged.
+  - `authorize` and `userinfo` still refuse in plain text.
+- **BREAKING (wire) — IdP `POST <prefix>/token` enforces RFC 6749 and
+  RFC 7636/9700 on requests it used to accept** (#14).
+  - `POST` only. `GET`, `PUT` and `DELETE` used to answer `400
+    unsupported_grant_type`; they are now `405` with `Allow: POST`.
+  - A `client_id`, `client_secret`, `code`, `code_verifier` or
+    `refresh_token` in the URL query is `400 invalid_request`. They used to
+    be read from the query.
+  - `redirect_uri` is required and must match the authorization request's
+    (§4.1.3). A relying party that omits it at `token` now gets
+    `invalid_grant`.
+  - A `code_verifier` sent for a code issued without a challenge is
+    `invalid_grant`. This is the PKCE downgrade RFC 9700 §2.1.1 requires the
+    server to catch.
+  - `authorize` refuses a `plain` PKCE method, a `code_challenge` with no
+    method (RFC 7636 §4.3 reads that as `plain`), and a malformed challenge,
+    with the RFC 6749 §4.1.2.1 `error=invalid_request` redirect. They used to
+    be accepted and never checked.
+  - A client registered with no secret used to authenticate with an empty
+    one. It is now a public client: see Added.
+  - `NewIDP` refuses an empty or duplicate `ClientID`. A duplicate used to
+    replace the earlier registration silently.
+
 ## [0.12.0] - 2026-09-30
 
 The admin user detail across tenants, and the deprecation of the one exported

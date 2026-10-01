@@ -780,9 +780,10 @@ func resourceServerPrincipal(r *http.Request, a *Auth, client *JWKSClient, issue
 //
 // typ is kept where the reference relies on a second secret: it signs refresh
 // tokens with refreshTokenSecret, so a refresh token cannot pass its
-// verifyAccessToken, while this port signs both with Config.Secret and tells
-// them apart by typ. Dropping the check would turn every refresh token into an
-// access credential here, which the reference never does.
+// verifyAccessToken. This port does the same when Config.RefreshSecret is set,
+// and otherwise signs both with Config.Secret and tells them apart by typ alone.
+// Dropping the check would turn every refresh token into an access credential
+// in that second case, which the reference never does.
 func (s *Service) verifyLocalAccessToken(token string) (map[string]any, error) {
 	if _, err := s.parseToken(token, "access"); err != nil {
 		return nil, err

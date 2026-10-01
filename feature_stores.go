@@ -18,10 +18,36 @@ import (
 type MemoryAuthCodeStore struct {
 	mu    sync.Mutex
 	codes map[string]AuthCode
+	// redemptions is the AuthCodeReplayStore half: what each redeemed code
+	// produced, until the code's own expiry.
+	redemptions map[string]AuthCodeRedemption
 }
 
 func NewMemoryAuthCodeStore() *MemoryAuthCodeStore {
-	return &MemoryAuthCodeStore{codes: make(map[string]AuthCode)}
+	return &MemoryAuthCodeStore{codes: make(map[string]AuthCode), redemptions: make(map[string]AuthCodeRedemption)}
+}
+
+func (s *MemoryAuthCodeStore) SaveRedemption(_ context.Context, redemption AuthCodeRedemption) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for hash, existing := range s.redemptions {
+		if now.After(existing.ExpiresAt) {
+			delete(s.redemptions, hash)
+		}
+	}
+	s.redemptions[redemption.CodeHash] = redemption
+	return nil
+}
+
+func (s *MemoryAuthCodeStore) RedemptionOf(_ context.Context, codeHash string) (AuthCodeRedemption, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	redemption, ok := s.redemptions[codeHash]
+	if !ok || time.Now().After(redemption.ExpiresAt) {
+		return AuthCodeRedemption{}, ErrInvalidCode
+	}
+	return redemption, nil
 }
 
 func (s *MemoryAuthCodeStore) SaveCode(_ context.Context, code AuthCode) error {
@@ -49,6 +75,92 @@ func (s *MemoryAuthCodeStore) ConsumeCode(_ context.Context, codeHash string) (A
 		return AuthCode{}, ErrInvalidCode
 	}
 	return code, nil
+}
+
+// MemoryIDPRefreshTokenStore is an in-process implementation of
+// IDPRefreshTokenStore, and the IDP's default; see IDPConfig.RefreshTokens.
+//
+// One mutex covers every method, which is what makes ConsumeRefreshToken's
+// check-and-mark atomic. A used token stays in the map as a tombstone until it
+// expires, so that its replay is recognised; a revoked family is remembered
+// until the latest expiry among its members, so that a member saved after the
+// revocation is still refused. Both are swept on the next SaveRefreshToken.
+type MemoryIDPRefreshTokenStore struct {
+	mu     sync.Mutex
+	tokens map[string]memoryIDPRefreshToken
+	// revoked maps a revoked family to the time after which every member it
+	// can have is expired.
+	revoked map[string]time.Time
+}
+
+type memoryIDPRefreshToken struct {
+	token IDPRefreshToken
+	used  bool
+}
+
+func NewMemoryIDPRefreshTokenStore() *MemoryIDPRefreshTokenStore {
+	return &MemoryIDPRefreshTokenStore{
+		tokens:  make(map[string]memoryIDPRefreshToken),
+		revoked: make(map[string]time.Time),
+	}
+}
+
+func (s *MemoryIDPRefreshTokenStore) SaveRefreshToken(_ context.Context, token IDPRefreshToken) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for hash, entry := range s.tokens {
+		if now.After(entry.token.ExpiresAt) {
+			delete(s.tokens, hash)
+		}
+	}
+	for family, until := range s.revoked {
+		if now.After(until) {
+			delete(s.revoked, family)
+		}
+	}
+	if until, ok := s.revoked[token.FamilyID]; ok && token.ExpiresAt.After(until) {
+		s.revoked[token.FamilyID] = token.ExpiresAt
+	}
+	s.tokens[token.TokenHash] = memoryIDPRefreshToken{token: token}
+	return nil
+}
+
+func (s *MemoryIDPRefreshTokenStore) ConsumeRefreshToken(_ context.Context, tokenHash string) (IDPRefreshToken, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.tokens[tokenHash]
+	if !ok {
+		return IDPRefreshToken{}, ErrInvalidToken
+	}
+	if time.Now().After(entry.token.ExpiresAt) {
+		delete(s.tokens, tokenHash)
+		return IDPRefreshToken{}, ErrInvalidToken
+	}
+	if _, revoked := s.revoked[entry.token.FamilyID]; revoked {
+		return IDPRefreshToken{}, ErrInvalidToken
+	}
+	if entry.used {
+		return entry.token, ErrRefreshTokenReused
+	}
+	entry.used = true
+	s.tokens[tokenHash] = entry
+	return entry.token, nil
+}
+
+func (s *MemoryIDPRefreshTokenStore) RevokeRefreshTokenFamily(_ context.Context, familyID string, until time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if previous := s.revoked[familyID]; previous.After(until) {
+		until = previous
+	}
+	for _, entry := range s.tokens {
+		if entry.token.FamilyID == familyID && entry.token.ExpiresAt.After(until) {
+			until = entry.token.ExpiresAt
+		}
+	}
+	s.revoked[familyID] = until
+	return nil
 }
 
 // MemoryMetadataStore is an in-memory implementation of UserMetadataStore.

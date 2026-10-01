@@ -17,6 +17,12 @@ var (
 	ErrTenantNotFound      = errors.New("auth: tenant not found")
 	ErrRoleNotFound        = errors.New("auth: role not found")
 
+	// ErrRefreshTokenReused is what an IDPRefreshTokenStore answers for a refresh
+	// token that was already consumed once: the replay a rotation scheme exists
+	// to detect. The store returns the record with it, so that the IdP can revoke
+	// the whole family the token belongs to. See IDPRefreshTokenStore.
+	ErrRefreshTokenReused = errors.New("auth: refresh token already used")
+
 	// ErrInvalidInput is a registration missing one of the two fields the route
 	// cannot proceed without. It is deliberately not ErrWeakPassword: an absent
 	// password is not a rejected one, and the default register handler on the

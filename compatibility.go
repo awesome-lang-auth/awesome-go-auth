@@ -177,6 +177,82 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"routes, which sit behind the access-token gate.",
 			},
 			{
+				ID:      "refresh-secret-falls-back-to-secret",
+				Title:   "The refresh-token secret is optional and may equal the access-token secret",
+				Surface: "`auth.Config.RefreshSecret` / `auth.WithRefreshSecret`, and every refresh token `POST <prefix>/login`, `POST <prefix>/register` and `POST <prefix>/refresh` mint",
+				Behaviour: "Signs and verifies refresh tokens with `Config.RefreshSecret` when it is " +
+					"set, and with `Config.Secret` — the access-token secret — when it is empty, " +
+					"which is the default. Construction succeeds whether the two are different, " +
+					"equal, or the refresh one is unset, with or without a session store. When " +
+					"they coincide the refresh token is still refused as an access credential, by " +
+					"its `typ` claim.",
+				Reference: "`refreshTokenSecret` is a required member of `AuthConfig`, separate " +
+					"from `accessTokenSecret`, and signs and verifies every refresh token. Since " +
+					"1.10.3 the router also refuses to be constructed when " +
+					"`refreshTokenSecret === accessTokenSecret` and a session store is configured, " +
+					"throwing `refreshTokenSecret must differ from accessTokenSecret when a " +
+					"sessionStore is configured` (auth.router.ts:843-844 at 1.10.8).",
+				Citations: []string{"auth-config.model.ts:147-148", "token.service.ts:25-29", "token.service.ts:154"},
+				Why: "Until `RefreshSecret` existed this port signed both tokens with `Config.Secret`, " +
+					"so every deployment running it today has the two secrets equal and a session " +
+					"store configured. The reference's refusal would stop every one of them from " +
+					"starting on an upgrade within `0.x`. The fallback keeps them running unchanged, " +
+					"while a deployment that sets `RefreshSecret` gets the reference's separation " +
+					"of the two trust domains. The refusal is planned for v1.0.0, where a breaking " +
+					"change of configuration belongs.",
+				Notes: []DeviationNote{{
+					Label: "Matching the reference exactly",
+					Text: "Set `WithRefreshSecret` to a value different from `WithSecret`'s. " +
+						"Doing so on a running deployment invalidates every refresh token " +
+						"outstanding at that moment, so every session signs in again once.",
+				}},
+			},
+			{
+				ID:    "idp-mode-adds-an-oauth-authorization-server",
+				Title: "IdP mode also serves an OAuth 2.0 / OIDC authorization server",
+				Surface: "`GET <prefix>/.well-known/openid-configuration`, `<prefix>/authorize`, " +
+					"`POST <prefix>/token` and `GET <prefix>/userinfo`, mounted by `auth.WithIDP`",
+				Behaviour: "Beside the JWKS route, an `Auth` built `WithIDP` serves the four OIDC " +
+					"endpoints of the authorization-code flow. `authorize` accepts PKCE as `S256` only " +
+					"and refuses `plain` with the RFC 6749 §4.1.2.1 `invalid_request` redirect. `token` " +
+					"is `POST` only and reads no credential or token from the URL query; it authenticates " +
+					"the client by `client_secret_basic` or `client_secret_post` — never both — or, for a " +
+					"public client registered without a secret, by `client_id` alone, and such a client " +
+					"must use PKCE; it requires the authorization request's `redirect_uri`, verifies the " +
+					"`code_verifier` of a code issued with a challenge and refuses one for a code issued " +
+					"without (the RFC 9700 §2.1.1 downgrade), revokes what a replayed code produced, and " +
+					"implements two grants: `authorization_code`, which returns the HS256 session access " +
+					"token and an RS256 `id_token`, plus a `refresh_token` only when the code was granted " +
+					"`offline_access`; and `refresh_token` — unless `IDPConfig.DisableRefreshTokenGrant` is " +
+					"set — which rotates that opaque token on every use " +
+					"and revokes its whole family when a used one comes back, when another client " +
+					"presents it, or when its session has ended. Every `token` refusal is the RFC 6749 " +
+					"§5.2 JSON body (`invalid_request`, `invalid_client`, `invalid_grant`, " +
+					"`invalid_scope`, `unsupported_grant_type`) with `Cache-Control: no-store`; " +
+					"`authorize` and `userinfo` refuse in plain text.",
+				Reference: "Its IdP mode signs RS256 token pairs (`generateIdProviderTokenPair`) and serves " +
+					"the JWKS document, and nothing more: there is no discovery document, no " +
+					"`/authorize`, no `/token` and no `/userinfo`, so no PKCE, no client authentication " +
+					"and no refresh grant to compare against. The same holds at 1.10.8 " +
+					"(auth.router.ts:927-957 there).",
+				Citations: []string{"auth.router.ts:473-503", "token.service.ts:40-44"},
+				Why: "The port has carried these four endpoints since its first IdP release, and a " +
+					"relying party that finds an authorization server has to be able to rely on it: a " +
+					"PKCE challenge that was recorded and never checked protected nothing, and a " +
+					"client library speaking plain OAuth expects Basic authentication, the §5.2 error " +
+					"body and a refresh grant. None of it reaches a family client, which never calls " +
+					"these routes, and none of it changes the reference's own IdP surface, the JWKS " +
+					"route, which this port reproduces separately. Every rule is the specification's " +
+					"(RFC 6749, RFC 7636, OIDC Core §11 and §12.2, RFC 9700 §4.14.2), because there is " +
+					"no reference behaviour to follow.",
+				Notes: []DeviationNote{{
+					Label: "What is still open",
+					Text: "Which token pair `token` returns — the HS256 session pair it returns today or " +
+						"the RS256 pair `IssueIdPTokenPair` mints — is decision D-15 of the upstream plan " +
+						"and is not settled by this entry.",
+				}},
+			},
+			{
 				ID:      "link-request-exempts-bearer-from-csrf",
 				Title:   "`link-request` exempts a bearer credential from CSRF",
 				Surface: "`POST <prefix>/link-request`",
@@ -1246,7 +1322,8 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"`config.refreshTokenSecret` there (token.service.ts:25-29) and is therefore " +
 					"a second admin credential only in a deployment that sets both secrets to " +
 					"one value — where it is one for seven days rather than five minutes. This " +
-					"port has a single Config.Secret, so refusing it here is not hypothetical. " +
+					"port signs both with Config.Secret unless `Config.RefreshSecret` is set, and " +
+					"leaves it unset by default, so refusing it here is not hypothetical. " +
 					"A payload carrying `isRoot: true` short-circuits the user-store lookup and " +
 					"the policy together, whatever minted it.",
 				Citations: []string{
