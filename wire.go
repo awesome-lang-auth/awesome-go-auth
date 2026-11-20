@@ -491,6 +491,33 @@ type HTTPConfig struct {
 	// (auth.router.ts:510, :541); gating all of them is the
 	// resource-server-gates-all-credential-routes deviation.
 	ResourceServer bool
+	// ClosedRegistration closes public sign-up: the adapters do not register
+	// POST <prefix>/register at all, so it answers with whatever the router
+	// returns for an unknown path — 404 on all four — exactly as the reference
+	// does when the host supplies no onRegister hook (auth.router.ts:712-715).
+	// GET <prefix>/ui/config then answers features.register: false, which is
+	// what makes the built-in UI hide its sign-up link, and the OpenAPI
+	// document an adapter serves leaves the route out (OpenAPIInfo has the
+	// matching flag for a host that generates the document itself).
+	//
+	// It closes the route and nothing behind it. Service.Register and
+	// Auth.Register stay callable, so the host keeps every way of creating an
+	// account it controls — an invitation it redeems, an admin action, a
+	// provisioning job — and only the anonymous HTTP entry point is gone.
+	//
+	// It is not the only self-registration path. An OAuth callback creates an
+	// account for a provider identity nothing here knows yet whenever
+	// OAuthProvisioning.AutoCreate is on, which it is in
+	// DefaultOAuthProvisioning; a deployment that wants no account created
+	// except by its own hand sets AutoCreate to false as well, or configures no
+	// OAuth provider. Magic-link and SMS logins create nothing: both answer
+	// only for an account that already exists. The deprecated MCPServer, which
+	// a host mounts on a mux of its own, calls Service.Register directly and is
+	// not governed by this field either; it must not be mounted at all.
+	//
+	// False, the default, mounts the route as every release before this field
+	// did. See the register-route-is-always-mounted deviation.
+	ClosedRegistration bool
 	// RateLimiter is the reference's RouterOptions.rateLimiter
 	// (auth.router.ts:46): the slot a host drops its own limiter into. nil —
 	// the default — means no limiter, which is the reference's own default:

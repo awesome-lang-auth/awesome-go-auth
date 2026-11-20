@@ -254,9 +254,12 @@ func (ad *Adapter) Mount(group gin.IRoutes) {
 // mountCredentialRoutes registers the nineteen routes that create, prove,
 // deliver or change a credential — auth.ResourceServerGatedRoutes, which is the
 // same list and carries the reasoning. HTTPConfig.ResourceServer is the switch
-// that skips this call.
+// that skips this call, and HTTPConfig.ClosedRegistration the one that skips
+// POST /register alone (auth.HTTPConfig.RegisterMounted).
 func (ad *Adapter) mountCredentialRoutes(group gin.IRoutes, prefix string) {
-	group.POST(prefix+"/register", ad.guard(ad.register))
+	if ad.cfg.RegisterMounted() {
+		group.POST(prefix+auth.RegisterRoute, ad.guard(ad.register))
+	}
 	group.POST(prefix+"/login", ad.guard(ad.login))
 	group.POST(prefix+"/refresh", ad.guard(ad.refresh))
 	group.POST(prefix+"/logout", ad.guard(ad.logout))

@@ -189,8 +189,15 @@ var wantClaims = map[string][]string{
 		"features.verifyEmail", "SendEmailVerification", "EmailVerificationMode",
 		"emailVerificationMode !== 'none'", "requireEmailVerification",
 	},
+	// The switch and both of its answers, that the host keeps Service.Register,
+	// and — the part a reword must not lose — that the flag closes one of two
+	// self-registration paths: an entry that dropped AutoCreate would read as
+	// "sign-up is closed" to a deployment whose OAuth callback still creates
+	// accounts.
 	"register-route-is-always-mounted": {
 		"features.register", "onRegister", "404", "Service.Register",
+		"HTTPConfig.ClosedRegistration", "features.register: false", "OpenAPIInfo.ClosedRegistration",
+		"OAuthProvisioning.AutoCreate", "DefaultOAuthProvisioning", "<prefix>/ui/register",
 	},
 	// Both halves of the difference — what the reference does to the request and
 	// what this port does to the remaining handlers — plus the mechanism that

@@ -152,17 +152,51 @@ string. The dev line tests the untrimmed body value and would accept it; this is
 the narrower reading, and it can only refuse a request the dev line would have
 turned into an account with no usable address.
 
-Note that a successful `POST /auth/register` also opens a session — cookies, or
-body tokens under `X-Auth-Strategy: bearer` — where the published reference
-returns `201 {"success":true,"userId":…}` and nothing else. There is no knob to
-turn that off in this release, and it is **not** a settled decision: a
-registration that authenticates bypasses whatever email verification gate the
-deployment configured, so under `strict` the new account holds an access token
-that `POST /auth/login` would have refused it. That is tracked as a defect in
-[#21](https://github.com/nik2208/awesome-go-auth/issues/21) and recorded
-provisionally as `register-issues-a-session` in [README.md](README.md) so the
-difference is visible on the wire contract while the issue is open; when #21
-lands the behaviour changes and the entry is retired.
+Whether a successful `POST /auth/register` also opens a session is
+`Config.IssueSessionOnRegister`, off by default since 0.13.0 — see
+[`IssueSessionOnRegister`](#issuesessiononregister).
+
+### Closing public registration — `HTTPConfig.ClosedRegistration`
+
+An invite-only deployment keeps `Service.Register` and takes the anonymous
+route off the wire:
+
+```go
+cfg := auth.DefaultHTTPConfig()
+cfg.ClosedRegistration = true
+nethttp.MountWithConfig(mux, a, cfg)
+
+// the host still creates accounts: an invitation it redeems, an admin action
+user, _, err := a.Register(ctx, auth.RegisterInput{Email: invitee, Password: initial, TenantID: tenant})
+```
+
+With the flag set, on all four adapters:
+
+| Surface | Answer |
+| --- | --- |
+| `POST <prefix>/register` | not registered: the router's `404` (gin, chi and echo write their own bodies) |
+| `GET <prefix>/ui/config` | `features.register: false` |
+| the built-in UI | the injected config carries the same `false`, so `login.html` hides its "Sign up" link; `<prefix>/ui/register` is still served, as the reference serves it without a hook |
+| `GET <prefix>/openapi.json` | no `/register` path item (`OpenAPIInfo.ClosedRegistration`, set by `(*nethttp.Adapter).OpenAPIInfo()`) |
+| `Service.Register`, `Auth.Register` | unchanged: callable by the host |
+
+This is the reference's deployment without `onRegister`, which mounts no
+`/register` and reports `features.register: false` (`auth.router.ts:712-715`,
+`ui.router.ts:115`). Unset — the default — the route is mounted as in every
+earlier release; the deviation `register-route-is-always-mounted` in
+[README.md](README.md) records that difference in default.
+`HTTPConfig.RegisterMounted()` is the condition the adapters read: neither
+`ResourceServer` nor `ClosedRegistration` set.
+
+> **It closes one of two self-registration paths.** An OAuth callback creates an
+> account for a provider identity nothing here knows yet whenever
+> `OAuthProvisioning.AutoCreate` is on, and it is on in
+> `DefaultOAuthProvisioning`. A deployment that wants accounts created only by
+> its own hand sets `AutoCreate: false` as well — the callback then answers
+> `403 OAUTH_USER_NOT_PROVISIONED` — or configures no provider. Magic-link and
+> SMS logins create nothing; they answer only for an existing account. The
+> deprecated `MCPServer` calls `Service.Register` directly and must not be
+> mounted.
 
 ---
 
@@ -2823,6 +2857,7 @@ type OpenAPIInfo struct {
     Title, Description, Version, ServerURL string
     APIPrefix string // must match the mount; empty means DefaultAPIPrefix ("/auth")
     ResourceServer bool // must match HTTPConfig.ResourceServer
+    ClosedRegistration bool // must match HTTPConfig.ClosedRegistration
     IDProvider bool     // add the JWKS route     — set it when the Auth was built WithIDP
     JWKSPath   string   // where it is served; must match IDPConfig.JWKSPath
     OIDC       bool     // add the four OIDC ones — set it when the Auth was built WithIDP
@@ -2847,6 +2882,8 @@ envelope, the per-route error catalog entries, the `X-Auth-Strategy` and
 paths the server does not serve. Set `ResourceServer` to whatever you passed as
 `HTTPConfig.ResourceServer`: it drops the nineteen credential operations the adapters
 then leave unmounted (see [Resource server mode](#resource-server-mode)). Set
+`ClosedRegistration` to whatever you passed as `HTTPConfig.ClosedRegistration`: it
+drops `POST /register`, which the adapters then leave unmounted. Set
 `IDProvider` and `OIDC` when the `Auth` was built `WithIDP`: they add the JWKS
 route and the four OIDC endpoints the adapters then mount — `ResourceServer`
 alongside `OIDC` drops `/authorize` and `/token` again, because the adapters do
@@ -2932,8 +2969,8 @@ only when you serve the document from a route of your own.
 `(*nethttp.Adapter).OpenAPIHandler` and `.SwaggerUIHandler` build them from the
 mount, and `(*nethttp.Adapter).OpenAPIInfo()` returns the `OpenAPIInfo` that
 describes it — the value to start from in that case. Its `IDProvider`,
-`JWKSPath` and `ResourceServer` are read off the mount and cannot disagree with
-it; its `APIPrefix` is the documented base path, which is the mount prefix
+`JWKSPath`, `ResourceServer` and `ClosedRegistration` are read off the mount and
+cannot disagree with it; its `APIPrefix` is the documented base path, which is the mount prefix
 unless `Docs.BasePath` moved the description.
 
 ---
@@ -2999,7 +3036,7 @@ the wiring rather than configured:
 
 | Key | True when | Reference |
 | --- | --- | --- |
-| `register` | always — this port always mounts `POST <prefix>/register`, where the reference mounts it only with an `onRegister` hook and reports that same condition; the route and the flag together are registered as the deviation `register-route-is-always-mounted` in [README.md](README.md) | `ui.router.ts:115`, `auth.router.ts:712-715` |
+| `register` | `HTTPConfig.ClosedRegistration` is **not** set — the adapters then mount `POST <prefix>/register`; the reference mounts it only with an `onRegister` hook and reports that same condition. The flag does not follow `ResourceServer`, as the reference's does not follow its resource-server mode. The default (mounted, `true`) is registered as the deviation `register-route-is-always-mounted` in [README.md](README.md); see [Closing public registration](#closing-public-registration--httpconfigclosedregistration) | `ui.router.ts:115`, `auth.router.ts:712-715` |
 | `magicLink` | `Config.SendMagicLink` is set | `:116` |
 | `sms` | `Config.SendSMSCode` is set | `:117` |
 | `google` / `github` | `WithOAuth` wired a provider of that name | `:118-119` |
@@ -3502,6 +3539,9 @@ All four adapters provide the same package-level functions:
     `Tools.Path`.
   - Under `ResourceServer`, the credential routes are left out
     (`auth.ResourceServerGatedRoutes`).
+  - Under `ClosedRegistration`, `POST /register` is left out
+    (`HTTPConfig.RegisterMounted`); see
+    [Closing public registration](#closing-public-registration--httpconfigclosedregistration).
 - `Middleware(a)` verifies this instance's HS256 access token and puts the user
   in the context.
 - `ResourceServerMiddleware(a, cfg auth.ResourceServerConfig)` verifies a
