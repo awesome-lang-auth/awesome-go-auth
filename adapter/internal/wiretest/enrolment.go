@@ -478,6 +478,30 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 
 	// ── everything else answers as it did ──────────────────────────────────────
 
+	t.Run("a user an outer middleware injects is no credential on the mount", func(t *testing.T) {
+		// On main the two routes sat behind the access middleware, which
+		// demanded the request's own access token whatever an outer
+		// middleware had put in the context. The adapter's own mount keeps
+		// demanding it under either setting: a host that wraps the whole mux
+		// in its own authentication does not thereby enrol its principal on
+		// these routes.
+		for _, enrol := range []bool{false, true} {
+			t.Run(fmt.Sprintf("EnrolOnLogin=%v", enrol), func(t *testing.T) {
+				env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithEnrolOnLogin(enrol))
+				user, _ := env.Seed("outer@example.com")
+				inner := env.Handler
+				outer := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					inner.ServeHTTP(w, r.WithContext(auth.ContextWithUser(r.Context(), user)))
+				})
+				for _, route := range []string{"/2fa/setup", "/2fa/verify-setup"} {
+					rec := httptest.NewRecorder()
+					outer.ServeHTTP(rec, env.Request(http.MethodPost, route, map[string]any{"secret": "JBSWY3DPEHPK3PXP", "token": "000000"}))
+					AssertError(t, rec, http.StatusForbidden, "No access token provided", "")
+				}
+			})
+		}
+	})
+
 	t.Run("a request with no enrolment token answers as before", func(t *testing.T) {
 		// Behind the middleware (EnrolOnLogin off) or authenticating
 		// themselves (on), the two routes answer a request that carries no

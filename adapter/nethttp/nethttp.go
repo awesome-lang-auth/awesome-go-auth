@@ -266,15 +266,26 @@ func (a *Adapter) mountCredentialRoutes(mux *http.ServeMux, prefix string) {
 // auth.HTTPConfig.RateLimiter for why the other two are in this order.
 // enrolmentGate is what the two enrolment routes sit behind inside guard: the
 // access middleware when Config.EnrolOnLogin is off, exactly as before the
-// option existed, and nothing when it is on, because the handlers then take
-// the enrolment token too and authenticate themselves. EnrolmentGate exposes
-// it to the chi adapter, which mounts the same handlers.
+// option existed; and when it is on, a marker that tells the handlers to
+// authenticate the request themselves, because they then take the enrolment
+// token too. The marker is what keeps a user an outer middleware put in the
+// request context from standing in for the credential the access middleware
+// used to demand on these routes: behind the gate, only the request's own
+// credential counts. EnrolmentGate exposes it to the chi adapter, which mounts
+// the same handlers.
 func (a *Adapter) enrolmentGate(h http.Handler) http.Handler {
 	if a.auth.EnrolOnLogin() {
-		return h
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), selfAuthenticatedKey{}, true)))
+		})
 	}
 	return a.Middleware()(h)
 }
+
+// selfAuthenticatedKey marks a request enrolmentGate let through under
+// Config.EnrolOnLogin: the enrolment handlers authenticate it from its own
+// credential and ignore any user already in its context.
+type selfAuthenticatedKey struct{}
 
 // EnrolmentGate returns the middleware Mount puts between guard and
 // TwoFactorSetup or TwoFactorVerifySetup: Middleware when Config.EnrolOnLogin

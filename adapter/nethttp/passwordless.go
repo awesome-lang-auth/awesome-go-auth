@@ -230,9 +230,16 @@ func (a *Adapter) SMSVerify(w http.ResponseWriter, r *http.Request) {
 // it. Otherwise the request authenticates itself, through
 // auth.Auth.TOTPEnrolmentCaller: an access token, or under
 // Config.EnrolOnLogin the enrolment token of a 2FA_SETUP_REQUIRED answer.
+//
+// Behind the adapter's own mount under Config.EnrolOnLogin (enrolmentGate)
+// the context is not consulted at all: there no Middleware runs, so a user in
+// it was put there by something outside the mount, and on main these routes
+// demanded the request's own access token whatever an outer middleware said.
 func (a *Adapter) enrolmentCaller(r *http.Request, tempToken string) (auth.TOTPEnrolmentCaller, auth.HTTPError, bool) {
-	if user, ok := UserFromContext(r.Context()); ok {
-		return auth.TOTPEnrolmentCaller{User: user}, auth.HTTPError{}, true
+	if selfAuthenticated, _ := r.Context().Value(selfAuthenticatedKey{}).(bool); !selfAuthenticated {
+		if user, ok := UserFromContext(r.Context()); ok {
+			return auth.TOTPEnrolmentCaller{User: user}, auth.HTTPError{}, true
+		}
 	}
 	return a.auth.TOTPEnrolmentCaller(r.Context(), r, tempToken)
 }

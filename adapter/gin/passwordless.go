@@ -193,8 +193,13 @@ func (ad *Adapter) smsVerify(c *gin.Context) {
 // request — an access token, or under Config.EnrolOnLogin the enrolment token
 // of a 2FA_SETUP_REQUIRED answer.
 func (ad *Adapter) enrolmentCaller(c *gin.Context, tempToken string) (auth.TOTPEnrolmentCaller, auth.HTTPError, bool) {
-	if user, ok := UserFromContext(c); ok {
-		return auth.TOTPEnrolmentCaller{User: user}, auth.HTTPError{}, true
+	// Only Middleware puts a user there, and the routes sit behind it only
+	// with Config.EnrolOnLogin off; with it on, the request's own credential
+	// decides.
+	if !ad.auth.EnrolOnLogin() {
+		if user, ok := UserFromContext(c); ok {
+			return auth.TOTPEnrolmentCaller{User: user}, auth.HTTPError{}, true
+		}
 	}
 	return ad.auth.TOTPEnrolmentCaller(c.Request.Context(), c.Request, tempToken)
 }
