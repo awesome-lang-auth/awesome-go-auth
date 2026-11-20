@@ -431,6 +431,31 @@ func (a *Auth) adminFindUser(ctx context.Context, id string) (User, error) {
 	return a.service.users.GetUserByID(ctx, id, "")
 }
 
+// adminUserTenant is the tenant a console write addresses the user id under:
+// the tenant UserLookupStore finds the user in, so that DELETE
+// <admin>/api/users/:id and POST <admin>/users/:id/promote with method=flag
+// reach the row GET <admin>/api/users listed — in any tenant, as the
+// reference's tenant-less deleteUser(id) and update(id, patch) do.
+//
+// Everything else is the empty tenant, which is what both writes passed before
+// UserLookupStore existed: a store without the capability, and a lookup that
+// fails. The second is deliberate. A miss means no tenant holds the id, so the
+// write is handed the id as it always was and the store answers for it — the
+// route's pinned answer for an unknown or already-deleted id (a store that
+// reports not-found is the route's 500) does not move, and a store whose
+// lookup is down is not told to write somewhere new.
+func (a *Auth) adminUserTenant(ctx context.Context, id string) string {
+	lookup, ok := a.service.users.(UserLookupStore)
+	if !ok {
+		return ""
+	}
+	user, err := lookup.FindUserByID(ctx, id)
+	if err != nil {
+		return ""
+	}
+	return user.TenantID
+}
+
 // adminGetUserMetadata is GET <admin>/api/users/:id/metadata (:855-863). The
 // body is the metadata object itself, unwrapped, exactly as res.json(metadata)
 // sends it.

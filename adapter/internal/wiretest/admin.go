@@ -218,6 +218,7 @@ func testAdmin(t *testing.T, mount Mounter) {
 	t.Run("Uploads", func(t *testing.T) { testAdminUploads(t, mount) })
 	t.Run("Docs", func(t *testing.T) { testAdminDocs(t, mount) })
 	t.Run("Promote", func(t *testing.T) { testAdminPromote(t, mount) })
+	t.Run("MachineAccess", func(t *testing.T) { testAdminMachineAccess(t, mount) })
 	t.Run("RouteSet", func(t *testing.T) { testAdminRouteSet(t, mount) })
 	t.Run("DocumentSet", func(t *testing.T) { testAdminDocumentSet(t, mount) })
 }
@@ -1793,9 +1794,10 @@ func testAdminDeleteUser(t *testing.T, mount Mounter) {
 	t.Run("a second delete is the store's answer and not the route's", func(t *testing.T) {
 		env := newAdminEnv(t, mount, adminEnvOptions{admin: adminOpenOptions(), seeds: seeds})
 		adminAssertSuccess(t, env, http.MethodDelete, auth.AdminUsersPath+"/a-user", "")
-		// The route is unconditional — it looks nothing up, answers no 404 and
-		// reports nothing about what it did. What a repeat delete gets therefore
-		// depends entirely on the store: the reference's `DELETE … WHERE id = ?`
+		// The route is unconditional — it looks up nothing but the tenant
+		// (UserLookupStore, which misses for a deleted id and so leaves the empty
+		// tenant), answers no 404 and reports nothing about what it did. What a
+		// repeat delete gets therefore depends entirely on the store: the reference's `DELETE … WHERE id = ?`
 		// is a silent no-op and answers 200, and this package's MemoryUserStore
 		// reports not-found, which lands in the route's own 500. Reading a
 		// not-found sentinel here to synthesise success would invent a

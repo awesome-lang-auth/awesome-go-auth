@@ -1673,9 +1673,10 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"interfaces and not only here.",
 			},
 			{
-				ID:      "admin-user-detail-spans-tenants-only-through-a-lookup-store",
-				Title:   "`GET <admin>/api/users/{id}` reaches a user in another tenant only through `UserLookupStore`",
-				Surface: "`HTTPConfig.Admin`: `GET <admin>/api/users/{id}`",
+				ID:    "admin-user-detail-spans-tenants-only-through-a-lookup-store",
+				Title: "`GET <admin>/api/users/{id}` and the two user writes reach a user in another tenant only through `UserLookupStore`",
+				Surface: "`HTTPConfig.Admin`: `GET <admin>/api/users/{id}`, `DELETE <admin>/api/users/{id}` and " +
+					"`POST <admin>/users/{id}/promote` with `method=flag`",
 				Behaviour: "Resolves the id through `auth.UserLookupStore.FindUserByID` when the " +
 					"configured user store implements it — by id alone, across every tenant, " +
 					"which is how `GET <admin>/api/users` lists — and answers the reference's " +
@@ -1684,7 +1685,11 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"literal, so a user stored under a non-empty tenant is " +
 					"`404 {\"error\": \"User not found\"}` although the listing shows it. A " +
 					"store that holds one id under two tenants answers an error for that id " +
-					"rather than either record, and the route answers that `404` too.",
+					"rather than either record, and the route answers that `404` too. The two " +
+					"writes resolve the same way before they write: the delete and the flag go to " +
+					"the tenant the lookup found the user in, and to the empty tenant when the " +
+					"store has no lookup or no tenant holds the id — so an unknown id still gets " +
+					"the store's own answer, a `500` from `MemoryUserStore`.",
 				Reference: "`findById(id)` is a mandatory `IUserStore` method and carries no tenant " +
 					"(`user-store.interface.ts:5`). The route calls it with the path parameter " +
 					"and answers `404` only for `null` (`admin.router.ts:789-800`). An id is the " +
@@ -1719,18 +1724,59 @@ func CompatibilityNotes() APICompatibilityNotes {
 							"to have one.",
 					},
 					{
-						Label: "What this does not cover",
+						Label: "What this covers, and what it does not",
 						Text: "`DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote` " +
-							"with `method=flag` still pass the empty tenant whatever the store " +
-							"implements, so in a multi-tenant deployment neither reaches a user " +
-							"the listing shows under another tenant. Both are writes, and " +
-							"resolving a write's row through this seam changes which row it " +
-							"reaches; neither has been moved onto it yet. " +
-							"`GET <admin>/api/users/{id}/roles` also passes the empty tenant and " +
+							"with `method=flag` resolve the tenant through this seam since they were " +
+							"moved onto it, so in a multi-tenant deployment both reach the user the " +
+							"listing shows; only the tenant is looked up, and neither route answers a " +
+							"`404` of its own. The other user-scoped admin writes still pass the empty " +
+							"tenant. `GET <admin>/api/users/{id}/roles` also passes the empty tenant and " +
 							"is not a case of this at all: its tenant is the scope of a role " +
 							"assignment, and the console's own writers assign in the empty scope.",
 					},
 				},
+			},
+			{
+				ID:    "admin-machine-access-is-a-host-seam",
+				Title: "A host can admit a machine caller to the admin API, ahead of the session policy, and every such call is audited",
+				Surface: "`HTTPConfig.Admin.MachineAccess`: every route behind `AdminGuard.Protect`, and " +
+					"`identity.admin.machine.access` on the event bus",
+				Behaviour: "`AdminOptions.MachineAccess`, a `func(*http.Request) (principal string, ok bool)` the " +
+					"host supplies, is asked first on every guarded admin request, before the session " +
+					"policy and before the legacy secret. `ok` with a non-empty principal grants the " +
+					"request outright — no token, no cookie, no user store and no policy are read — " +
+					"`AdminMachinePrincipalFromContext` hands the principal to the handler, and " +
+					"`identity.admin.machine.access` is raised with the principal, the method and the " +
+					"path. `ok` false, and `ok` with an empty principal, leave the request to the " +
+					"guard exactly as if the function were absent. The machine path reads no cookie, " +
+					"so a machine caller needs no CSRF pair, and the function is not asked about a " +
+					"request a browser originated — an `Origin` header, or `Sec-Fetch-Site` other than " +
+					"`none` — which meets the session policy instead. The event is outside the " +
+					"`identity.*` vocabulary `EventNames` returns, and with no event bus each grant is " +
+					"logged through `Config.Logger` instead. Nil, the default, is the reference's guard.",
+				Reference: "Offers two ways into the admin router: the deprecated `adminSecret`, one " +
+					"shared bearer string compared for every caller with no identity behind it, and " +
+					"the session policies, which judge a user's token. A service has to be a user " +
+					"with a password and a session to use the second, and nothing in either is " +
+					"audited per caller.",
+				Citations: []string{"admin.router.ts:252-266", "admin.router.ts:269-395"},
+				Why: "Back-office services provision and remove accounts through the admin API, and " +
+					"the reference gives them nothing better than a shared secret or a human's " +
+					"account kept in a vault — the interim a deployment otherwise has to run, with a " +
+					"second factor it has to automate. A host that already authenticates its services " +
+					"at the edge — an IAM-signed request at an API gateway, a mutual-TLS peer, a " +
+					"scoped key — needs only a place to say so, and the guard is that place: ahead of " +
+					"the policy, so a service is never mistaken for a person, and with an audit record " +
+					"naming the caller, so an admin action is attributable to the service that took " +
+					"it. The verification is left to the host because it depends on infrastructure " +
+					"this package never sees.",
+				Notes: []DeviationNote{{
+					Label: "Mounting a console for machines only",
+					Text: "`HTTPConfig.AdminMounted` still requires an `AccessPolicy` or a `Secret`; " +
+						"`MachineAccess` alone mounts nothing. A deployment whose console no person " +
+						"should enter configures a policy that admits no session — " +
+						"`AdminPredicate` returning false — beside the function.",
+				}},
 			},
 			{
 				ID:      "tools-router-requires-an-explicit-guard-decision",
