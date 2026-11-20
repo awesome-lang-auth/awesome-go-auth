@@ -176,7 +176,7 @@ func TestTempTokenExpiresWithItsTTL(t *testing.T) {
 func TestTempTokenIsNotASessionCredential(t *testing.T) {
 	svc := newTestSvc(t)
 	user := seedUser(t, svc, "tempscope@example.com")
-	tokens, err := svc.newSessionTokens(context.Background(), user)
+	tokens, err := svc.newSessionTokens(context.Background(), user, authBy(AMRPassword))
 	if err != nil {
 		t.Fatalf("session tokens: %v", err)
 	}

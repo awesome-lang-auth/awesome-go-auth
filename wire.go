@@ -487,7 +487,7 @@ type HTTPConfig struct {
 	//
 	// It changes nothing else: the routes that stay are unaffected, and the
 	// bearer verification itself is ResourceServerMiddleware, which a host
-	// mounts on its own routes. The reference gates six of the nineteen
+	// mounts on its own routes. The reference gates six of the nineteen it has
 	// (auth.router.ts:510, :541); gating all of them is the
 	// resource-server-gates-all-credential-routes deviation.
 	ResourceServer bool

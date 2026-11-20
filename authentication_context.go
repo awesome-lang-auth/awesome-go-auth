@@ -1,0 +1,420 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+)
+
+// This file is the authentication context of a session: how its user was
+// proved, and when a second factor was last presented — recorded on the
+// Session when it opens, and carried on every access token it mints as three
+// claims a resource server can decide on without asking anybody:
+//
+//	amr       the authentication methods, RFC 8176 values: ["pwd"],
+//	          ["pwd","otp","mfa"], ["email"], ["oauth"], …
+//	auth_time when the session was opened (OIDC Core §2), a NumericDate
+//	mfa_at    when a second factor was last presented, a NumericDate; absent
+//	          when the session never presented one
+//
+// It has no counterpart in the reference, whose tokens say nothing about how
+// they were obtained (buildPayload, auth.router.ts:378-384): a session opened
+// by a password and one opened by a password and a TOTP code carry the same
+// payload, so a route that wants a recent second factor before a privileged
+// action has nothing to read. That is what this adds, and it is registered as
+// the deviation access-tokens-carry-the-authentication-context.
+//
+// Three properties make the claims worth trusting, and each is pinned by a
+// test:
+//
+//   - They are reserved (reservedClaimNames): Config.BuildTokenClaims, and so a
+//     ClaimsWebhook, cannot set them on any token, and UserFieldClaims refuses
+//     to map onto them — the protection the session claims already had.
+//   - They come from the session row and nowhere else. A refresh carries them
+//     forward unchanged, because Refresh mints from the row it has just read;
+//     POST <prefix>/2fa/step-up is the one route that moves mfa_at, and it
+//     writes only those two fields, through SessionAuthenticationStore.
+//   - mfa_at is written only where a second factor was actually verified: POST
+//     <prefix>/2fa/verify, the step-up branches of /sms/verify and
+//     /magic-link/verify, and the step-up route. A login that skips the second
+//     factor by design — the OAuth callback, and the admin console's login,
+//     whose token is a different type and carries none of the three — never
+//     has one.
+
+// The amr values a session records. The first four are registered in RFC 8176
+// §2; AMREmail and AMROAuth are this library's own names for the two methods
+// that registry has no entry for — a link delivered to the user's mailbox, and
+// a login federated to an OAuth provider.
+const (
+	// AMRPassword is a password login: POST <prefix>/login, a registration that
+	// opens a session, and the IdP's /authorize.
+	AMRPassword = "pwd"
+	// AMROTP is a TOTP code: POST <prefix>/2fa/verify and the step-up route.
+	AMROTP = "otp"
+	// AMRSMS is a code delivered by SMS: POST <prefix>/sms/verify.
+	AMRSMS = "sms"
+	// AMRMFA says that more than one of the factors above was presented. It is
+	// what a check for a second factor looks for, together with mfa_at.
+	AMRMFA = "mfa"
+	// AMREmail is a link delivered by email: POST <prefix>/magic-link/verify,
+	// and the account-link token of POST <prefix>/link-verify.
+	AMREmail = "email"
+	// AMROAuth is a login federated to an OAuth provider: the callback of
+	// GET <prefix>/oauth/{provider}.
+	AMROAuth = "oauth"
+)
+
+// The three claim names. They are reserved: see reservedClaimNames.
+const (
+	ClaimAMR      = "amr"
+	ClaimAuthTime = "auth_time"
+	ClaimMFAAt    = "mfa_at"
+)
+
+// deleteAuthContextClaims removes from claims the three claim names above in
+// every spelling encoding/json folds onto them (isReservedClaim says why): the
+// IdP pair, which carries no authentication context, strips them from the
+// hook's result this way.
+func deleteAuthContextClaims(claims map[string]any) {
+	for name := range claims {
+		if strings.EqualFold(name, ClaimAMR) || strings.EqualFold(name, ClaimAuthTime) || strings.EqualFold(name, ClaimMFAAt) {
+			delete(claims, name)
+		}
+	}
+}
+
+// sessionAuth is how a session about to be opened was authenticated. Every
+// caller of issueSession states one, so a new way of opening a session cannot
+// compile without saying what it proved.
+type sessionAuth struct {
+	// methods are the amr values, in the order the factors were presented.
+	methods []string
+	// secondFactor is true when one of methods was verified as a second factor
+	// on top of a first: AMRMFA is appended and MFAAt is the opening time.
+	secondFactor bool
+}
+
+// authBy is a session proved by one factor.
+func authBy(method string) sessionAuth { return sessionAuth{methods: []string{method}} }
+
+// authBySecondFactor is a session proved by a first factor and then a second.
+// Every step-up token this library mints is minted after a password verified
+// (Service.LoginWithChallenge), so first is AMRPassword at every caller today.
+func authBySecondFactor(first, second string) sessionAuth {
+	return sessionAuth{methods: []string{first, second}, secondFactor: true}
+}
+
+// unknownAuth is a session whose opener cannot say how its user was proved —
+// Service.IssueTokensForUser, a public method that takes the proof on trust.
+// Its tokens carry no amr and no mfa_at rather than a guess.
+var unknownAuth = sessionAuth{}
+
+// apply records a on a session about to be created at now.
+func (a sessionAuth) apply(session *Session, now time.Time) {
+	if len(a.methods) == 0 {
+		return
+	}
+	methods := slices.Clone(a.methods)
+	if a.secondFactor {
+		methods = appendMethod(methods, AMRMFA)
+		at := now
+		session.MFAAt = &at
+	}
+	session.AuthMethods = methods
+}
+
+// appendMethod appends method unless it is already there, keeping the order in
+// which the factors were presented.
+func appendMethod(methods []string, method string) []string {
+	if slices.Contains(methods, method) {
+		return methods
+	}
+	return append(methods, method)
+}
+
+// sessionAuthClaims is what an access token of session says about how it was
+// authenticated: auth_time always (the session's CreatedAt), amr when the
+// session recorded its methods, mfa_at when it presented a second factor. A
+// zero CreatedAt — a store that does not persist it — yields no auth_time
+// rather than year one.
+func sessionAuthClaims(session Session) map[string]any {
+	claims := make(map[string]any, 3)
+	if !session.CreatedAt.IsZero() {
+		claims[ClaimAuthTime] = session.CreatedAt.Unix()
+	}
+	if len(session.AuthMethods) > 0 {
+		claims[ClaimAMR] = slices.Clone(session.AuthMethods)
+	}
+	if session.MFAAt != nil {
+		claims[ClaimMFAAt] = session.MFAAt.Unix()
+	}
+	return claims
+}
+
+// SessionAuthenticationStore records a second factor on a session without
+// rewriting the rest of its row. It is optional; POST <prefix>/2fa/step-up
+// needs it and answers 501 without it.
+//
+// It is a seam of its own rather than UpdateSession because the step-up route
+// races the two routes that write the same row. A step-up that read the row,
+// verified the code and wrote the whole row back would put back a refresh-token
+// hash a concurrent POST /refresh had just rotated out — reviving a spent
+// refresh token — or clear the RevokedAt a concurrent logout had just set,
+// resurrecting the session. Writing only the two fields closes both.
+//
+// What an implementor owes, each method as one atomic operation:
+//
+//   - RecordSecondFactor: the session with sessionID that is not revoked has
+//     its AuthMethods replaced by methods, its MFAAt set to at and its
+//     StepUpAttempts reset to zero; nothing else changes. The updated session
+//     is returned.
+//   - RecordStepUpAttempt: the session with sessionID that is not revoked has
+//     its StepUpAttempts incremented and, when the new count exceeds limit,
+//     its RevokedAt set to at, in the same step; nothing else changes. The
+//     updated session is returned, so the caller reads the count and the
+//     revocation off it. The step-up counts an attempt before it checks the
+//     code, and counting and revoking in one step is what makes the budget
+//     hold against concurrent guesses: each one gets a count of its own, and
+//     none past the limit is checked at all.
+//   - For both, a session that is not there is ErrSessionNotFound, and a
+//     revoked one is ErrSessionRevoked — decided in the same atomic step as the
+//     write, so that a revocation that wins the race is never undone. On
+//     DynamoDB each is one UpdateItem with a condition on the item existing
+//     and carrying no revocation, and ReturnValues ALL_NEW: the attempt an
+//     ADD, and the revocation a second conditional UpdateItem the method
+//     issues when the count came back over the limit.
+//
+// A store that implements it also persists Session.TOTPBinding and
+// Session.StepUpAttempts with the rest of the row, as it does AuthMethods and
+// MFAAt: the step-up reads all four.
+//
+// MemorySessionStore implements it.
+type SessionAuthenticationStore interface {
+	RecordSecondFactor(ctx context.Context, sessionID string, methods []string, at time.Time) (Session, error)
+	RecordStepUpAttempt(ctx context.Context, sessionID string, limit int, at time.Time) (Session, error)
+}
+
+// StepUpFailureLimit is how many codes POST <prefix>/2fa/step-up checks on one
+// session without accepting one: the wrong code that reaches it revokes the
+// session, and no attempt past it is checked. A step-up presents a TOTP code
+// on the strength of an access token alone, so without a budget the route
+// would be an oracle that whoever holds a stolen token could query for as long
+// as the token lives — with three codes valid at any time out of a million,
+// enough guesses find one. Five in a row is more than a person mistyping
+// makes, and gives a guesser odds of about one in 67,000 before the session,
+// and the stolen token's refresh, are gone. An accepted code resets the count.
+const StepUpFailureLimit = 5
+
+// totpBinding is the Session.TOTPBinding of a session user opens now: a keyed
+// fingerprint of the TOTP secret the user has enrolled, or empty when there is
+// none. Keyed with Config.Secret, so the session store holds nothing an
+// offline guess at a weak secret could be checked against; a rotation of
+// Config.Secret therefore ends every session's ability to step up, which then
+// takes a fresh sign-in.
+func (s *Service) totpBinding(user User) string {
+	if !user.IsTOTPEnabled || strings.TrimSpace(user.TOTPSecret) == "" {
+		return ""
+	}
+	return sign("awesome-go-auth/session-totp-binding/v1\x00"+user.TOTPSecret, s.cfg.Secret)
+}
+
+// StepUpTOTP re-verifies the TOTP factor of the session an access token
+// belongs to, records it — mfa_at moves to now, and amr gains AMROTP and
+// AMRMFA — and mints a fresh access token carrying the new claims. It is POST
+// <prefix>/2fa/step-up.
+//
+// Only the access token is minted: the refresh token and the session's lifetime
+// are untouched, and the next refresh carries the new mfa_at forward because it
+// mints from the row this call wrote. The returned AuthTokens has no
+// RefreshToken.
+//
+// The session is validated whatever Config.SessionCheckOn says — it is about to
+// be written to — so a revoked one is ErrSessionRevoked, and a missing,
+// expired or mismatched one ErrInvalidToken. The user is re-read: no TOTP
+// enrolled is ErrInvalidCredentials, a user the store no longer has
+// ErrUserNotFound. A session store without SessionAuthenticationStore, or with
+// no way to look a session up by id, is ErrFeatureNotSupported.
+//
+// The factor must be the one the session is bound to (Session.TOTPBinding):
+// the secret the user had enrolled when the session opened. A factor enrolled
+// since — a first one, or one that replaced it — is ErrReauthenticationRequired
+// whatever code comes with it, because whoever holds the session's access
+// token can enrol one, and a code of it proves nothing the token did not. The
+// same answer is given to a session that recorded no binding at all: one whose
+// user had no factor when it opened, one Service.IssueTokensForUser opened,
+// and one a store did not persist the binding for. Its user signs in again.
+//
+// Every attempt that gets that far counts against the session's budget before
+// its code is checked (SessionAuthenticationStore.RecordStepUpAttempt), and an
+// accepted code resets the count. A wrong code is ErrInvalidCode; the wrong
+// code that reaches StepUpFailureLimit revokes the session and is
+// ErrSessionRevoked, as is every step-up after it, and an attempt the budget
+// no longer covers is refused unchecked. The code is checked as /2fa/verify
+// checks it, with the same tolerance and, as there, no replay cache: a code
+// accepted once is accepted again within its window.
+//
+// It raises no event. A step-up is not a login, and neither tree has a
+// publication point for it.
+func (s *Service) StepUpTOTP(ctx context.Context, accessToken, code string) (AuthTokens, error) {
+	claims, err := s.parseToken(accessToken, "access")
+	if err != nil {
+		return AuthTokens{}, err
+	}
+	if claims.Sid == "" {
+		return AuthTokens{}, ErrInvalidToken
+	}
+	recorder, ok := s.sessions.(SessionAuthenticationStore)
+	if !ok {
+		return AuthTokens{}, ErrFeatureNotSupported
+	}
+	session, supported, err := s.lookupSession(ctx, claims.Sid, claims.Sub, claims.Tid)
+	switch {
+	case !supported:
+		return AuthTokens{}, ErrFeatureNotSupported
+	case errors.Is(err, ErrSessionNotFound):
+		return AuthTokens{}, ErrInvalidToken
+	case err != nil:
+		return AuthTokens{}, fmt.Errorf("auth: step-up: read session: %w", err)
+	}
+	if err := s.validateSessionState(session, claims); err != nil {
+		return AuthTokens{}, err
+	}
+	user, err := s.users.GetUserByID(ctx, claims.Sub, claims.Tid)
+	if err != nil {
+		return AuthTokens{}, userLookupError(err)
+	}
+	if !user.IsTOTPEnabled || user.TOTPSecret == "" {
+		return AuthTokens{}, ErrInvalidCredentials
+	}
+	// Before the code is looked at, so that a factor the session is not bound
+	// to is never worth a guess, and never costs the session its budget either.
+	if session.TOTPBinding == "" || !secureEqual(session.TOTPBinding, s.totpBinding(user)) {
+		return AuthTokens{}, ErrReauthenticationRequired
+	}
+	// The attempt is counted before the code is checked, so that concurrent
+	// guesses cannot all be checked against the one try the budget has left:
+	// each gets a count of its own, and one past the limit revokes the session
+	// instead of being checked.
+	now := s.now()
+	attempt, err := recorder.RecordStepUpAttempt(ctx, session.ID, StepUpFailureLimit, now)
+	switch {
+	case errors.Is(err, ErrSessionRevoked):
+		return AuthTokens{}, ErrSessionRevoked
+	case errors.Is(err, ErrSessionNotFound):
+		return AuthTokens{}, ErrInvalidToken
+	case err != nil:
+		return AuthTokens{}, fmt.Errorf("auth: step-up: count attempt: %w", err)
+	case attempt.RevokedAt != nil:
+		s.logf("auth: step-up: session %q of user %q revoked: attempt %d is past the budget of %d", session.ID, user.ID, attempt.StepUpAttempts, StepUpFailureLimit)
+		return AuthTokens{}, ErrSessionRevoked
+	}
+	if !validateTOTPCode(user.TOTPSecret, code, now) {
+		if attempt.StepUpAttempts < StepUpFailureLimit {
+			return AuthTokens{}, ErrInvalidCode
+		}
+		// That was the last try the budget held: end the session now rather
+		// than at its next attempt. The count goes past the limit, which is
+		// what revokes; a session revoked meanwhile is just as ended.
+		if _, err := recorder.RecordStepUpAttempt(ctx, session.ID, StepUpFailureLimit, now); err != nil &&
+			!errors.Is(err, ErrSessionRevoked) && !errors.Is(err, ErrSessionNotFound) {
+			return AuthTokens{}, fmt.Errorf("auth: step-up: revoke after the last attempt: %w", err)
+		}
+		s.logf("auth: step-up: session %q of user %q revoked after %d wrong codes", session.ID, user.ID, StepUpFailureLimit)
+		return AuthTokens{}, ErrSessionRevoked
+	}
+	methods := appendMethod(appendMethod(slices.Clone(session.AuthMethods), AMROTP), AMRMFA)
+	updated, err := recorder.RecordSecondFactor(ctx, session.ID, methods, now)
+	switch {
+	case errors.Is(err, ErrSessionRevoked):
+		return AuthTokens{}, ErrSessionRevoked
+	case errors.Is(err, ErrSessionNotFound):
+		return AuthTokens{}, ErrInvalidToken
+	case err != nil:
+		return AuthTokens{}, fmt.Errorf("auth: step-up: record second factor: %w", err)
+	}
+	access, _, err := s.issueAccessToken(ctx, user, updated)
+	if err != nil {
+		return AuthTokens{}, err
+	}
+	return AuthTokens{AccessToken: access, ExpiresIn: s.cfg.AccessTokenTTL}, nil
+}
+
+// StepUpTOTP delegates to Service.StepUpTOTP.
+func (a *Auth) StepUpTOTP(ctx context.Context, accessToken, code string) (AuthTokens, error) {
+	return a.service.StepUpTOTP(ctx, accessToken, code)
+}
+
+// StepUpRoute is where POST <prefix>/2fa/step-up sits below the mount prefix.
+// Exported for the reason RegisterRoute-style constants are: the four adapters
+// mount it, the OpenAPI generator describes it and the conformance suite
+// replays it.
+const StepUpRoute = "/2fa/step-up"
+
+// CodeReauthenticationRequired is the code of HTTPErrReauthenticationRequired.
+const CodeReauthenticationRequired = "REAUTHENTICATION_REQUIRED"
+
+// HTTPErrReauthenticationRequired is POST <prefix>/2fa/step-up's answer for a
+// session that may not step up with the account's current factor
+// (ErrReauthenticationRequired). It is a 403 rather than a 401: the session is
+// still good for everything it was good for, and only a fresh sign-in — the
+// password and then this factor — yields one that can step up.
+var HTTPErrReauthenticationRequired = HTTPError{
+	Status:  http.StatusForbidden,
+	Message: "Sign in again to use this second factor",
+	Code:    CodeReauthenticationRequired,
+}
+
+// StepUpHTTPError maps a Service.StepUpTOTP failure. The credential failures
+// are the access gate's own answers — the route authenticates itself, as GET
+// /me does — and the factor failures are /2fa/verify's: no TOTP enrolled is
+// 400 "User not found or 2FA not set up", a wrong code 401 "Invalid TOTP code".
+// A factor the session is not bound to is 403 REAUTHENTICATION_REQUIRED, and
+// the wrong code that exhausts the session's budget is 401 SESSION_REVOKED.
+func StepUpHTTPError(err error) HTTPError {
+	switch {
+	case errors.Is(err, ErrReauthenticationRequired):
+		return HTTPErrReauthenticationRequired
+	case errors.Is(err, ErrSessionRevoked):
+		return HTTPErrSessionRevoked
+	case errors.Is(err, ErrInvalidToken):
+		return HTTPErrInvalidAccessToken
+	case errors.Is(err, ErrInvalidCode):
+		return HTTPErrInvalidTOTPCode
+	case errors.Is(err, ErrInvalidCredentials):
+		return HTTPErrTOTPNotSetUp
+	case errors.Is(err, ErrUserNotFound):
+		return HTTPErrUserNotFound
+	default:
+		return HTTPErrorFor(err)
+	}
+}
+
+// StepUpRequest is the body of POST <prefix>/2fa/step-up. The code member is
+// named totpCode, as on POST <prefix>/2fa/verify.
+type StepUpRequest struct {
+	TOTPCode string `json:"totpCode"`
+}
+
+// WriteAccessToken delivers a re-minted access token and nothing else: the
+// access cookie in cookie mode, or a top-level accessToken in bearer mode,
+// beside {"success":true}. It is WriteTokens for the one route that does not
+// rotate the refresh token, which WriteTokens would otherwise overwrite with an
+// empty cookie.
+func (c HTTPConfig) WriteAccessToken(w http.ResponseWriter, r *http.Request, status int, tokens AuthTokens) {
+	body := successBody(nil)
+	if IsBearerRequest(r) {
+		body["accessToken"] = tokens.AccessToken
+		WriteJSON(w, status, body)
+		return
+	}
+	cookies := c.Cookies
+	if cookies.AccessTokenMaxAge <= 0 && tokens.ExpiresIn > 0 {
+		cookies.AccessTokenMaxAge = tokens.ExpiresIn
+	}
+	cookies.SetAccessTokenCookie(w, tokens.AccessToken)
+	WriteJSON(w, status, body)
+}

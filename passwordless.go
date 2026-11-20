@@ -147,7 +147,10 @@ func (s *Service) VerifyMagicLinkForUser(ctx context.Context, in MagicLinkVerify
 	if user.ID != userID {
 		return User{}, AuthTokens{}, ErrMagicLinkOwnerMismatch
 	}
-	tokens, err := s.CompleteMagicLinkLogin(ctx, user)
+	// The link is the second factor of a password login here, not a login of
+	// its own: the step-up token that named userID is only ever minted after
+	// the password verified.
+	tokens, err := s.completeMagicLinkLogin(ctx, user, authBySecondFactor(AMRPassword, AMREmail))
 	if err != nil {
 		return User{}, AuthTokens{}, err
 	}
@@ -178,6 +181,14 @@ type TempTokenSubject struct {
 // IssueTempToken mints the step-up token a 2FA challenge hands the client. Its
 // lifetime is Config.TempTokenTTL, 5 minutes by default, matching the
 // reference's hardcoded '5m'.
+//
+// The token stands for a verified password. Every route that completes one —
+// POST <prefix>/2fa/verify and the step-up branches of /sms/verify and
+// /magic-link/verify — opens a session recording amr ["pwd", <factor>, "mfa"]
+// and an mfa_at, because the only caller in this package mints it after
+// Service.LoginWithChallenge verified the password. A host that calls this
+// after some other proof gets sessions that claim a password nobody
+// presented; mint it only where a password has just verified.
 func (s *Service) IssueTempToken(ctx context.Context, user User) (string, error) {
 	token, _, err := s.issueToken(ctx, user, "", tokenTypeTemp, s.cfg.TempTokenTTL)
 	return token, err

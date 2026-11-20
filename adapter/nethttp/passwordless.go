@@ -222,7 +222,7 @@ func (a *Adapter) SMSVerify(w http.ResponseWriter, r *http.Request) {
 		auth.WriteHTTPError(w, auth.HTTPErrUserIDRequired)
 		return
 	}
-	_, tokens, err := a.auth.VerifySMSCode(r.Context(), auth.SMSCodeVerifyInput{UserID: userID, TenantID: tenantID, Code: req.Code})
+	_, tokens, err := a.auth.VerifySMSCode(r.Context(), auth.SMSCodeVerifyInput{UserID: userID, TenantID: tenantID, Code: req.Code, SecondFactor: auth.TwoFactorMode(req.Mode)})
 	if err != nil {
 		auth.WriteHTTPError(w, auth.SMSVerifyHTTPError(err))
 		return
@@ -286,6 +286,28 @@ func (a *Adapter) TwoFactorVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.cfg.WriteTokens(w, r, http.StatusOK, tokens, nil)
+}
+
+// TwoFactorStepUp handles POST <prefix>/2fa/step-up: the signed-in user
+// presents a TOTP code again, the session records it (mfa_at moves to now) and
+// a fresh access token carrying the new claims is delivered — the access
+// cookie in cookie mode, a top-level accessToken in bearer mode. The refresh
+// token is left as it is. See auth.Service.StepUpTOTP.
+//
+// It sits behind Middleware like the other protected routes, so a request with
+// no usable access token is answered by the gate; the service then validates
+// the session again whatever SessionCheckOn says, because it writes to it.
+func (a *Adapter) TwoFactorStepUp(w http.ResponseWriter, r *http.Request) {
+	var req auth.StepUpRequest
+	if !auth.DecodeOptionalJSON(w, r, &req) {
+		return
+	}
+	tokens, err := a.auth.StepUpTOTP(r.Context(), auth.AccessTokenFromRequest(r), req.TOTPCode)
+	if err != nil {
+		auth.WriteHTTPError(w, auth.StepUpHTTPError(err))
+		return
+	}
+	a.cfg.WriteAccessToken(w, r, http.StatusOK, tokens)
 }
 
 // TwoFactorDisable handles POST <prefix>/2fa/disable.

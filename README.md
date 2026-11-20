@@ -66,12 +66,18 @@ func main() {
 - SMS OTP login (`SendSMSCode`, `VerifySMSCode`).
 - Mail and SMS delivery for both of the above via `Config.SendMagicLink` / `Config.SendSMSCode`, with built-in senders over an HTTP mailer or SMS gateway ([Delivery](README_DETAILED.md#delivery)).
 - TOTP 2FA (`SetupTOTP`, `VerifyTOTPSetup`, `VerifyTOTP`, `DisableTOTP`).
+- The authentication context on every access token — RFC 8176 `amr`,
+  `auth_time` and `mfa_at`, reserved so no claims hook can forge them, carried
+  through refresh, and exposed on the middleware's principal — plus
+  `POST <prefix>/2fa/step-up` to re-verify TOTP for a session before a
+  privileged action, accepting only the factor the session is bound to and
+  revoking the session after five wrong codes ([Authentication context](README_DETAILED.md#authentication-context--amr-auth_time-mfa_at-and-step-up)).
 - Email verification (`SendVerificationEmailToken`, `VerifyEmail`) and email change (`RequestEmailChange`, `ConfirmEmailChange`).
 - Session admin helpers (`ListSessions`, `RevokeSessionByID`, `CleanupExpiredSessions`).
 - User metadata store and service helpers.
 - Multi-tenant in-memory RBAC (`MemoryRolesPermissionsStore`) with roles and permissions.
 - In-memory tenant store (`MemoryTenantStore`) with user↔tenant membership.
-- Custom token claims via `Config.BuildTokenClaims`, written by hand or built from configuration with `StaticClaims`, `UserFieldClaims`, `ChainClaims` and the synchronous `ClaimsWebhook`; reflected under `customClaims` on `GET /me`. The hook may override the reference's six base claims (`sub`, `email`, `role`, `loginProvider`, `isEmailVerified`, `isTotpEnabled`); the session claims `sid`, `tid`, `jti`, `typ`, `iss`, `iat` and `exp` are reserved. It runs at mint time and on `/me`, never in the adapters' middleware ([Custom Claims](README_DETAILED.md#custom-claims)).
+- Custom token claims via `Config.BuildTokenClaims`, written by hand or built from configuration with `StaticClaims`, `UserFieldClaims`, `ChainClaims` and the synchronous `ClaimsWebhook`; reflected under `customClaims` on `GET /me`. The hook may override the reference's six base claims (`sub`, `email`, `role`, `loginProvider`, `isEmailVerified`, `isTotpEnabled`); the session claims `sid`, `tid`, `jti`, `typ`, `iss`, `iat` and `exp`, and the authentication context `amr`, `auth_time` and `mfa_at`, are reserved, in every spelling a case-insensitive JSON decoder reads as one of them. It runs at mint time and on `/me`, never in the adapters' middleware ([Custom Claims](README_DETAILED.md#custom-claims)).
 - API key service and HTTP middleware (`APIKeyService`, `APIKeyMiddleware`).
 - In-process event bus (`EventBus`) for event-driven integrations.
 - Extended storage interfaces and thread-safe in-memory implementations for all the above flows.
@@ -181,6 +187,72 @@ revision the whole contract was extracted from.
   `[UNTESTED]` there, so no shipped client depends on it. The cost is that the
   `tempToken` in a `2FA_SETUP_REQUIRED` answer cannot reach the enrolment
   routes, which sit behind the access-token gate.
+
+### Access tokens carry `amr`, `auth_time` and `mfa_at`, and `POST <prefix>/2fa/step-up` re-verifies the second factor
+
+`access-tokens-carry-the-authentication-context`
+
+- **Surface**: Every access token a session mints — `POST <prefix>/login`,
+  `/refresh`, `/2fa/verify`, `/sms/verify`, `/magic-link/verify`, the OAuth
+  callback, `/link-verify` and the IdP's `/token` — `POST <prefix>/2fa/step-up`,
+  and `Config.BuildTokenClaims`.
+- **This port**: The session records how its user was proved, and every access
+  token it mints carries that as three claims after the reserved ones: `amr`,
+  RFC 8176 values in the order the factors were presented (`["pwd"]` for a
+  password login, `["pwd","otp","mfa"]` after `/2fa/verify`, `sms` or `email` in
+  place of `otp` for the SMS and magic-link step-up, `["email"]` for a
+  magic-link login, `["oauth"]` for an OAuth one); `auth_time`, when the session
+  opened; and `mfa_at`, when a second factor was last presented — absent for a
+  session that never presented one, which includes the OAuth callback. A refresh
+  carries all three forward unchanged, the IdP's `refresh_token` grant too, and
+  `POST <prefix>/2fa/step-up` — `{"totpCode"}` with an access token —
+  re-verifies TOTP for the current session, moves `mfa_at` to now, adds `otp`
+  and `mfa` to `amr` and answers a fresh access token alone: the access cookie,
+  or `accessToken` under `X-Auth-Strategy: bearer`; a session store without
+  `SessionAuthenticationStore` answers `501`. The step-up accepts only the
+  factor the session is bound to — the TOTP secret its user held when it opened
+  (`Session.TOTPBinding`) — and answers any other
+  `403 REAUTHENTICATION_REQUIRED` before looking at the code, so a factor
+  enrolled through the session's own access token never moves its `mfa_at`; and
+  the wrong code that reaches `StepUpFailureLimit` revokes the session. The
+  three names are reserved, like the session claims, in every spelling
+  `encoding/json` folds onto them: `BuildTokenClaims`, and so a `ClaimsWebhook`,
+  cannot set them on any token, and `UserFieldClaims` refuses to map onto them.
+  The admin console's own login mints a token of another type that carries none
+  of them. `VerifyAccess`, and so the adapters' middleware, exposes them as
+  `User.AuthMethods`, `User.AuthTime` and `User.MFAAt`.
+- **The reference**: The payload is `buildPayload(user)` — the six base claims
+  with `config.buildTokenPayload(user)` spread over them — plus `sid`, and
+  nothing in it says how the session was obtained: a password login and a
+  password-and-TOTP login mint the same claims. The hook may set any name but
+  the session claims, `amr` and `mfa_at` included, and there is no route that
+  re-verifies a factor for an existing session (`auth.router.ts:378-384`,
+  `auth.router.ts:433`, `token.service.ts:19`).
+- **Why**: A privileged action wants proof of a recent second factor, and with
+  the reference's payload a resource server has nothing to read: the only way to
+  know is to ask the auth service on every call, which is the round trip a
+  self-contained token exists to avoid. Recording the context on the session and
+  minting it on the token answers the question locally, and reserving the names
+  is what makes the answer worth believing — an `mfa_at` a claims hook or a
+  webhook could write is not evidence of anything. The claims are additive for
+  every client, which ignores claims it does not know; the one thing taken away
+  is a host hook's ability to emit those three names, and the step-up route is
+  new surface the reference has no counterpart for.
+- **Matching the reference exactly**: Not available from configuration: the
+  claims are minted on every access token. A client that does not read them sees
+  the reference's payload with three extra members. A host hook that set `amr`,
+  `auth_time` or `mfa_at` must rename the claim; a `UserFieldClaims` mapping
+  onto one now fails at startup.
+- **What a session store owes**: Persist `Session.AuthMethods`, `Session.MFAAt`,
+  `Session.TOTPBinding` and `Session.StepUpAttempts` with the rest of the row; a
+  store that does not loses them on the first refresh, and the tokens then claim
+  no method and the step-up answers `403` — which fails closed. Implement
+  `SessionAuthenticationStore` for the step-up route: `RecordSecondFactor`, a
+  write of those fields alone that refuses a revoked session atomically, so a
+  step-up can never revive a refresh token a rotation spent or a session a
+  logout revoked; and `RecordStepUpAttempt`, which counts an attempt before its
+  code is checked and revokes the session past the limit in the same atomic
+  step. `MemorySessionStore` does all of it.
 
 ### The refresh-token secret is optional and may equal the access-token secret
 
@@ -580,24 +652,25 @@ revision the whole contract was extracted from.
 
 `resource-server-gates-all-credential-routes`
 
-- **Surface**: `HTTPConfig.ResourceServer`: the nineteen routes of
+- **Surface**: `HTTPConfig.ResourceServer`: the twenty routes of
   `ResourceServerGatedRoutes`.
-- **This port**: Registers none of the nineteen routes that mint, deliver or
+- **This port**: Registers none of the twenty routes that mint, deliver or
   consume a credential, so each answers `404` — `/register`, `/login`,
   `/refresh`, `/logout`, `/forgot-password`, `/reset-password`,
   `/change-password`, `/send-verification-email`, `/verify-email`,
   `/change-email/request`, `/change-email/confirm`, `/magic-link/send`,
   `/magic-link/verify`, `/sms/send`, `/sms/verify`, `/2fa/setup`,
-  `/2fa/verify-setup`, `/2fa/verify` and `/2fa/disable`. `GenerateOpenAPISpec`
-  drops the same nineteen under `OpenAPIInfo.ResourceServer`, so the published
-  spec and the mount agree. What stays is `/me`, the session routes, `/profile`,
-  `/add-phone`, `/account` and the OAuth and linking group — and those still
-  need a local user store: `/me` reads it through `Service.Me`, `/profile`,
-  `/add-phone` and `/account` write it, and the OAuth callback provisions a user
-  and mints a local session. The flag is about credentials, not about store
-  independence. The deployment with no user store is the one that mounts
-  `ResourceServerMiddleware` on its own routes, whose bearer and cookie paths
-  both build the principal from verified claims and read no store at all.
+  `/2fa/verify-setup`, `/2fa/verify`, `/2fa/disable` and `/2fa/step-up`, the
+  last of which is this port's own. `GenerateOpenAPISpec` drops the same twenty
+  under `OpenAPIInfo.ResourceServer`, so the published spec and the mount agree.
+  What stays is `/me`, the session routes, `/profile`, `/add-phone`, `/account`
+  and the OAuth and linking group — and those still need a local user store:
+  `/me` reads it through `Service.Me`, `/profile`, `/add-phone` and `/account`
+  write it, and the OAuth callback provisions a user and mints a local session.
+  The flag is about credentials, not about store independence. The deployment
+  with no user store is the one that mounts `ResourceServerMiddleware` on its
+  own routes, whose bearer and cookie paths both build the principal from
+  verified claims and read no store at all.
 - **The reference**: Guards six registrations on `isResourceServer` — `/login`,
   `/logout`, `/refresh`, `/register`, `/forgot-password` and `/reset-password` —
   and leaves the other thirteen mounted. Those thirteen reach handlers that read
@@ -612,7 +685,7 @@ revision the whole contract was extracted from.
   an SMS code cannot be stored and a TOTP secret cannot be enrolled without the
   store the mode has removed. Leaving them mounted turns a configuration mistake
   into a runtime failure on a credential route, which is the worst place to
-  discover it. Gating all nineteen makes the mode mean one thing, and makes it
+  discover it. Gating all twenty makes the mode mean one thing, and makes it
   checkable: the same list drives the mount, the OpenAPI spec and the
   conformance suite. It is drawn at the credential and not at the store
   deliberately: gating every store-reading route would unmount `/me` and the

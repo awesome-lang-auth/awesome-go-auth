@@ -225,7 +225,7 @@ func (ad *Adapter) Mount(group *echo.Group) {
 	}
 }
 
-// mountCredentialRoutes registers the nineteen routes that create, prove,
+// mountCredentialRoutes registers the twenty routes that create, prove,
 // deliver or change a credential — auth.ResourceServerGatedRoutes, which is the
 // same list and carries the reasoning. HTTPConfig.ResourceServer is the switch
 // that skips this call.
@@ -246,6 +246,7 @@ func (ad *Adapter) mountCredentialRoutes(group *echo.Group, prefix string) {
 	group.POST(prefix+"/2fa/verify-setup", ad.guard(ad.Middleware()(ad.twoFactorVerifySetup)))
 	group.POST(prefix+"/2fa/verify", ad.guard(ad.twoFactorVerify))
 	group.POST(prefix+"/2fa/disable", ad.guard(ad.Middleware()(ad.twoFactorDisable)))
+	group.POST(prefix+auth.StepUpRoute, ad.guard(ad.Middleware()(ad.twoFactorStepUp)))
 	// Password management and email verification (password_email.go).
 	ad.mountPasswordEmail(group, prefix)
 }

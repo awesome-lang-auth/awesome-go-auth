@@ -159,7 +159,8 @@ func TestUserFieldClaims_RejectsEmptyClaimNames(t *testing.T) {
 }
 
 // TestUserFieldClaims_RejectsReservedClaimNames: a mapping onto sid, tid, jti,
-// typ, iss, iat or exp would be discarded by issueToken on every mint, so the
+// typ, iss, iat, exp, amr, auth_time or mfa_at would be discarded by mintToken
+// on every mint, so the
 // constructor refuses it — the silent-configuration failure the allowlist
 // exists to prevent, on the claim side rather than the field side. The base
 // claims are not reserved: mapping over email or role is the reference's own
@@ -181,9 +182,17 @@ func TestUserFieldClaims_RejectsReservedClaimNames(t *testing.T) {
 			}
 		})
 	}
-	// Exact match only: a differently cased or padded name is a claim of the
-	// hook's own, which issueToken leaves alone.
-	for _, claim := range []string{"Exp", "SID", " typ"} {
+	// Every spelling encoding/json folds onto a reserved name is refused too:
+	// a struct decoder reads "MFA_AT" as mfa_at, and "ſid" (U+017F) as sid,
+	// so the mapping would be setting the reserved claim for every such reader.
+	for _, claim := range []string{"Exp", "SID", "MFA_AT", "Amr", "Auth_Time", "\u017fid"} {
+		if _, err := UserFieldClaims(map[string]string{claim: "id"}); err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("UserFieldClaims(%q) = %v, want the spelling of a reserved name refused", claim, err)
+		}
+	}
+	// A name that only resembles one is a claim of the hook's own: padding is
+	// not folded by any decoder.
+	for _, claim := range []string{" typ", "typ ", "mfa-at", "mfaAt"} {
 		if _, err := UserFieldClaims(map[string]string{claim: "id"}); err != nil {
 			t.Fatalf("UserFieldClaims(%q) = %v, want the name accepted as a non-reserved claim", claim, err)
 		}
@@ -197,11 +206,12 @@ func TestUserFieldClaims_RejectsReservedClaimNames(t *testing.T) {
 }
 
 // TestReservedClaimNames_MatchIssueToken ties the constructor's list to the
-// mint: every name UserFieldClaims refuses is one issueToken overwrites, and
-// the list is exactly the seven the docs and the CHANGELOG name — so neither
-// can drift from the other without a test noticing.
+// mint: every name UserFieldClaims refuses is one mintToken owns, and the list
+// is exactly the ten the docs and the CHANGELOG name — the seven session
+// claims and the three of the authentication context — so neither can drift
+// from the other without a test noticing.
 func TestReservedClaimNames_MatchIssueToken(t *testing.T) {
-	const documented = "sid,tid,jti,typ,iss,iat,exp"
+	const documented = "sid,tid,jti,typ,iss,iat,exp,amr,auth_time,mfa_at"
 	if got := strings.Join(reservedClaimNames, ","); got != documented {
 		t.Fatalf("reservedClaimNames = %s, want %s (update issueToken, the docs and this test together)", got, documented)
 	}

@@ -1681,6 +1681,8 @@ func testLinkVerify(t *testing.T, mount Mounter) {
 		AssertKeys(t, Body(t, rec), "success")
 		AssertCookieAttrs(t, Cookie(t, rec, hostAccess), accessCookieSpec())
 		AssertCookieAttrs(t, Cookie(t, rec, hostRefresh), refreshCookieSpec())
+		// The proof was the emailed account-link token, and nothing else.
+		assertAuthContext(t, rec, []string{auth.AMREmail}, false)
 	})
 
 	// The one route in this group where X-Auth-Strategy matters: it answers with

@@ -778,7 +778,7 @@ func TestIssueToken_LoginProviderClaim(t *testing.T) {
 		{"reports the recorded provider", User{ID: "usr_033", TenantID: "t1", LoginProvider: "github"}, "github"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tokens, err := svc.newSessionTokens(ctx, tc.user)
+			tokens, err := svc.newSessionTokens(ctx, tc.user, authBy(AMRPassword))
 			if err != nil {
 				t.Fatalf("newSessionTokens: %v", err)
 			}

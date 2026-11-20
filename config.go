@@ -127,7 +127,10 @@ type Config struct {
 	// the reference's buildTokenPayload may (auth.router.ts:378-384). The
 	// session claims sid, tid, jti, typ, iss, iat and exp are reserved: they
 	// are written after the merge, so a hook value under one of those names is
-	// discarded rather than minted (see issueToken for why).
+	// discarded rather than minted (see issueToken for why). So are amr,
+	// auth_time and mfa_at, the authentication context: deleted after the merge
+	// and written back on an access token from its session alone, so no hook
+	// can claim a second factor (authentication_context.go).
 	//
 	// It runs at mint time and on Me, and nowhere else: Authenticate, which the
 	// adapters' Middleware calls on every protected request, never runs it. A
