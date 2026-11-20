@@ -196,10 +196,13 @@ with `method=flag` now reach users in every tenant (Fixed).
   token`, `401 SESSION_REVOKED`, `403 CSRF_INVALID` for a cookie call without
   the header, and the credential before the body. With the option off both
   routes are mounted behind the middleware, as they always were.
-  `(*nethttp.Adapter).TwoFactorSetup` and `TwoFactorVerifySetup` act for the
-  user already in the request context when there is one — `Middleware`'s, or a
-  host's own through `auth.ContextWithUser` on a hand mount — exactly as
+  `(*nethttp.Adapter).TwoFactorSetup` and `TwoFactorVerifySetup`, mounted by
+  hand, act for the user already in the request context when there is one —
+  `Middleware`'s, or a host's own through `auth.ContextWithUser` — exactly as
   before, and authenticate the request themselves only when there is none.
+  Behind the adapters' own mount under the option they always authenticate the
+  request themselves: a user an outer middleware injected is not a credential
+  there, as it was not behind the access middleware.
 - **BREAKING (configuration) — `amr`, `auth_time` and `mfa_at` are reserved
   claims.** A `Config.BuildTokenClaims` hook, or a `ClaimsWebhook`, that
   returned one of them no longer reaches any token: the three are deleted after

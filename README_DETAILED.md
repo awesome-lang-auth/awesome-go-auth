@@ -423,12 +423,15 @@ What keeps the token to its one purpose:
   cookie.
 
 With `EnrolOnLogin` on, the four adapters mount the two routes without the
-access middleware, so that the token reaches them; with it off, behind it, as
-before. `(*nethttp.Adapter).TwoFactorSetup` and `TwoFactorVerifySetup`, which
-a host may mount by hand, act for the user already in the request context when
-there is one — put there by `Middleware`, or by the host's own authentication
-through `auth.ContextWithUser` — exactly as before, and otherwise authenticate
-the request themselves.
+access middleware, so that the token reaches them, and the handlers then
+authenticate every request from its own credential: a user an outer middleware
+put in the request context is not one, as it was not behind the access
+middleware. With the option off they sit behind the middleware, as before.
+`(*nethttp.Adapter).TwoFactorSetup` and `TwoFactorVerifySetup`, which a host may
+mount by hand, act for the user already in the request context when there is
+one — put there by `Middleware`, or by the host's own authentication through
+`auth.ContextWithUser` — exactly as before, and otherwise authenticate the
+request themselves.
 
 `AuthSettings.Require2FA`, the setting an administrator flips at run time, is
 **not** a login term, as it is not in the reference: it is read only by
