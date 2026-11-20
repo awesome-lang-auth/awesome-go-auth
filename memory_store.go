@@ -69,7 +69,7 @@ func (s *MemoryUserStore) GetUserByID(_ context.Context, id, tenantID string) (U
 	defer s.mu.RUnlock()
 	u, ok := s.byID[id]
 	if !ok || u.TenantID != tenantID {
-		return User{}, errors.New("user not found")
+		return User{}, ErrUserNotFound
 	}
 	return u, nil
 }

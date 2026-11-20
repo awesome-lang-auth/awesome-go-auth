@@ -113,6 +113,29 @@ func (s *countingUserStore) count() int {
 	return s.lookups
 }
 
+// countingSessionStore counts GetSessionByID, the read the shared auth
+// middleware makes under SessionCheckOn "allcalls" and nothing else on the
+// /sessions route does — its handler lists by user — so a count above zero
+// means the middleware ran.
+type countingSessionStore struct {
+	*auth.MemorySessionStore
+	mu    sync.Mutex
+	reads int
+}
+
+func (s *countingSessionStore) GetSessionByID(ctx context.Context, id string) (auth.Session, error) {
+	s.mu.Lock()
+	s.reads++
+	s.mu.Unlock()
+	return s.MemorySessionStore.GetSessionByID(ctx, id)
+}
+
+func (s *countingSessionStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
+}
+
 func testRateLimit(t *testing.T, mount Mounter) {
 	t.Run("every auth route passes through the slot exactly once", func(t *testing.T) {
 		testRateLimitCoversEveryRoute(t, mount)
@@ -122,6 +145,9 @@ func testRateLimit(t *testing.T, mount Mounter) {
 	})
 	t.Run("a refusal short-circuits the CSRF and auth middlewares", func(t *testing.T) {
 		testRateLimitRefusalShortCircuits(t, mount)
+	})
+	t.Run("a refusal short-circuits the auth middleware on a protected route", func(t *testing.T) {
+		testRateLimitRefusalSkipsMiddleware(t, mount)
 	})
 	t.Run("no limiter changes nothing", func(t *testing.T) {
 		testRateLimitNilIsTransparent(t, mount)
@@ -183,10 +209,14 @@ func testRateLimitSkipsJWKS(t *testing.T, mount Mounter) {
 // The request is a cookie-authenticated GET: it carries a valid access-token
 // cookie and no CSRF cookie, so with no limiter in the way both middlewares
 // leave a mark — the CSRF middleware mints and distributes the cookie, and the
-// auth middleware verifies the token, which reaches the user store. That is the
-// control. With the limiter refusing, all three marks have to be gone: the 429
-// body verbatim, no Set-Cookie at all, and not one store lookup. A limiter
-// mounted inside either middleware fails on one of them.
+// route verifies the token and reads the user it names from the user store.
+// That is the control. The route is GET /me because it is the one whose
+// credential check reaches the user store: since #31 the shared auth
+// middleware verifies the token without a store read, as the reference's
+// does, so a route behind it would leave no store mark to count. With the
+// limiter refusing, all three marks have to be gone: the 429 body verbatim, no
+// Set-Cookie at all, and not one store lookup. A limiter mounted inside the
+// CSRF middleware or behind the credential check fails on one of them.
 func testRateLimitRefusalShortCircuits(t *testing.T, mount Mounter) {
 	probe := func(t *testing.T, limiter func(http.Handler) http.Handler) (*httptest.ResponseRecorder, int) {
 		t.Helper()
@@ -197,7 +227,7 @@ func testRateLimitRefusalShortCircuits(t *testing.T, mount Mounter) {
 		_, tokens := env.Seed("ratelimit@example.com")
 
 		before := store.count()
-		req := env.Request(http.MethodGet, "/sessions", nil)
+		req := env.Request(http.MethodGet, "/me", nil)
 		req.AddCookie(&http.Cookie{Name: hostAccess, Value: tokens.AccessToken})
 		return env.Do(req), store.count() - before
 	}
@@ -207,7 +237,7 @@ func testRateLimitRefusalShortCircuits(t *testing.T, mount Mounter) {
 		AssertStatus(t, rec, http.StatusOK)
 		Cookie(t, rec, hostCSRF)
 		if lookups == 0 {
-			t.Fatalf("the auth middleware made no store lookup, so the control proves nothing")
+			t.Fatalf("the credential check made no store lookup, so the control proves nothing")
 		}
 	})
 
@@ -221,7 +251,7 @@ func testRateLimitRefusalShortCircuits(t *testing.T, mount Mounter) {
 		// arrives without one, so a single Set-Cookie here would mean it ran.
 		AssertNoCookies(t, rec)
 		if lookups != 0 {
-			t.Errorf("the auth middleware made %d store lookup(s) behind a refusal, want 0", lookups)
+			t.Errorf("the credential check made %d store lookup(s) behind a refusal, want 0", lookups)
 		}
 	})
 }
@@ -279,4 +309,41 @@ func testRateLimitNilIsTransparent(t *testing.T, mount Mounter) {
 			}
 		})
 	}
+}
+
+// testRateLimitRefusalSkipsMiddleware is the same short-circuit on a route
+// behind the shared auth middleware, GET /sessions. Since #31 that middleware
+// reads no user store, so the mark counted is the session-store read it makes
+// under SessionCheckOn "allcalls": present without a limiter, absent behind a
+// refusing one. A limiter mounted inside Middleware() fails here.
+func testRateLimitRefusalSkipsMiddleware(t *testing.T, mount Mounter) {
+	probe := func(t *testing.T, limiter func(http.Handler) http.Handler) (*httptest.ResponseRecorder, int) {
+		t.Helper()
+		sessions := &countingSessionStore{MemorySessionStore: auth.NewMemorySessionStore()}
+		cfg := auth.DefaultHTTPConfig()
+		cfg.RateLimiter = limiter
+		env := NewEnv(t, mount, cfg, auth.WithSessionStore(sessions), auth.WithSessionCheckOn(auth.SessionCheckOnAllCalls))
+		_, tokens := env.Seed("ratelimit-mw@example.com")
+
+		before := sessions.count()
+		req := env.Request(http.MethodGet, "/sessions", nil)
+		req.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+		return env.Do(req), sessions.count() - before
+	}
+
+	t.Run("without a limiter the middleware runs", func(t *testing.T) {
+		rec, reads := probe(t, nil)
+		AssertStatus(t, rec, http.StatusOK)
+		if reads == 0 {
+			t.Fatalf("the auth middleware made no session read, so the control proves nothing")
+		}
+	})
+
+	t.Run("with a limiter at its limit it does not", func(t *testing.T) {
+		rec, reads := probe(t, refusingRateLimiter)
+		AssertStatus(t, rec, http.StatusTooManyRequests)
+		if reads != 0 {
+			t.Errorf("the auth middleware made %d session read(s) behind a refusal, want 0", reads)
+		}
+	})
 }

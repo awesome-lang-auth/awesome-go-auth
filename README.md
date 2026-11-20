@@ -27,7 +27,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	_, tokens, err := service.Register(context.Background(), auth.RegisterInput{
+	ctx := context.Background()
+	if _, _, err := service.Register(ctx, auth.RegisterInput{
+		Email:    "alice@example.com",
+		Password: "supersecurepassword",
+		TenantID: "tenant-1",
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	// Registration opens no session unless Config.IssueSessionOnRegister is on,
+	// as in the reference: log in for the token pair.
+	_, tokens, err := service.Login(ctx, auth.LoginInput{
 		Email:    "alice@example.com",
 		Password: "supersecurepassword",
 		TenantID: "tenant-1",
@@ -197,8 +208,10 @@ revision the whole contract was extracted from.
 - **Surface**: `POST <prefix>/reset-password` and
   `POST <prefix>/change-password`.
 - **This port**: Rejects a new password shorter than `Config.MinPasswordLen`
-  with `400 {"error": "Password is too weak", "code": "WEAK_PASSWORD"}`, checked
-  before the current-password comparison on `/change-password`.
+  with `400 {"error": "Password is too weak", "code": "WEAK_PASSWORD"}`. On
+  `/change-password` it is checked last, after every refusal the reference
+  itself makes there — a missing user, a missing `newPassword`, a missing or
+  wrong current password — so it never outranks one of them.
 - **The reference**: Applies no strength check on either route — the password
   goes straight to `passwordService.hash`. Its own OpenAPI document declares
   `minLength: 8` on both bodies and nothing enforces it
@@ -207,8 +220,7 @@ revision the whole contract was extracted from.
   reached with a mailed token, which silently undoes whatever policy the host
   applied at registration. `WEAK_PASSWORD` has no reference counterpart, so a
   client that does not know the code still sees a `400` it must show the user
-  either way. The check order differs too: the reference would report a wrong
-  current password first.
+  either way.
 
 ### `2fa/setup` omits the QR code
 
@@ -501,13 +513,12 @@ revision the whole contract was extracted from.
   drops the same nineteen under `OpenAPIInfo.ResourceServer`, so the published
   spec and the mount agree. What stays is `/me`, the session routes, `/profile`,
   `/add-phone`, `/account` and the OAuth and linking group — and those still
-  need a local user store: `/me` reads it through `Service.Authenticate`,
-  `/profile`, `/add-phone` and `/account` write it, and the OAuth callback
-  provisions a user and mints a local session. The flag is about credentials,
-  not about store independence. The deployment with no user store is the one
-  that mounts `ResourceServerMiddleware` on its own routes, whose bearer and
-  cookie paths both build the principal from verified claims and read no store
-  at all.
+  need a local user store: `/me` reads it through `Service.Me`, `/profile`,
+  `/add-phone` and `/account` write it, and the OAuth callback provisions a user
+  and mints a local session. The flag is about credentials, not about store
+  independence. The deployment with no user store is the one that mounts
+  `ResourceServerMiddleware` on its own routes, whose bearer and cookie paths
+  both build the principal from verified claims and read no store at all.
 - **The reference**: Guards six registrations on `isResourceServer` — `/login`,
   `/logout`, `/refresh`, `/register`, `/forgot-password` and `/reset-password` —
   and leaves the other thirteen mounted. Those thirteen reach handlers that read
@@ -576,75 +587,52 @@ revision the whole contract was extracted from.
   unknown `kid` then invalidates and refetches, as the reference does. Nothing
   else in the verifier changes.
 
-### `register` opens a session, where the reference only creates the account — provisional, tracked as `nik2208/awesome-go-auth#21`
+### `register` can also open a session, when the instance opts in — `Config.IssueSessionOnRegister`, off by default
 
 `register-issues-a-session`
 
 - **Surface**: `POST <prefix>/register`.
-- **This port**: Mints a token pair for the new account and delivers it with the
-  `201`, through the same delivery switch every other issuing route uses: in
-  cookie mode the response is `201 {"success": true, "userId": "…"}` plus
-  `Set-Cookie` for `accessToken` and `refreshToken`, and in bearer mode
-  (`X-Auth-Strategy: bearer`) the same body with top-level `accessToken` and
-  `refreshToken` fields and no cookies at all. A refresh session row is created
-  with it, so the account is logged in as soon as it exists and
-  `GET <prefix>/me` answers on the credential the registration returned.
-- **The reference**: Mounts the route at all only when the host supplies
-  `options.onRegister`; without it there is no `POST <prefix>/register` in the
-  reference and the path answers `404` where this port answers `201` (or
-  `400 INVALID_INPUT` for a body missing a credential). That unconditional mount
-  is a second, smaller difference on this surface, and it is named here rather
-  than kept as a separate entry because a host that has no register route has no
-  session question to ask. Where the reference *is* mounted it answers
-  `201 {"success": true, "userId": user.id}` and nothing else: the register
-  route never reaches `sendTokens` — the one function that writes
-  `setTokenCookies` or the body tokens — and never reaches `issueTokens`, so no
-  cookie is set, no token is returned and no session row is created. The caller
-  is unauthenticated after a successful registration and has to `POST /login`
-  with the credentials it just chose (`auth.router.ts:713-730`,
-  `auth.router.ts:726`, `auth.router.ts:399-406`).
-- **Why**: **Provisional, and recorded rather than endorsed.** The entry exists
-  so that a difference which is client-visible today is visible in the contract
-  too; it is not a settled product decision. What it costs is a bypass of the
-  email verification gate: `Service.Register` sets `IsEmailVerified` from the
-  configured mode and then mints the token pair unconditionally, so under
-  `strict` a brand-new account walks away holding a usable access token that
-  `POST <prefix>/login` would have refused for the same user with
-  `403 EMAIL_NOT_VERIFIED`. The registration hands out exactly the credential
-  the gate exists to withhold. The family already carries that as a defect and
-  not as a decision: it is tracked as
-  [nik2208/awesome-go-auth#21](https://github.com/nik2208/awesome-go-auth/issues/21),
-  and `awesome-lambda-auth`'s contract suite pins the current behaviour under
-  protest in `test/contract/cases_register_test.go`, which calls it
-  security-relevant and is written to fail the moment #21 lands. This entry
-  follows that suite: when #21 lands, the behaviour changes and the entry is
-  retired, not reworded. What has kept the issuance in place so far is only the
-  first-run cost of the alternative — a registration that leaves the caller
-  logged out makes the first thing a new account does re-present the password it
-  typed one screen earlier, and issuing here removes that round trip. That
-  argument covers the round trip and nothing else; it is not a reason to skip a
-  verification gate the deployment asked for, and where the two conflict the
-  gate is the stronger claim. The difference has stayed invisible this long
-  because it costs the shipped clients nothing: `ng-awesome-node-auth` posts the
-  registration `withCredentials` and reads only `userId` off the body, so the
-  cookies simply land in the jar and its next session check succeeds instead of
-  redirecting to the login form; the Flutter client reads `userId` (or `id`) and
-  ignores every other field, so on native it discards the tokens and logs in
-  exactly as it does today, and on web it inherits the same cookie jar. Neither
-  reads a field this port omits, and neither has a branch that a present session
-  breaks — but a client that does not notice is not a client that consented, and
-  it is the gate, not the client, that #21 is about.
-- **Matching the reference exactly**: Not possible today: there is no knob. The
-  issuance is unconditional in the handler and no configuration field switches
-  it off, which is part of why `nik2208/awesome-go-auth#21` is open rather than
-  closed as configurable: a deployment running `EmailVerificationModeStrict`
-  cannot opt out of the email verification bypass described above. The only way
-  to get the reference's answer now is to not mount `POST <prefix>/register` —
-  `HTTPConfig.ResourceServer` unmounts it along with the rest of the credential
-  set — and create accounts through `UserStore` itself, verifying the address
-  before the first login. Read "no knob" as the state of this release and not as
-  a decision that it stays that way: the fix for #21 is expected to remove the
-  issuance rather than add a switch.
+- **This port**: By default answers what the reference answers:
+  `201 {"success": true, "userId": "…"}` and nothing else — no `Set-Cookie`, no
+  token, no session row; the client logs in with `POST /login` afterwards.
+  `Config.IssueSessionOnRegister` (`WithIssueSessionOnRegister(true)`) is an
+  addition the instance administrator may turn on: the registration then also
+  delivers a session exactly as a successful `POST /login` does, through the
+  same delivery switch — in cookie mode `Set-Cookie` for `accessToken` and
+  `refreshToken` beside the same body, in bearer mode
+  (`X-Auth-Strategy: bearer`) top-level `accessToken` and `refreshToken` fields
+  and no cookies — with a refresh session row and `identity.auth.login.success`
+  raised after `identity.user.created`. Even on, no session is issued to an
+  account `POST /login` would not log straight in: under
+  `EmailVerificationModeStrict` the new address is unverified and the login
+  would answer `403 EMAIL_NOT_VERIFIED`, and under `Config.Require2FA` it would
+  answer a challenge, so in both cases the registration answers the plain `201`
+  — the email verification gate wins over the option, and the service logs once
+  at startup when both are configured. A refused registration (`400`,
+  `409 USER_EXISTS`) never issues anything.
+- **The reference**: Has no such option at the pinned revision. Where its
+  register route is mounted (only with `options.onRegister`; see
+  `register-route-is-always-mounted`) it answers
+  `201 {"success": true, "userId": user.id}` and nothing else: the route never
+  reaches `sendTokens` — the one function that writes `setTokenCookies` or the
+  body tokens — nor `issueTokens`, so no cookie, no token and no session row
+  (`auth.router.ts:1259` at v1.10.8). The family's option of the same name,
+  `issueSessionOnRegister`, is off by default there too
+  (`auth.router.ts:713-730`, `auth.router.ts:726`, `auth.router.ts:399-406`).
+- **Why**: Whether registration logs the account in is a deployment's choice,
+  the same knob in every backend of the family (owner decision 2026-09-30, from
+  [nik2208/awesome-go-auth#21](https://github.com/nik2208/awesome-go-auth/issues/21)),
+  and its default is the reference's answer, so an unconfigured instance answers
+  what the reference answers. It is registered because turning it on puts
+  cookies, tokens and a session on a route that never carries them in the
+  reference. Until this release the port issued that session unconditionally,
+  which handed a strict deployment's new accounts exactly the access token
+  `POST /login` withholds; the option, and the login's gates winning over it,
+  close that. `awesome-lambda-auth` keeps issuing by default through its own
+  knob, as its contract suite (`test/contract/cases_register_test.go`) records.
+- **Matching the reference exactly**: Leave the option off, the default: the
+  registration answers `201 {"success": true, "userId": "…"}` with no cookie, no
+  token and no session row.
 
 ### `ui/config`: `features.verifyEmail` follows the effective verification mode
 

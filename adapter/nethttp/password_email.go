@@ -118,10 +118,6 @@ func (a *Adapter) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
-	if httpErr, invalid := auth.ChangePasswordInlineError(user, req.CurrentPassword, req.NewPassword); invalid {
-		auth.WriteHTTPError(w, httpErr)
-		return
-	}
 	in := auth.ChangePasswordInput{
 		UserID:          user.ID,
 		TenantID:        user.TenantID,
@@ -198,10 +194,6 @@ func (a *Adapter) ChangeEmailRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	var req changeEmailRequestRequest
 	if !auth.DecodeOptionalJSON(w, r, &req) {
-		return
-	}
-	if httpErr, refused := auth.ChangeEmailInlineError(user); refused {
-		auth.WriteHTTPError(w, httpErr)
 		return
 	}
 	// The change token is discarded for the same reason the reset token is: it is

@@ -158,12 +158,23 @@ func (e *Env) Request(method, route string, body any) *http.Request {
 	return req
 }
 
-// Seed registers a user directly through the service, bypassing HTTP.
+// Seed registers a user directly through the service, bypassing HTTP, and
+// logs it in for the session the cases authenticate with: registration opens
+// none by default (Config.IssueSessionOnRegister is off, the reference's
+// answer). Where the login itself would not open one — a required second
+// factor, a strict email-verification gate — the tokens are the zero value, as
+// the login leaves them.
 func (e *Env) Seed(email string) (auth.User, auth.AuthTokens) {
 	e.T.Helper()
-	user, tokens, err := e.Auth.Register(context.Background(), auth.RegisterInput{Email: email, Password: "password1", TenantID: "t1"})
+	ctx := context.Background()
+	user, tokens, err := e.Auth.Register(ctx, auth.RegisterInput{Email: email, Password: "password1", TenantID: "t1"})
 	if err != nil {
 		e.T.Fatalf("seed %s: %v", email, err)
+	}
+	if tokens.AccessToken == "" {
+		if _, loggedIn, err := e.Auth.Login(ctx, auth.LoginInput{Email: email, Password: "password1", TenantID: "t1"}); err == nil {
+			tokens = loggedIn
+		}
 	}
 	return user, tokens
 }

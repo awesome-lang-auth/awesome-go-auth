@@ -125,19 +125,17 @@ var wantClaims = map[string][]string{
 		"MinRefreshInterval", "invalidateCache", "RS256", "401",
 	},
 	"csrf-cookie-not-reissued-with-tokens": {"Set-Cookie", "setTokenCookies"},
-	// Both halves of the difference, the fact that there is no way back to the
-	// reference (an entry that dropped "no knob" would read as a documented
-	// option a deployment could take), and — the part that must survive every
-	// future reword — that this is a provisional record of the defect tracked as
-	// nik2208/awesome-go-auth#21, that what it costs is the email verification
-	// gate, and that awesome-lambda-auth's contract suite already classifies it
-	// that way. An entry that keeps the wire facts but loses the bypass reads as
-	// a settled product decision, which is exactly what it is not.
+	// Both answers; that the default is the reference's and the session is an
+	// opt-in addition (an entry that lost "off by default" would read as a
+	// divergence every deployment carries); and — the part that must survive
+	// every reword — that the email verification gate wins over the option,
+	// which is what nik2208/awesome-go-auth#21 was filed about.
 	"register-issues-a-session": {
 		"201", "userId", "accessToken", "refreshToken", "Set-Cookie",
-		"sendTokens", "POST /login", "no knob",
-		"Provisional", "email verification", "nik2208/awesome-go-auth#21",
-		"cases_register_test.go", "EMAIL_NOT_VERIFIED",
+		"sendTokens", "POST /login", "off by default",
+		"Config.IssueSessionOnRegister", "WithIssueSessionOnRegister(true)", "issueSessionOnRegister",
+		"email verification gate wins", "EmailVerificationModeStrict", "EMAIL_NOT_VERIFIED",
+		"nik2208/awesome-go-auth#21", "cases_register_test.go",
 	},
 	// The last four claims are U15's: the entry now covers all three routers,
 	// and the one fact a reader must not lose is that the admin console's pair

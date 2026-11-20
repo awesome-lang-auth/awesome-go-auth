@@ -59,7 +59,30 @@ type Config struct {
 	EmailVerificationMode string
 	EmailChangeTTL        time.Duration
 	TempTokenTTL          time.Duration
-	Require2FA            bool
+	// IssueSessionOnRegister decides whether POST <prefix>/register — and
+	// Service.Register — also logs the new account in: when true, a successful
+	// registration opens a session exactly as a successful POST <prefix>/login
+	// does (the same cookies in cookie mode, the same accessToken and
+	// refreshToken body fields in bearer mode, the same session row, the same
+	// identity.auth.login.success event); when false, the registration answers
+	// 201 {"success":true,"userId":"…"} and nothing else, and the client logs
+	// in afterwards. It is the family's instance-admin option of that name
+	// (awesome-go-auth #21).
+	//
+	// False — the zero value, and what DefaultConfig leaves — is the reference's
+	// answer, so an unconfigured instance answers what the reference answers.
+	// True is an addition the reference does not have, registered as
+	// register-issues-a-session; WithIssueSessionOnRegister sets it.
+	//
+	// Even when true, no session is issued to an account POST <prefix>/login
+	// would not log straight in: an unverified address under
+	// EmailVerificationModeStrict (the verification gate wins; NewService logs
+	// once when both are configured), or an account a second factor is
+	// required of (Require2FA, for a new account). The registration then
+	// answers the plain 201 and the account logs in through the login's own
+	// gates.
+	IssueSessionOnRegister bool
+	Require2FA             bool
 	// TwoFactorAppName is the issuer an authenticator app files a TOTP
 	// enrolment under: the `issuer` of the otpauth:// URI POST <prefix>/2fa/setup
 	// returns, and the prefix of its label. It is the reference's

@@ -9,6 +9,13 @@ import (
 type UserStore interface {
 	CreateUser(ctx context.Context, user User) (User, error)
 	GetUserByEmail(ctx context.Context, email, tenantID string) (User, error)
+	// GetUserByID returns the stored row whole, PasswordHash included:
+	// Service.ChangePassword and POST /change-email/request decide on it
+	// whether an account has a password, so a store that leaves the hash out
+	// makes every account look passwordless to them. A row that does not match
+	// the id and tenant is reported with ErrUserNotFound (or an error wrapping
+	// it); any other error is a store failure, and the routes that look the
+	// user up answer it with the generic 500 rather than 404 "User not found".
 	GetUserByID(ctx context.Context, id, tenantID string) (User, error)
 }
 
