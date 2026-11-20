@@ -1024,6 +1024,131 @@ func TestMemoryLinkedAccounts_MultipleProviders(t *testing.T) {
 	}
 }
 
+// linkIDs lists a user's link ids in the order ListForUser returns them.
+func linkIDs(t *testing.T, store *MemoryLinkedAccounts, userID string) string {
+	t.Helper()
+	links, err := store.ListForUser(context.Background(), userID)
+	if err != nil {
+		t.Fatalf("ListForUser(%s): %v", userID, err)
+	}
+	ids := make([]string, 0, len(links))
+	for _, l := range links {
+		ids = append(ids, l.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+// assertLinkedAccountIndexes checks every lookup against the expected state:
+// who FindByProvider names for each pair ("" for unbound), and each user's list.
+func assertLinkedAccountIndexes(t *testing.T, store *MemoryLinkedAccounts, pairs map[[2]string]string, lists map[string]string) {
+	t.Helper()
+	for pair, wantID := range pairs {
+		got, err := store.FindByProvider(context.Background(), pair[0], pair[1])
+		switch {
+		case wantID == "" && err == nil:
+			t.Errorf("FindByProvider(%s, %s) = %s, want not found", pair[0], pair[1], got.ID)
+		case wantID != "" && err != nil:
+			t.Errorf("FindByProvider(%s, %s): %v, want %s", pair[0], pair[1], err, wantID)
+		case wantID != "" && got.ID != wantID:
+			t.Errorf("FindByProvider(%s, %s) = %s, want %s", pair[0], pair[1], got.ID, wantID)
+		}
+	}
+	for user, want := range lists {
+		if got := linkIDs(t, store, user); got != want {
+			t.Errorf("ListForUser(%s) = [%s], want [%s]", user, got, want)
+		}
+	}
+}
+
+// #37: a Save that re-points a bound (provider, providerID) pair to another
+// user under a new id is an upsert on the pair. The previous owner loses the
+// link from every lookup, and no row survives that no id can reach.
+func TestMemoryLinkedAccounts_RepointPairEvictsPreviousOwner(t *testing.T) {
+	store := NewMemoryLinkedAccounts()
+	ctx := context.Background()
+	acme := [2]string{"acme", "acme-1"}
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "lnk_1", UserID: "usr_a", Provider: "acme", ProviderID: "acme-1"})
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "lnk_other", UserID: "usr_a", Provider: "github", ProviderID: "gh-a"})
+	if err := store.Save(ctx, OAuthLinkedAccount{ID: "lnk_2", UserID: "usr_b", Provider: "acme", ProviderID: "acme-1"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	assertLinkedAccountIndexes(t, store,
+		map[[2]string]string{acme: "lnk_2", {"github", "gh-a"}: "lnk_other"},
+		map[string]string{"usr_a": "lnk_other", "usr_b": "lnk_2"})
+
+	// The superseded id reaches nothing any more.
+	if err := store.Delete(ctx, "lnk_1"); err != nil {
+		t.Fatalf("Delete(lnk_1): %v", err)
+	}
+	assertLinkedAccountIndexes(t, store,
+		map[[2]string]string{acme: "lnk_2"},
+		map[string]string{"usr_a": "lnk_other", "usr_b": "lnk_2"})
+
+	// Deleting the live link leaves nothing behind for either user.
+	if err := store.Delete(ctx, "lnk_2"); err != nil {
+		t.Fatalf("Delete(lnk_2): %v", err)
+	}
+	assertLinkedAccountIndexes(t, store,
+		map[[2]string]string{acme: "", {"github", "gh-a"}: "lnk_other"},
+		map[string]string{"usr_a": "lnk_other", "usr_b": ""})
+}
+
+// Saving an existing id with a different pair or owner moves the link: the old
+// pair stops resolving and the old owner stops listing it.
+func TestMemoryLinkedAccounts_ResaveIDMovesPairAndOwner(t *testing.T) {
+	store := NewMemoryLinkedAccounts()
+	ctx := context.Background()
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "l1", UserID: "u1", Provider: "google", ProviderID: "g1"})
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "l1", UserID: "u2", Provider: "google", ProviderID: "g2"})
+	assertLinkedAccountIndexes(t, store,
+		map[[2]string]string{{"google", "g1"}: "", {"google", "g2"}: "l1"},
+		map[string]string{"u1": "", "u2": "l1"})
+	if err := store.Delete(ctx, "l1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	assertLinkedAccountIndexes(t, store,
+		map[[2]string]string{{"google", "g1"}: "", {"google", "g2"}: ""},
+		map[string]string{"u1": "", "u2": ""})
+}
+
+// Re-linking a pair the same user already holds is idempotent, as the
+// reference's linkAccount contract requires: no duplicate, and the link keeps
+// its place in the user's list even under a new id.
+func TestMemoryLinkedAccounts_RelinkSamePairIsIdempotent(t *testing.T) {
+	store := NewMemoryLinkedAccounts()
+	ctx := context.Background()
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "la", UserID: "u1", Provider: "google", ProviderID: "g1"})
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "lb", UserID: "u1", Provider: "github", ProviderID: "gh1"})
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "la", UserID: "u1", Provider: "google", ProviderID: "g1", Email: "new@example.com"})
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "lb2", UserID: "u1", Provider: "github", ProviderID: "gh1"})
+	assertLinkedAccountIndexes(t, store,
+		map[[2]string]string{{"google", "g1"}: "la", {"github", "gh1"}: "lb2"},
+		map[string]string{"u1": "la,lb2"})
+	if got, _ := store.FindByProvider(ctx, "google", "g1"); got.Email != "new@example.com" {
+		t.Fatalf("Email = %q, want the re-saved value", got.Email)
+	}
+}
+
+// An id re-saved onto a pair another of the same user's links holds collapses
+// the two into one: both superseded rows are gone and the survivor is listed
+// once.
+func TestMemoryLinkedAccounts_ResaveIDOntoOwnPair(t *testing.T) {
+	store := NewMemoryLinkedAccounts()
+	ctx := context.Background()
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "l1", UserID: "u1", Provider: "google", ProviderID: "g1"})
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "l2", UserID: "u1", Provider: "google", ProviderID: "g2"})
+	_ = store.Save(ctx, OAuthLinkedAccount{ID: "l1", UserID: "u1", Provider: "google", ProviderID: "g2"})
+	assertLinkedAccountIndexes(t, store,
+		map[[2]string]string{{"google", "g1"}: "", {"google", "g2"}: "l1"},
+		map[string]string{"u1": "l1"})
+	if err := store.Delete(ctx, "l2"); err != nil {
+		t.Fatalf("Delete(l2): %v", err)
+	}
+	assertLinkedAccountIndexes(t, store,
+		map[[2]string]string{{"google", "g2"}: "l1"},
+		map[string]string{"u1": "l1"})
+}
+
 // --- AdminUserStore -------------------------------------------------------
 
 func seedUsers(t *testing.T, store *MemoryUserStore, users ...User) {

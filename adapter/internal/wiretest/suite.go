@@ -73,6 +73,7 @@ func Run(t *testing.T, mount Mounter) {
 	t.Run("LoginTwoFactor", func(t *testing.T) { testLoginTwoFactor(t, mount) })
 	t.Run("StepUpModeDefault", func(t *testing.T) { testStepUpModeDefault(t, mount) })
 	t.Run("StepUpEmptyBody", func(t *testing.T) { testStepUpEmptyBody(t, mount) })
+	t.Run("CredentialEmptyBody", func(t *testing.T) { testCredentialEmptyBody(t, mount) })
 	t.Run("PasswordAndEmail", func(t *testing.T) { testPasswordAndEmail(t, mount) })
 	t.Run("PasswordEmailDelivery", func(t *testing.T) { testPasswordEmailDelivery(t, mount) })
 	t.Run("JWKS", func(t *testing.T) { testJWKS(t, mount) })
@@ -729,6 +730,87 @@ func testLogin(t *testing.T, mount Mounter) {
 		rec := env.Do(env.Request(http.MethodPost, "/login", map[string]string{"email": "loginbad@example.com", "password": "wrong", "tenantId": "t1"}))
 		AssertError(t, rec, http.StatusUnauthorized, "Invalid credentials", auth.CodeInvalidCredentials)
 	})
+
+	// A body missing either credential is the reference's router-level 400,
+	// with no code (awesome-node-auth v1.10.8 auth.router.ts:996-1000), not the
+	// strategy's 401 INVALID_CREDENTIALS: the route never reaches the lookup.
+	// The test is on the values as sent, so an address that is only whitespace
+	// passes it and is then an unknown address.
+	t.Run("missing credentials", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			body map[string]string
+		}{
+			{"no email", map[string]string{"password": "password1", "tenantId": "t1"}},
+			{"no password", map[string]string{"email": "loginmissing@example.com", "tenantId": "t1"}},
+			{"neither, keys absent", map[string]string{"tenantId": "t1"}},
+			{"neither, keys empty", map[string]string{"email": "", "password": "", "tenantId": "t1"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+				env.Seed("loginmissing@example.com")
+				rec := env.Do(env.Request(http.MethodPost, "/login", tc.body))
+				AssertError(t, rec, http.StatusBadRequest, "Email and password are required", "")
+				AssertNoCookie(t, rec, hostAccess)
+				AssertNoCookie(t, rec, hostRefresh)
+			})
+		}
+		t.Run("a whitespace address is an unknown one", func(t *testing.T) {
+			env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+			rec := env.Do(env.Request(http.MethodPost, "/login", map[string]string{"email": "   ", "password": "password1", "tenantId": "t1"}))
+			AssertError(t, rec, http.StatusUnauthorized, "Invalid credentials", auth.CodeInvalidCredentials)
+		})
+	})
+
+	t.Run("malformed body", func(t *testing.T) {
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+		req := httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/login", stringReader("{not json"))
+		req.Header.Set("Content-Type", "application/json")
+		AssertError(t, env.Do(req), http.StatusBadRequest, "Invalid request body", auth.CodeInvalidBody)
+	})
+}
+
+// testCredentialEmptyBody pins #34: a /register or /login request with no body
+// at all is answered as a request whose fields are simply absent — the
+// per-field answer each route gives an empty JSON object — and not as a
+// malformed body.
+//
+// The reference runs express.json(), which leaves req.body as {} when there is
+// nothing to parse, and every router reads `req.body ?? {}` since v1.10.5
+// (awesome-node-auth CHANGELOG 1.10.5, issue #21), so each route reaches its
+// own check: /register throws INVALID_INPUT from the default handler
+// (auth.router.ts:889-891 at v1.10.8), /login answers its codeless 400
+// (:996-1000). The four adapters used to disagree here as well: echo's binder
+// returned nil for a zero-length body, net/http, chi and gin answered 400
+// INVALID_BODY. Both shapes a client sends are covered: an empty body with the
+// JSON Content-Type, and no body and no Content-Type at all. Malformed JSON is
+// still 400 INVALID_BODY, pinned by testRegister and testLogin.
+func testCredentialEmptyBody(t *testing.T, mount Mounter) {
+	cases := []struct {
+		route   string
+		status  int
+		message string
+		code    string
+	}{
+		{route: "/register", status: http.StatusBadRequest, message: "Email and password are required", code: auth.CodeInvalidInput},
+		{route: "/login", status: http.StatusBadRequest, message: "Email and password are required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.route, func(t *testing.T) {
+			t.Run("empty body, JSON content type", func(t *testing.T) {
+				env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+				rec := env.Do(env.Request(http.MethodPost, tc.route, nil))
+				AssertError(t, rec, tc.status, tc.message, tc.code)
+				AssertNoCookie(t, rec, hostAccess)
+				AssertNoCookie(t, rec, hostRefresh)
+			})
+			t.Run("no body, no content type", func(t *testing.T) {
+				env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+				rec := env.Do(httptest.NewRequest(http.MethodPost, env.Config.Prefix()+tc.route, nil))
+				AssertError(t, rec, tc.status, tc.message, tc.code)
+			})
+		})
+	}
 }
 
 func testRefresh(t *testing.T, mount Mounter) {

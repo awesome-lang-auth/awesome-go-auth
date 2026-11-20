@@ -198,7 +198,7 @@ type linkRequestBody struct {
 
 func (a *Adapter) linkRequest(w http.ResponseWriter, r *http.Request) {
 	var req linkRequestBody
-	if !decodeJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	if _, err := a.auth.LinkRequest(r.Context(), auth.LinkRequestInput{
@@ -225,7 +225,7 @@ type linkVerifyBody struct {
 
 func (a *Adapter) linkVerify(w http.ResponseWriter, r *http.Request) {
 	var req linkVerifyBody
-	if !decodeJSON(w, r, &req) {
+	if !auth.DecodeOptionalJSON(w, r, &req) {
 		return
 	}
 	result, err := a.auth.LinkVerify(r.Context(), auth.LinkVerifyInput{

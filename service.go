@@ -633,55 +633,92 @@ func (s *Service) SendMagicLink(ctx context.Context, in MagicLinkSendInput) (str
 	return magicToken, nil
 }
 
+// VerifyMagicLink is the passwordless login: it consumes the link, marks the
+// owner's address verified, and opens a session for them — the reference's
+// mode='login' branch of POST /magic-link/verify (awesome-node-auth v1.10.8
+// auth.router.ts:1756-1767).
+//
+// The email-verification side effect belongs to this wrapper and to nothing
+// else. The reference applies it in the router's login branch only
+// (:1758-1761); its 2fa branch (:1727-1754) has no such call, because a second
+// factor is not proof of address ownership. ConsumeMagicLink therefore never
+// applies it, and VerifyMagicLinkForUser — the second-factor wrapper — does not
+// either.
+//
+// A caller that has to decide something after learning who the link belongs to
+// uses ConsumeMagicLink and then CompleteMagicLinkLogin instead.
 func (s *Service) VerifyMagicLink(ctx context.Context, in MagicLinkVerifyInput) (User, AuthTokens, error) {
-	return s.verifyMagicLink(ctx, in, "")
-}
-
-// verifyMagicLink consumes a magic link and issues a session for its owner.
-//
-// requireUserID, when set, is the identity the link has to belong to — the
-// step-up flow, where the link is a second factor for a user the caller has
-// already identified. It is checked *before* anything is issued, so a refused
-// request leaves no session behind, and before the email-verification side
-// effect, which the reference applies only on the login path
-// (auth.router.ts:1158-1164 versus the 2fa branch at :1134-1156). The link is
-// still consumed either way: the reference burns it inside the strategy before
-// the router compares ids (magic-link.strategy.ts:50), so a mismatch costs the
-// link there too.
-//
-// See VerifyMagicLinkForUser for the exported entry point.
-func (s *Service) verifyMagicLink(ctx context.Context, in MagicLinkVerifyInput, requireUserID string) (User, AuthTokens, error) {
-	ms, ok := s.users.(MagicLinkStore)
-	if !ok {
-		return User{}, AuthTokens{}, ErrFeatureNotSupported
-	}
-	user, err := ms.GetUserByMagicLinkTokenHash(ctx, hashToken(in.Token))
-	if err != nil || user.MagicLinkTokenExpiresAt == nil || s.now().After(user.MagicLinkTokenExpiresAt.Add(s.cfg.ClockSkew)) {
-		return User{}, AuthTokens{}, ErrInvalidToken
-	}
-	if err := ms.ClearMagicLinkToken(ctx, user.ID, user.TenantID); err != nil {
+	user, err := s.ConsumeMagicLink(ctx, in)
+	if err != nil {
 		return User{}, AuthTokens{}, err
 	}
-	if requireUserID != "" && user.ID != requireUserID {
-		return User{}, AuthTokens{}, ErrMagicLinkOwnerMismatch
-	}
-	if requireUserID == "" && !user.IsEmailVerified {
+	if !user.IsEmailVerified {
 		if evs, ok := s.users.(EmailVerificationStore); ok {
 			_ = evs.MarkEmailVerified(ctx, user.ID, user.TenantID, true)
 		}
 		user.IsEmailVerified = true
 	}
-	tokens, sessionID, err := s.issueSession(ctx, user)
+	tokens, err := s.CompleteMagicLinkLogin(ctx, user)
 	if err != nil {
 		return User{}, AuthTokens{}, err
+	}
+	return user, tokens, nil
+}
+
+// ConsumeMagicLink verifies a magic link and burns it, and does nothing else:
+// no session, no token, no event, and no change to the user's email-verified
+// flag. It answers the link's owner, so the caller can decide what to do with
+// them — refuse, gate on tenant membership or a risk score, ask for another
+// factor — before anything exists in the store. CompleteMagicLinkLogin is the
+// call that issues the session once the caller has decided to.
+//
+// This is the reference's magicLinkStrategy.verify
+// (awesome-node-auth v1.10.8 magic-link.strategy.ts:36-52), which the router
+// calls before it compares identities and before it reaches issueTokens
+// (auth.router.ts:1741-1747). The link is single-use from here on whatever the
+// caller decides next, as in the reference, which clears it inside verify
+// (:50): a refused request still costs the link.
+//
+// An unknown link and an expired one both answer ErrInvalidToken; see
+// HTTPErrInvalidMagicLink for the reference's split between the two. A store
+// that cannot hold magic links answers ErrFeatureNotSupported.
+func (s *Service) ConsumeMagicLink(ctx context.Context, in MagicLinkVerifyInput) (User, error) {
+	ms, ok := s.users.(MagicLinkStore)
+	if !ok {
+		return User{}, ErrFeatureNotSupported
+	}
+	user, err := ms.GetUserByMagicLinkTokenHash(ctx, hashToken(in.Token))
+	if err != nil || user.MagicLinkTokenExpiresAt == nil || s.now().After(user.MagicLinkTokenExpiresAt.Add(s.cfg.ClockSkew)) {
+		return User{}, ErrInvalidToken
+	}
+	if err := ms.ClearMagicLinkToken(ctx, user.ID, user.TenantID); err != nil {
+		return User{}, err
+	}
+	return user, nil
+}
+
+// CompleteMagicLinkLogin opens a session for a user whose magic link the caller
+// has already consumed with ConsumeMagicLink, and raises
+// identity.auth.login.success with `method: "magic-link"` — the reference's
+// issueTokens and publish that close both branches of POST /magic-link/verify
+// (awesome-node-auth v1.10.8 auth.router.ts:1747-1752 and :1762-1767).
+//
+// It checks nothing about user: the proof is the link ConsumeMagicLink burned,
+// and the decision to honour it is the caller's. Pass the User that
+// ConsumeMagicLink returned, not one looked up some other way. It does not mark
+// the address verified; VerifyMagicLink does that for the login path.
+func (s *Service) CompleteMagicLinkLogin(ctx context.Context, user User) (AuthTokens, error) {
+	tokens, sessionID, err := s.issueSession(ctx, user)
+	if err != nil {
+		return AuthTokens{}, err
 	}
 	// node-auth auth.router.ts:1267 and :1282 — two publication points, one
 	// here. The dev line writes POST /magic-link/verify as two branches of one
 	// route, the step-up branch that checks the temp token and the direct-login
 	// branch that does not, and each ends with its own issueTokens and its own
 	// publish; the two payloads are identical, `method: "magic-link"` and no
-	// per-branch key. This port has those branches as requireUserID set or
-	// empty, and they converge here, so one publication covers both.
+	// per-branch key. This port has those branches as VerifyMagicLink and
+	// VerifyMagicLinkForUser, and both end here, so one publication covers both.
 	//
 	// It is deliberately not `magic-link-2fa` for the step-up branch. Both dev
 	// line sites write the same literal, and a subscriber that needed to tell
@@ -694,7 +731,7 @@ func (s *Service) verifyMagicLink(ctx context.Context, in MagicLinkVerifyInput, 
 			Data:      map[string]any{"method": loginMethodMagicLink},
 		}
 	})
-	return user, tokens, nil
+	return tokens, nil
 }
 
 // SendSMSCode mints a one-time code, stores its hash and delivers it through
@@ -819,7 +856,7 @@ func (s *Service) VerifyEmail(ctx context.Context, in VerifyEmailInput) error {
 	//
 	// The other place this port marks an address verified raises nothing, and
 	// that is the dev line's shape too: the first magic-link login verifies the
-	// address as a side effect (verifyMagicLink above, node-auth
+	// address as a side effect (VerifyMagicLink above, node-auth
 	// auth.router.ts:1277-1280) and publishes only the login.
 	s.publish(ctx, func() Event {
 		return Event{Name: EventUserEmailVerified, UserID: user.ID}

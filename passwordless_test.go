@@ -301,6 +301,119 @@ func TestVerifyMagicLinkForUserRefusesBeforeIssuing(t *testing.T) {
 	}
 }
 
+// sessionRows counts every session row in the store, whoever owns it: a check
+// scoped to one user would miss a session opened for the wrong one.
+func sessionRows(t *testing.T, svc *Service) int {
+	t.Helper()
+	all, err := svc.ListAllSessions(context.Background(), 1000, 0)
+	if err != nil {
+		t.Fatalf("list all sessions: %v", err)
+	}
+	return len(all)
+}
+
+// #32: the step-up mismatch, counted across the whole session store rather
+// than per user. A refused mode:"2fa" verification adds no session row for
+// anybody — not for the link's owner, and not for the user the temp token
+// named.
+func TestVerifyMagicLinkForUserMismatchCreatesNoSessionRow(t *testing.T) {
+	svc := newTestSvc(t)
+	ctx := context.Background()
+	owner := seedUser(t, svc, "rowowner@example.com")
+	other := seedUser(t, svc, "rowother@example.com")
+	token, err := svc.SendMagicLink(ctx, MagicLinkSendInput{Email: owner.Email, TenantID: "t1"})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	before := sessionRows(t, svc)
+	if _, _, err := svc.VerifyMagicLinkForUser(ctx, MagicLinkVerifyInput{Token: token}, other.ID); !errors.Is(err, ErrMagicLinkOwnerMismatch) {
+		t.Fatalf("mismatch = %v, want ErrMagicLinkOwnerMismatch", err)
+	}
+	if after := sessionRows(t, svc); after != before {
+		t.Fatalf("session rows %d -> %d: the refused verification created a session", before, after)
+	}
+}
+
+// #32: ConsumeMagicLink verifies and burns the link and issues nothing, so a
+// caller can refuse on a predicate of its own after learning the owner. Every
+// effect VerifyMagicLink has beyond consuming the link is checked absent: no
+// session row, no event, and no change to the email-verified flag (#33 — that
+// side effect belongs to the login wrapper).
+func TestConsumeMagicLinkIssuesNothing(t *testing.T) {
+	h := newEventHarness(t)
+	user, _ := h.register(t, "consume@example.com")
+	if err := h.users.MarkEmailVerified(h.ctx, user.ID, harnessTenant, false); err != nil {
+		t.Fatalf("unverify: %v", err)
+	}
+	token := h.magicLinkToken(t, "consume@example.com")
+	before := sessionRows(t, h.svc)
+	h.reset()
+
+	got, err := h.svc.ConsumeMagicLink(h.ctx, MagicLinkVerifyInput{Token: token})
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	if got.ID != user.ID {
+		t.Fatalf("consume answered %q, want the link's owner %q", got.ID, user.ID)
+	}
+	// The caller refuses here, on whatever it knows that the service does not.
+
+	if after := sessionRows(t, h.svc); after != before {
+		t.Errorf("session rows %d -> %d after a bare consume", before, after)
+	}
+	if evs := h.events(); len(evs) != 0 {
+		t.Errorf("a bare consume published %v", eventNamesOf(evs))
+	}
+	stored, err := h.users.GetUserByID(h.ctx, user.ID, harnessTenant)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if stored.IsEmailVerified {
+		t.Error("a bare consume marked the address verified")
+	}
+	// Single use, as in the reference (magic-link.strategy.ts:50): the link is
+	// gone whatever the caller decided.
+	if _, err := h.svc.ConsumeMagicLink(h.ctx, MagicLinkVerifyInput{Token: token}); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("second consume = %v, want ErrInvalidToken", err)
+	}
+	if _, _, err := h.svc.VerifyMagicLink(h.ctx, MagicLinkVerifyInput{Token: token}); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("verify after consume = %v, want ErrInvalidToken", err)
+	}
+}
+
+// #32: consume, decide, then CompleteMagicLinkLogin — the split path ends where
+// VerifyMagicLink does: one session row, one identity.auth.login.success with
+// method magic-link and the new session's id, and a usable access token.
+func TestConsumeThenCompleteMagicLinkLogin(t *testing.T) {
+	h := newEventHarness(t)
+	user, _ := h.register(t, "complete@example.com")
+	token := h.magicLinkToken(t, "complete@example.com")
+	before := sessionRows(t, h.svc)
+	h.reset()
+
+	consumed, err := h.svc.ConsumeMagicLink(h.ctx, MagicLinkVerifyInput{Token: token})
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	tokens, err := h.svc.CompleteMagicLinkLogin(h.ctx, consumed)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if tokens.AccessToken == "" || tokens.RefreshToken == "" {
+		t.Fatalf("complete returned %+v", tokens)
+	}
+	if after := sessionRows(t, h.svc); after != before+1 {
+		t.Errorf("session rows %d -> %d, want one more", before, after)
+	}
+	ev := h.only(t)
+	if ev.Name != EventAuthLoginSuccess || ev.UserID != user.ID || ev.SessionID == "" || ev.Data["method"] != loginMethodMagicLink {
+		t.Errorf("event = %+v, want %s for %s with a session id and method %q", ev, EventAuthLoginSuccess, user.ID, loginMethodMagicLink)
+	}
+	if authed, err := h.svc.Authenticate(h.ctx, tokens.AccessToken); err != nil || authed.ID != user.ID {
+		t.Errorf("authenticate the issued token = %v, %v", authed.ID, err)
+	}
+}
+
 // TestVerifyMagicLinkEmailVerificationIsLoginOnly pins the reference's
 // asymmetry: the login path treats a magic link as proof of the address
 // (auth.router.ts:1158-1164), the step-up path does not (:1134-1156).

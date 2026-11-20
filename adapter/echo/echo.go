@@ -296,8 +296,7 @@ func (ad *Adapter) register(c echo.Context) error {
 		Password string `json:"password"`
 		TenantID string `json:"tenantId"`
 	}
-	if err := c.Bind(&req); err != nil {
-		auth.WriteHTTPError(c.Response(), auth.HTTPErrInvalidBody)
+	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
 		return nil
 	}
 	user, tokens, err := ad.auth.Register(c.Request().Context(), auth.RegisterInput{Email: req.Email, Password: req.Password, TenantID: req.TenantID})
@@ -315,8 +314,11 @@ func (ad *Adapter) login(c echo.Context) error {
 		Password string `json:"password"`
 		TenantID string `json:"tenantId"`
 	}
-	if err := c.Bind(&req); err != nil {
-		auth.WriteHTTPError(c.Response(), auth.HTTPErrInvalidBody)
+	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
+		return nil
+	}
+	if req.Email == "" || req.Password == "" {
+		auth.WriteHTTPError(c.Response(), auth.HTTPErrLoginCredentialsRequired)
 		return nil
 	}
 	result, err := ad.auth.LoginWithChallenge(c.Request().Context(), auth.LoginInput{Email: req.Email, Password: req.Password, TenantID: req.TenantID})

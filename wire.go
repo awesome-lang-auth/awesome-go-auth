@@ -151,6 +151,18 @@ var (
 	// names neither field is not a weak password, and answering WEAK_PASSWORD
 	// there tells the user to pick a better one when they typed none at all.
 	HTTPErrInvalidInput = HTTPError{Status: http.StatusBadRequest, Message: "Email and password are required", Code: CodeInvalidInput}
+	// HTTPErrLoginCredentialsRequired is POST /login's answer to a body with
+	// no email or no password, an absent body included. Same message as
+	// HTTPErrInvalidInput and deliberately no code: the reference's /login
+	// writes `{ error: 'Email and password are required' }` from the router
+	// before it reaches the strategy (awesome-node-auth v1.10.8
+	// auth.router.ts:996-1000), where /register throws INVALID_INPUT (:890).
+	// The test is on the values as sent, `!email || !password`, so an address
+	// that is only whitespace passes it and fails the lookup as invalid
+	// credentials, as it does there. The adapters make the check before calling
+	// the service, so no login-failed event is raised for it: the reference
+	// publishes that event only for a 401 caught after the check (:1040-1045).
+	HTTPErrLoginCredentialsRequired = HTTPError{Status: http.StatusBadRequest, Message: "Email and password are required"}
 )
 
 // HTTPErrorFor maps a service sentinel onto the envelope. Routes whose failure
