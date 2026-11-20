@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-21
+
+Closed registration for invite-only deployments, an enforced second factor at
+login with an opt-in forced enrolment, and machine access to the admin API with
+the user writes resolving their tenant (#101, #102, #104).
+
+No change alters what an existing deployment or its clients see without a
+configuration change: closed registration (`HTTPConfig.ClosedRegistration`),
+forced enrolment (`Config.EnrolOnLogin`, off by default; it is trust on first
+use, see Security) and machine access (`AdminOptions.MachineAccess`) are all
+opt-in. Hosts that call `CompleteTOTPEnrolment` or implement the enrolment
+store hooks directly should read Changed. The `amr`/`auth_time`/`mfa_at`
+claims and the step-up route (#103) are not in this release: they are held back
+by an open security review.
+
 ### Added
 - **Closed registration: `HTTPConfig.ClosedRegistration`.** Set, none of the
   four adapters mounts `POST <prefix>/register`, which then answers the
@@ -28,7 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reference serves it without a hook. Unset — the default — nothing
   changes. The `register-route-is-always-mounted` deviation now describes the
   flag, and its "not available from configuration" note is retired.
-- **Forced second-factor enrolment at login.** Under `Config.Require2FA`
 - **Forced second-factor enrolment at login, behind `Config.EnrolOnLogin`
   (`WithEnrolOnLogin(true)`), off by default.** Under `Config.Require2FA`
   (`WithRequire2FA(true)`) or a user's own `Require2FA` flag, a login by an
