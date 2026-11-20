@@ -712,8 +712,13 @@ func openAPISchemas() map[string]any {
 			"required": []string{"requires2FASetup", "tempToken", "code"},
 			"properties": map[string]any{
 				"requires2FASetup": map[string]any{"type": "boolean", "enum": []bool{true}},
-				"tempToken":        str,
-				"code":             map[string]any{"type": "string", "enum": []string{CodeTwoFactorSetupRequired}},
+				"tempToken": map[string]any{
+					"type": "string",
+					"description": "Enrolment token: present it to /2fa/setup and /2fa/verify-setup, as the body's tempToken " +
+						"or as a bearer credential, and to no other route. It is honoured only while this account still has " +
+						"to enrol, and verify-setup with it opens the session.",
+				},
+				"code": map[string]any{"type": "string", "enum": []string{CodeTwoFactorSetupRequired}},
 			},
 		},
 		"RegisterResult": map[string]any{
@@ -1274,31 +1279,45 @@ func openAPIPaths(prefix string) map[string]any {
 
 		prefix + "/2fa/setup": map[string]any{
 			"post": map[string]any{
-				"summary":     "Begin authenticator enrolment",
-				"description": "Stateless: nothing is persisted until the secret comes back to /2fa/verify-setup with a code that verifies against it.",
+				"summary": "Begin authenticator enrolment",
+				"description": "Stateless: nothing is persisted until the secret comes back to /2fa/verify-setup with a code that verifies against it. " +
+					"The caller is a signed-in user (an access token), or a user whose login answered `" + CodeTwoFactorSetupRequired +
+					"`, presenting that answer's enrolment token as the body's `tempToken` or as a bearer credential. " +
+					"A body `tempToken` takes precedence over an access credential and must be a valid enrolment token.",
 				"operationId": "setupTwoFactor",
 				"tags":        []string{"TwoFactor"},
 				"security":    anyCredential,
 				"parameters":  protected,
+				"requestBody": map[string]any{
+					"required": false,
+					"content": jsonContent(inline(nil, map[string]any{
+						"tempToken": map[string]any{"type": "string", "description": "The enrolment token of a " + CodeTwoFactorSetupRequired + " answer. Omit it on a voluntary enrolment."},
+					})),
+				},
 				"responses": respond(http.StatusOK, "Enrolment material", schema("TOTPSetup"),
-					HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid),
+					HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrInvalidTempToken, HTTPErrCSRFInvalid),
 			},
 		},
 		prefix + "/2fa/verify-setup": map[string]any{
 			"post": map[string]any{
-				"summary":     "Complete authenticator enrolment",
-				"description": "The code field is named `token` on this route — not `code`, and not `totpCode`.",
+				"summary": "Complete authenticator enrolment",
+				"description": "The code field is named `token` on this route — not `code`, and not `totpCode`. " +
+					"On a voluntary enrolment (an access token) the answer is `{\"success\":true}` and no session is opened. " +
+					"On a forced one — the enrolment token of a `" + CodeTwoFactorSetupRequired + "` answer, as the body's `tempToken` " +
+					"or as a bearer credential — the factor is stored and the session is opened exactly as /2fa/verify opens it: " +
+					"the session cookies, or `accessToken` and `refreshToken` under `X-Auth-Strategy: bearer`.",
 				"operationId": "verifyTwoFactorSetup",
 				"tags":        []string{"TwoFactor"},
 				"security":    anyCredential,
 				"parameters":  protected,
 				"requestBody": body(inline([]string{"token", "secret"}, map[string]any{
-					"token":  map[string]any{"type": "string", "description": "The code from the authenticator app."},
-					"secret": map[string]any{"type": "string", "description": "The secret returned by /2fa/setup."},
+					"token":     map[string]any{"type": "string", "description": "The code from the authenticator app."},
+					"secret":    map[string]any{"type": "string", "description": "The secret returned by /2fa/setup."},
+					"tempToken": map[string]any{"type": "string", "description": "The enrolment token of a " + CodeTwoFactorSetupRequired + " answer. Omit it on a voluntary enrolment."},
 				})),
-				"responses": respond(http.StatusOK, "Second factor enabled", schema("Success"),
+				"responses": respond(http.StatusOK, "Second factor enabled; on a forced enrolment, the session is issued", schema("AuthResult"),
 					HTTPErrInvalidBody, HTTPErrInvalidTOTPSetupCode, HTTPErrNoAccessToken,
-					HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid),
+					HTTPErrInvalidAccessToken, HTTPErrInvalidTempToken, HTTPErrCSRFInvalid),
 			},
 		},
 		prefix + "/2fa/verify": map[string]any{

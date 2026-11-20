@@ -74,6 +74,7 @@ func Run(t *testing.T, mount Mounter) {
 	t.Run("SMSOTP", func(t *testing.T) { testSMSOTP(t, mount) })
 	t.Run("TwoFactor", func(t *testing.T) { testTwoFactor(t, mount) })
 	t.Run("LoginTwoFactor", func(t *testing.T) { testLoginTwoFactor(t, mount) })
+	t.Run("ForcedEnrolment", func(t *testing.T) { testForcedEnrolment(t, mount) })
 	t.Run("StepUpModeDefault", func(t *testing.T) { testStepUpModeDefault(t, mount) })
 	t.Run("StepUpEmptyBody", func(t *testing.T) { testStepUpEmptyBody(t, mount) })
 	t.Run("CredentialEmptyBody", func(t *testing.T) { testCredentialEmptyBody(t, mount) })

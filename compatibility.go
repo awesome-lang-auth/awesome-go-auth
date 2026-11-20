@@ -172,9 +172,57 @@ func CompatibilityNotes() APICompatibilityNotes {
 				Why: "Reproducing it would mean shipping a five-minute bypass of the second " +
 					"factor the challenge exists to demand. The type claim is not on the wire — " +
 					"the token is opaque to every client — and the reference's own sharing is " +
-					"`[UNTESTED]` there, so no shipped client depends on it. The cost is that the " +
-					"`tempToken` in a `2FA_SETUP_REQUIRED` answer cannot reach the enrolment " +
-					"routes, which sit behind the access-token gate.",
+					"`[UNTESTED]` there, so no shipped client depends on it. The one place the " +
+					"reference's sharing did real work — the `tempToken` of a " +
+					"`2FA_SETUP_REQUIRED` answer reaching the enrolment routes as an access " +
+					"token — is served by a third type instead, the enrolment token: see " +
+					"`forced-enrolment-opens-a-session`.",
+			},
+			{
+				ID:    "forced-enrolment-opens-a-session",
+				Title: "The `2FA_SETUP_REQUIRED` token enrols and nothing else, and enrolling with it opens the session",
+				Surface: "`POST <prefix>/login` (the `tempToken` of a `2FA_SETUP_REQUIRED` answer), " +
+					"`POST <prefix>/2fa/setup` and `POST <prefix>/2fa/verify-setup`",
+				Behaviour: "When a second factor is demanded — `Config.Require2FA` or the user's " +
+					"`Require2FA` flag — and the account has none to present, the login answers " +
+					"the reference's `403 {\"requires2FASetup\":true,\"tempToken\":…,\"code\":\"2FA_SETUP_REQUIRED\"}` " +
+					"and opens no session. That `tempToken` is an enrolment token, typed apart " +
+					"from the access, step-up and refresh tokens: `POST <prefix>/2fa/setup` and " +
+					"`POST <prefix>/2fa/verify-setup` accept it, as the body's `tempToken` or as " +
+					"`Authorization: Bearer`, and every other route refuses it. It is honoured " +
+					"only while the login would still answer `2FA_SETUP_REQUIRED` for its user, " +
+					"so it dies the moment a factor exists, and a replay is " +
+					"`401 INVALID_TEMP_TOKEN`. A `verify-setup` that completes with it stores the " +
+					"factor and opens the session exactly as `POST <prefix>/2fa/verify` does — " +
+					"cookies, or `accessToken` and `refreshToken` under `X-Auth-Strategy: bearer` — " +
+					"raising `identity.user.2fa.enabled` and then `identity.auth.login.success` " +
+					"with `method: \"totp\"`. With an access token, the voluntary path, " +
+					"`verify-setup` answers `{\"success\":true}` and opens nothing, as before.",
+				Reference: "Mints that `tempToken` as an ordinary 5-minute access token, so a client " +
+					"sends it as a bearer credential to `/2fa/setup` and `/2fa/verify-setup`, " +
+					"both behind `authMiddleware`, and also to every other protected route for " +
+					"five minutes. `verify-setup` enables the factor and answers " +
+					"`{success: true}` with no session, whatever credential reached it, so the " +
+					"client logs in again with the password and the new code.",
+				Citations: []string{"auth.router.ts:562-568", "auth.router.ts:828-857"},
+				Why: "The reference's token can enrol only because it is also a full session " +
+					"credential, which is the five-minute bypass " +
+					"`temp-token-is-typed-not-an-access-token` refuses — and before this, refusing " +
+					"it left the setup answer with no route to complete it, so an account under " +
+					"a mandatory policy had to be enrolled out of band before it could ever sign " +
+					"in. A token that can do nothing but enrol, and only while enrolment is " +
+					"owed, restores the flow without the bypass. Opening the session at the end " +
+					"replaces the reference's second login, which would re-prove the same two " +
+					"factors this request has just proved: the password, by the login that " +
+					"minted the token, and the code, by this request.",
+				Notes: []DeviationNote{{
+					Label: "For a client written against the reference",
+					Text: "It keeps working. Sending the `tempToken` as `Authorization: Bearer` to " +
+						"the two enrolment routes is accepted, and a client that ignores the " +
+						"session `verify-setup` now delivers and logs in again gets the step-up " +
+						"challenge for the factor it just enrolled. What it can no longer do is " +
+						"use that token on any other route before the second factor exists.",
+				}},
 			},
 			{
 				ID:      "refresh-secret-falls-back-to-secret",
@@ -981,6 +1029,17 @@ func CompatibilityNotes() APICompatibilityNotes {
 							"offered here is `auth.Auth`, whose surface is the routes. " +
 							"`event_publication_test.go` pins all twenty-six, exercises the " +
 							"twenty-three and names the missing surface for each of the three.",
+					},
+					{
+						Label: "One more place a login completes",
+						Text: "A forced enrolment's `POST <prefix>/2fa/verify-setup` opens a session, " +
+							"which the development line's never does, and raises " +
+							"`identity.auth.login.success` with `method: \"totp\"` after the " +
+							"`identity.user.2fa.enabled` that route always raises — the payload of " +
+							"the `POST <prefix>/2fa/verify` site, reached from the one other place a " +
+							"password-and-TOTP login now completes. It is not counted among the " +
+							"twenty-six, which are the development line's; see " +
+							"`forced-enrolment-opens-a-session`.",
 					},
 				},
 			},

@@ -93,6 +93,8 @@ Low-level constructor. Use `New()` for most cases.
 | `SetupTOTP(ctx, userID, tenantID) (string, error)` | Generate TOTP secret |
 | `VerifyTOTPSetup(ctx, userID, tenantID, secret, code) error` | Enable TOTP |
 | `VerifyTOTP(ctx, userID, tenantID, code) (User, AuthTokens, error)` | TOTP second factor |
+| `VerifyEnrolmentToken(ctx, token) (User, error)` | Resolve the user a `2FA_SETUP_REQUIRED` enrolment token names, while that user still has to enrol — see [forced enrolment](#mandatory-second-factor-and-forced-enrolment--require2fa) |
+| `CompleteTOTPEnrolment(ctx, userID, tenantID, secret, code) (User, AuthTokens, error)` | Enable TOTP for a user who has to enrol and open their session, as `/2fa/verify` does |
 | `DisableTOTP(ctx, userID, tenantID) error` | Disable TOTP |
 | `SendVerificationEmailToken(ctx, EmailVerificationInput) (string, error)` | Generate email verification token |
 | `VerifyEmail(ctx, VerifyEmailInput) error` | Mark email verified |
@@ -311,6 +313,83 @@ as constants, read by both the URI above and the verifier behind
 | `TOTPDigits` | `6` | otplib's default |
 | `TOTPPeriod` | `30 * time.Second` | otplib's default |
 | `TOTPSkew` | `1` | steps either side of now a code is accepted for; this port's tolerance — otplib's `epochTolerance` defaults to `0`, registered as the deviation `totp-accepts-one-step-of-skew` in [README.md](README.md) |
+
+### Mandatory second factor and forced enrolment — `Require2FA`
+
+A second factor is demanded at `POST <prefix>/login` when `Config.Require2FA`
+(`WithRequire2FA(true)`) is set, when the user's own `User.Require2FA` flag is
+set, or when the user has TOTP enrolled. The login then opens **no session**
+and answers with one of two bodies:
+
+| The account can present | Answer |
+| --- | --- |
+| a factor — TOTP enrolled, a phone number on a deployment that can send SMS, or any account on a deployment that can send magic links | `200 {"requiresTwoFactor":true,"tempToken":"<step-up token>","available2faMethods":[…]}`; the client completes it at `/2fa/verify`, `/sms/verify` or `/magic-link/verify` in `mode: "2fa"` |
+| nothing | `403 {"requires2FASetup":true,"tempToken":"<enrolment token>","code":"2FA_SETUP_REQUIRED"}`, and no cookie in either mode |
+
+The second answer's `tempToken` is an **enrolment token**. It lives for
+`Config.TempTokenTTL` (5 minutes by default) and is accepted by exactly two
+routes, `POST <prefix>/2fa/setup` and `POST <prefix>/2fa/verify-setup`, either
+as the body's `tempToken` or as `Authorization: Bearer <token>`. The bearer
+form is how a client written against the reference presents it, since the
+reference's `tempToken` is an access token. Forced enrolment is then the
+ordinary enrolment with the token in place of a session:
+
+```
+POST /auth/login             {"email":…,"password":…}
+  → 403 {"requires2FASetup":true,"tempToken":"T","code":"2FA_SETUP_REQUIRED"}
+POST /auth/2fa/setup         {"tempToken":"T"}
+  → 200 {"secret":"S","otpauthUrl":"otpauth://totp/…"}
+POST /auth/2fa/verify-setup  {"tempToken":"T","secret":"S","token":"123456"}
+  → 200 {"success":true} + the session cookies
+        (or {"success":true,"accessToken":…,"refreshToken":…} under X-Auth-Strategy: bearer)
+```
+
+A `verify-setup` that completes with the enrolment token stores the factor and
+then **opens the session exactly as `/2fa/verify` does**: the same delivery, a
+session row, and `identity.user.2fa.enabled` followed by
+`identity.auth.login.success` with `method: "totp"`. The password was proved by
+the login that minted the token and the code by this request. With an access
+token instead, the voluntary path, `verify-setup` answers `{"success":true}`
+and opens nothing, as before. `Service.VerifyEnrolmentToken` and
+`Service.CompleteTOTPEnrolment` (with `Auth` delegates) are the same two steps
+for a host serving its own routes, and `Auth.TOTPEnrolmentCaller` is the gate
+the adapters put on the two routes.
+
+What keeps the token to its one purpose:
+
+- **It is typed apart.** It is not an access token, not a step-up token and not
+  a refresh token. `/me` and every other access-gated route answer
+  `403 "Invalid or expired access token"`. `/2fa/verify` answers
+  `401 INVALID_ACCESS_TOKEN`, the SMS and magic-link step-up routes
+  `401 INVALID_TEMP_TOKEN`, `/refresh` `401`, and the admin guard `401`. The
+  other way round, a step-up token, an access token or a refresh token in the
+  body's `tempToken` is `401 INVALID_TEMP_TOKEN`. In particular, the step-up
+  token a user *with* a factor holds after the password alone cannot enrol a
+  replacement factor.
+- **It lives only as long as the need.** Each use re-reads the user and
+  requires that the login would still answer `2FA_SETUP_REQUIRED`. Once a
+  factor exists — from this token, another one, an administrator — or once the
+  policy is lifted, every outstanding enrolment token answers
+  `401 INVALID_TEMP_TOKEN`. That is what refuses a replay after a successful
+  enrolment, with no store of spent tokens. Two `verify-setup` calls racing
+  with the same token can both pass the check. That window is not closed,
+  since whoever holds the token can obtain another one from the password
+  anyway.
+- **A request with no enrolment token is answered as the access middleware
+  answers it**: `403 "No access token provided"`,
+  `403 "Invalid or expired access token"`, `401 SESSION_REVOKED`, and
+  `403 CSRF_INVALID` for a cookie-authenticated call without the header. A body
+  `tempToken` takes precedence over an access credential on the same request.
+  An `Authorization: Bearer` value is tried as an enrolment token only after it
+  failed as an access token.
+
+`AuthSettings.Require2FA`, the setting an administrator flips at run time, is
+**not** a login term, as it is not in the reference: it is read only by
+`/2fa/disable`. A deployment that wants the policy at login sets
+`Config.Require2FA`. The magic-link sender widens what counts as a factor (see
+the table), so a deployment that can send magic links challenges with them
+rather than asking for enrolment. That is the reference's
+`available2faMethods` rule.
 
 ### Password verifier (migration seam)
 
