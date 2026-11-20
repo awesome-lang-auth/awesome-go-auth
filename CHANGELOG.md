@@ -109,6 +109,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Behind the adapters' own mount under the option they always authenticate the
   request themselves: a user an outer middleware injected is not a credential
   there, as it was not behind the access middleware.
+- **Machine access to the admin API: `AdminOptions.MachineAccess`**, a
+  `func(*http.Request) (principal string, ok bool)` the host supplies. It is
+  asked first on every guarded admin request, ahead of the session policy and
+  the legacy secret. A non-empty principal with `ok` grants the request with no
+  token, cookie, user-store read or policy evaluation;
+  `AdminMachinePrincipalFromContext` hands the principal to the handler; and
+  `EventAdminMachineAccess` (`identity.admin.machine.access`, outside the
+  reference's `EventNames` vocabulary) is raised with the principal, the method
+  and the path, carrying the request's provenance — the audit trail of every
+  machine-authenticated admin call. `ok` false, or an empty principal (logged),
+  leave the request to the guard unchanged; nil is the reference's guard. The
+  machine path reads no cookie, so a machine caller sends no CSRF pair.
+  `AdminMounted` still requires an `AccessPolicy` or a `Secret`; a deployment
+  for machines only configures a policy that admits no session. No credential
+  implementation ships: the host verifies its own (an IAM-signed request, a
+  mutual-TLS peer, a key). Registered as the deviation
+  `admin-machine-access-is-a-host-seam`.
+
+### Fixed
+- **`DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote`
+  with `method=flag` reach a user stored under a tenant.** Both passed the
+  empty tenant to the store, so in a multi-tenant deployment the console
+  listed users it could neither delete nor flag (500). They now resolve the
+  tenant through `UserLookupStore`, as `GET <admin>/api/users/{id}` already
+  did, and write the row the listing shows. A store without the capability,
+  and an id no tenant holds, keep the empty tenant, so a single-tenant
+  deployment and an unknown id answer exactly as before. The
+  `admin-user-detail-spans-tenants-only-through-a-lookup-store` entry now
+  covers the two writes.
 
 ## [0.13.0] - 2026-11-20
 

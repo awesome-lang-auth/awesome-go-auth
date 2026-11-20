@@ -83,6 +83,7 @@ func main() {
 - In-memory tenant store (`MemoryTenantStore`) with user↔tenant membership.
 - Custom token claims via `Config.BuildTokenClaims`, written by hand or built from configuration with `StaticClaims`, `UserFieldClaims`, `ChainClaims` and the synchronous `ClaimsWebhook`; reflected under `customClaims` on `GET /me`. The hook may override the reference's six base claims (`sub`, `email`, `role`, `loginProvider`, `isEmailVerified`, `isTotpEnabled`); the session claims `sid`, `tid`, `jti`, `typ`, `iss`, `iat` and `exp` are reserved. It runs at mint time and on `/me`, never in the adapters' middleware ([Custom Claims](README_DETAILED.md#custom-claims)).
 - API key service and HTTP middleware (`APIKeyService`, `APIKeyMiddleware`).
+- Machine access to the admin API for back-office services, on a credential the host verifies (`AdminOptions.MachineAccess`), ahead of the session policy and audited per call as `identity.admin.machine.access` ([Admin API machine access](README_DETAILED.md#admin-api-machine-access--adminoptionsmachineaccess)).
 - In-process event bus (`EventBus`) for event-driven integrations.
 - Extended storage interfaces and thread-safe in-memory implementations for all the above flows.
 
@@ -1493,11 +1494,13 @@ revision the whole contract was extracted from.
   break on receiving one. The cost falls on a store implementor, which is why
   both orders are stated on the interfaces and not only here.
 
-### `GET <admin>/api/users/{id}` reaches a user in another tenant only through `UserLookupStore`
+### `GET <admin>/api/users/{id}` and the two user writes reach a user in another tenant only through `UserLookupStore`
 
 `admin-user-detail-spans-tenants-only-through-a-lookup-store`
 
-- **Surface**: `HTTPConfig.Admin`: `GET <admin>/api/users/{id}`.
+- **Surface**: `HTTPConfig.Admin`: `GET <admin>/api/users/{id}`,
+  `DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote` with
+  `method=flag`.
 - **This port**: Resolves the id through `auth.UserLookupStore.FindUserByID`
   when the configured user store implements it — by id alone, across every
   tenant, which is how `GET <admin>/api/users` lists — and answers the
@@ -1506,7 +1509,11 @@ revision the whole contract was extracted from.
   literal, so a user stored under a non-empty tenant is
   `404 {"error": "User not found"}` although the listing shows it. A store that
   holds one id under two tenants answers an error for that id rather than either
-  record, and the route answers that `404` too.
+  record, and the route answers that `404` too. The two writes resolve the same
+  way before they write: the delete and the flag go to the tenant the lookup
+  found the user in, and to the empty tenant when the store has no lookup or no
+  tenant holds the id — so an unknown id still gets the store's own answer, a
+  `500` from `MemoryUserStore`.
 - **The reference**: `findById(id)` is a mandatory `IUserStore` method and
   carries no tenant (`user-store.interface.ts:5`). The route calls it with the
   path parameter and answers `404` only for `null` (`admin.router.ts:789-800`).
@@ -1531,15 +1538,55 @@ revision the whole contract was extracted from.
   `AdminUserStore.ListUsers`: that index sorts on `<tenantID>#<id>`, and a key
   condition cannot match a suffix. It needs an item keyed on the id alone; the
   interface's doc comment sets out the two ways to have one.
-- **What this does not cover**: `DELETE <admin>/api/users/{id}` and
-  `POST <admin>/users/{id}/promote` with `method=flag` still pass the empty
-  tenant whatever the store implements, so in a multi-tenant deployment neither
-  reaches a user the listing shows under another tenant. Both are writes, and
-  resolving a write's row through this seam changes which row it reaches;
-  neither has been moved onto it yet. `GET <admin>/api/users/{id}/roles` also
+- **What this covers, and what it does not**: `DELETE <admin>/api/users/{id}`
+  and `POST <admin>/users/{id}/promote` with `method=flag` resolve the tenant
+  through this seam since they were moved onto it, so in a multi-tenant
+  deployment both reach the user the listing shows; only the tenant is looked
+  up, and neither route answers a `404` of its own. The other user-scoped admin
+  writes still pass the empty tenant. `GET <admin>/api/users/{id}/roles` also
   passes the empty tenant and is not a case of this at all: its tenant is the
   scope of a role assignment, and the console's own writers assign in the empty
   scope.
+
+### A host can admit a machine caller to the admin API, ahead of the session policy, and every such call is audited
+
+`admin-machine-access-is-a-host-seam`
+
+- **Surface**: `HTTPConfig.Admin.MachineAccess`: every route behind
+  `AdminGuard.Protect`, and `identity.admin.machine.access` on the event bus.
+- **This port**: `AdminOptions.MachineAccess`, a
+  `func(*http.Request) (principal string, ok bool)` the host supplies, is asked
+  first on every guarded admin request, before the session policy and before the
+  legacy secret. `ok` with a non-empty principal grants the request outright —
+  no token, no cookie, no user store and no policy are read —
+  `AdminMachinePrincipalFromContext` hands the principal to the handler, and
+  `identity.admin.machine.access` is raised with the principal, the method and
+  the path. `ok` false, and `ok` with an empty principal, leave the request to
+  the guard exactly as if the function were absent. The machine path reads no
+  cookie, so a machine caller needs no CSRF pair. The event is outside the
+  `identity.*` vocabulary `EventNames` returns, and with no event bus nothing is
+  recorded. Nil, the default, is the reference's guard.
+- **The reference**: Offers two ways into the admin router: the deprecated
+  `adminSecret`, one shared bearer string compared for every caller with no
+  identity behind it, and the session policies, which judge a user's token. A
+  service has to be a user with a password and a session to use the second, and
+  nothing in either is audited per caller (`admin.router.ts:252-266`,
+  `admin.router.ts:269-395`).
+- **Why**: Back-office services provision and remove accounts through the admin
+  API, and the reference gives them nothing better than a shared secret or a
+  human's account kept in a vault — the interim a deployment otherwise has to
+  run, with a second factor it has to automate. A host that already
+  authenticates its services at the edge — an IAM-signed request at an API
+  gateway, a mutual-TLS peer, a scoped key — needs only a place to say so, and
+  the guard is that place: ahead of the policy, so a service is never mistaken
+  for a person, and with an audit record naming the caller, so an admin action
+  is attributable to the service that took it. The verification is left to the
+  host because it depends on infrastructure this package never sees.
+- **Mounting a console for machines only**: `HTTPConfig.AdminMounted` still
+  requires an `AccessPolicy` or a `Secret`; `MachineAccess` alone mounts
+  nothing. A deployment whose console no person should enter configures a policy
+  that admits no session — `AdminPredicate` returning false — beside the
+  function.
 
 ### A tools router with no stated access posture is not served at all
 

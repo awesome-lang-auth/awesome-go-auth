@@ -146,13 +146,11 @@ func matchAdminPromote(method, rel string) (string, bool) {
 // including the fact that it names `IUserStore.update` — a method this port does
 // not have and deliberately narrowed. See that interface.
 //
-// The tenant passed to the store is "", which is adminDeleteUser's and for the
-// same reason: the reference's update(id, patch) carries none. In a deployment
-// that stores users under a non-empty tenant this route therefore promotes
-// nobody and answers 500 where the row exists under another tenant — the same
-// gap DELETE <admin>/api/users/:id has. The store-level half of the fix exists
-// now, as UserLookupStore; adminDeleteUser says why neither write resolves
-// through it yet.
+// The reference's update(id, patch) carries no tenant, so the tenant is
+// resolved through UserLookupStore first, exactly as adminDeleteUser resolves
+// it (adminUserTenant): the flag is written on the row the console's listing
+// shows, in whichever tenant holds it. A store without the capability, and an
+// id no tenant holds, keep the empty tenant this route always passed.
 //
 // There is no 404 above the 501 and none below it. The user store is the one
 // store createAdminRouter is always handed, and a row that is not there is
@@ -207,7 +205,7 @@ func (a *Auth) adminPromoteUser(w http.ResponseWriter, r *http.Request, cfg HTTP
 			writeAdminError(w, http.StatusNotImplemented, "IUserStore.update is required for method=flag")
 			return
 		}
-		if err := flags.UpdateIsAdmin(r.Context(), id, "", true); err != nil {
+		if err := flags.UpdateIsAdmin(r.Context(), id, a.adminUserTenant(r.Context(), id), true); err != nil {
 			writeAdminError(w, http.StatusInternalServerError, "Internal server error")
 			return
 		}

@@ -3780,6 +3780,56 @@ behaviour when the option is absent — it collapses to an empty middleware list
 
 ---
 
+### Admin API machine access — `AdminOptions.MachineAccess`
+
+A back-office service that provisions and removes accounts through the admin
+API should not need a user account, a password and a second factor. If the
+deployment already authenticates its services — an IAM-signed request at an API
+gateway, a mutual-TLS peer, a scoped API key — `AdminOptions.MachineAccess`
+lets the host say so:
+
+```go
+cfg.Admin = auth.AdminOptions{
+    Enabled: true,
+    // No person enters this console: the policy admits no session.
+    AccessPolicy: auth.AdminPredicate(func(context.Context, auth.User, auth.RolesPermissionsStore) (bool, error) {
+        return false, nil
+    }),
+    MachineAccess: func(r *http.Request) (string, bool) {
+        // Whatever the gateway in front of this handler verified and put on
+        // the request, in a form an internet caller cannot forge.
+        principal, ok := iamPrincipalFrom(r.Context())
+        return principal, ok
+    },
+}
+```
+
+The function runs for every request that reaches the guard, before the session
+policy and before the legacy `Secret`:
+
+| It answers | The request |
+| --- | --- |
+| a non-empty principal, `true` | is granted outright. No token, cookie, user store or policy is read. `AdminMachinePrincipalFromContext` returns the principal and `AdminUserFromContext` returns no user. `identity.admin.machine.access` is raised. |
+| `false` | goes to the session policy, exactly as without the function |
+| an empty principal, `true` | grants nothing and goes to the session policy too, logged: an audit record that names nobody is not one |
+
+`identity.admin.machine.access` carries
+`{"principal": …, "method": …, "path": …}` and the request's correlation id,
+client address and user agent. It is not in `EventNames()`, which is the
+reference's vocabulary alone, so subscribe to it by name or with the wildcard.
+With no event bus, nothing is recorded. The machine path reads no cookie, so a
+machine caller sends no CSRF pair; the admin router has no double-submit layer
+in any case. `AdminMounted()` still needs an `AccessPolicy` or a `Secret`, which
+is why the example configures a policy that admits nobody. The seam is
+registered as `admin-machine-access-is-a-host-seam` in [README.md](README.md).
+
+`DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote` with
+`method=flag` resolve the user's tenant through `UserLookupStore` before they
+write. They therefore reach a user stored under a tenant, the one
+`GET <admin>/api/users` lists, rather than looking in the empty tenant. Without
+the capability, or for an id no tenant holds, they pass the empty tenant as
+before, so an unknown id still gets the store's own answer.
+
 ## Security Helpers
 
 Internal helpers (unexported) available for use within the package:
