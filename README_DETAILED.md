@@ -348,9 +348,12 @@ A `verify-setup` that completes with the enrolment token stores the factor and
 then **opens the session exactly as `/2fa/verify` does**: the same delivery, a
 session row, and `identity.user.2fa.enabled` followed by
 `identity.auth.login.success` with `method: "totp"`. The password was proved by
-the login that minted the token and the code by this request. With an access
-token instead, the voluntary path, `verify-setup` answers `{"success":true}`
-and opens nothing, as before. `Service.VerifyEnrolmentToken` and
+the login that minted the token and the code by this request. Because that
+session claims the factor, the forced path also requires `secret` to be a base32
+key of at least 128 bits (RFC 4226 R6). An empty secret, whose codes anybody can
+compute, is `400 "Invalid TOTP code"` and enrols nothing. With an access token
+instead, the voluntary path, `verify-setup` answers `{"success":true}` and opens
+nothing, as before. `Service.VerifyEnrolmentToken` and
 `Service.CompleteTOTPEnrolment` (with `Auth` delegates) are the same two steps
 for a host serving its own routes, and `Auth.TOTPEnrolmentCaller` is the gate
 the adapters put on the two routes.

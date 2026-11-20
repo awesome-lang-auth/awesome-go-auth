@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"net/http"
@@ -114,7 +115,9 @@ func (s *Service) VerifyEnrolmentToken(ctx context.Context, token string) (User,
 //
 // The user is re-read and must still need to enrol (ErrInvalidToken
 // otherwise), so a direct caller cannot use this to replace a factor an account
-// already has. Then it is VerifyTOTPSetup — the code checked against secret
+// already has. The secret must be a base32 key of at least 128 bits (RFC 4226
+// R6; ErrInvalidCode otherwise), because the session that follows claims the
+// factor. Then it is VerifyTOTPSetup — the code checked against secret
 // (ErrInvalidCode), the secret stored, identity.user.2fa.enabled raised — and
 // then the tail of POST /2fa/verify: a session, and identity.auth.login.success
 // with `method: "totp"`. The two events are the two the voluntary enrolment and
@@ -133,6 +136,14 @@ func (s *Service) CompleteTOTPEnrolment(ctx context.Context, userID, tenantID, s
 	}
 	if !s.mustEnrolSecondFactor(user) {
 		return User{}, AuthTokens{}, ErrInvalidToken
+	}
+	// The session this opens says the account holds a second factor, so the
+	// secret has to be one: an empty string decodes to an empty HMAC key whose
+	// codes anybody can compute, and it would leave the account still owing
+	// enrolment while its session claimed otherwise. A secret below the RFC
+	// 4226 floor is refused as a code that does not verify.
+	if !totpSecretIsStrong(secret) {
+		return User{}, AuthTokens{}, ErrInvalidCode
 	}
 	if err := s.VerifyTOTPSetup(ctx, user.ID, user.TenantID, secret, code); err != nil {
 		return User{}, AuthTokens{}, err
@@ -158,6 +169,20 @@ func (s *Service) CompleteTOTPEnrolment(ctx context.Context, userID, tenantID, s
 		}
 	})
 	return user, tokens, nil
+}
+
+// minTOTPSecretBytes is RFC 4226 §4 requirement R6: "The length of the shared
+// secret MUST be at least 128 bits." The secrets POST /2fa/setup mints are well
+// above it (generateTOTPSecret).
+const minTOTPSecretBytes = 16
+
+// totpSecretIsStrong reports whether secret is a base32 key of at least
+// minTOTPSecretBytes, which is what a forced enrolment requires before it opens
+// a session on the strength of it. The voluntary path checks nothing of the
+// kind, as the reference's does not; it opens no session.
+func totpSecretIsStrong(secret string) bool {
+	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secret)
+	return err == nil && len(key) >= minTOTPSecretBytes
 }
 
 // TOTPEnrolmentRequest is the body POST <prefix>/2fa/setup and POST

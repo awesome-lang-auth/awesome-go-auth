@@ -41,7 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly as `POST <prefix>/2fa/verify` does — the session cookies, or
   `accessToken`/`refreshToken` under `X-Auth-Strategy: bearer` — and raises
   `identity.user.2fa.enabled` then `identity.auth.login.success` with
-  `method: "totp"`. The token lives `Config.TempTokenTTL` and is honoured only
+  `method: "totp"`. Because that session claims the factor, the forced path
+  requires the secret to be a base32 key of at least 128 bits (RFC 4226 R6) —
+  an empty secret, whose codes anybody can compute, is `400 "Invalid TOTP
+  code"` and enrols nothing. The token lives `Config.TempTokenTTL` and is honoured only
   while the login would still answer `2FA_SETUP_REQUIRED` for its user, so it
   dies the moment a factor exists: a replay after a successful enrolment, or a
   second outstanding token, is `401 INVALID_TEMP_TOKEN`. Voluntary enrolment

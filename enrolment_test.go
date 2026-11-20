@@ -368,3 +368,50 @@ func TestCompleteTOTPEnrolment_RefusesAnAccountWithAFactor(t *testing.T) {
 		t.Errorf("TOTPEnrolmentHTTPError = %v, want INVALID_TEMP_TOKEN", got)
 	}
 }
+
+// TestCompleteTOTPEnrolment_RefusesASecretThatIsNoFactor: an empty secret
+// decodes to an empty HMAC key, so its codes verify and anybody can compute
+// them. The forced path refuses it, and any key below RFC 4226's 128 bits,
+// before it stores anything or opens a session; the token stays usable.
+func TestCompleteTOTPEnrolment_RefusesASecretThatIsNoFactor(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryUserStore()
+	svc := enrolmentService(t, store)
+	user, token := setupChallenge(t, svc, "weak@example.com")
+
+	short := "MFRGGZDF" // base32 of five bytes
+	for name, secret := range map[string]string{"empty": "", "short": short, "not base32": "not-a-secret!"} {
+		t.Run(name, func(t *testing.T) {
+			code, ok := generateTOTPCode(secret, time.Now().Unix()/int64(TOTPPeriod/time.Second))
+			if !ok {
+				code = "000000"
+			}
+			_, tokens, err := svc.CompleteTOTPEnrolment(ctx, user.ID, user.TenantID, secret, code)
+			if !errors.Is(err, ErrInvalidCode) {
+				t.Fatalf("CompleteTOTPEnrolment(%q) = %v, want ErrInvalidCode", secret, err)
+			}
+			if tokens.AccessToken != "" {
+				t.Fatal("a refused enrolment opened a session")
+			}
+			stored, _ := store.GetUserByID(ctx, user.ID, user.TenantID)
+			if stored.IsTOTPEnabled {
+				t.Fatal("a refused enrolment enabled TOTP")
+			}
+		})
+	}
+	if _, err := svc.VerifyEnrolmentToken(ctx, token); err != nil {
+		t.Fatalf("the enrolment token died with a refused secret: %v", err)
+	}
+	if !totpSecretIsStrong(mustSecret(t)) {
+		t.Fatal("a secret /2fa/setup mints is below the floor the forced path enforces")
+	}
+}
+
+func mustSecret(t *testing.T) string {
+	t.Helper()
+	secret, err := generateTOTPSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return secret
+}

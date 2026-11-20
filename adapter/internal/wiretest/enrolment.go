@@ -226,6 +226,22 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 		})
 	})
 
+	t.Run("an empty secret is no factor", func(t *testing.T) {
+		// An empty secret is an empty HMAC key: its code verifies, and anybody
+		// can compute it. The forced path refuses it before anything is stored.
+		env := enrolmentEnv(t, mount, auth.DefaultHTTPConfig())
+		env.Seed("emptysecret@example.com")
+		token := setupRequiredToken(t, env, "emptysecret@example.com")
+		rec := env.Do(env.Request(http.MethodPost, "/2fa/verify-setup", map[string]any{
+			"tempToken": token, "secret": "", "token": totpCode(t, "", time.Now()),
+		}))
+		AssertError(t, rec, http.StatusBadRequest, "Invalid TOTP code", "")
+		AssertNoCookie(t, rec, hostAccess)
+		// Nothing enrolled: the login still asks for setup, and the token works.
+		setupRequiredToken(t, env, "emptysecret@example.com")
+		AssertStatus(t, env.Do(env.Request(http.MethodPost, "/2fa/setup", map[string]any{"tempToken": token})), http.StatusOK)
+	})
+
 	t.Run("a voluntary enrolment still opens nothing", func(t *testing.T) {
 		// The access-token path is unchanged: {"success":true} and no session,
 		// in cookie mode too.
