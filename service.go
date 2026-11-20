@@ -243,7 +243,10 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (AuthTokens,
 	if err != nil {
 		return AuthTokens{}, err
 	}
-	newAccess, _, err := s.issueToken(ctx, user, session.ID, "access", s.cfg.AccessTokenTTL)
+	// From the row just read, so amr, auth_time and mfa_at are carried forward
+	// exactly as the session recorded them — including an mfa_at a step-up
+	// moved since the session opened.
+	newAccess, _, err := s.issueAccessToken(ctx, user, session)
 	if err != nil {
 		return AuthTokens{}, err
 	}
@@ -495,7 +498,13 @@ func (s *Service) publish(ctx context.Context, build func() Event) {
 // minted it, used it for the claims and dropped it. The split is the smallest
 // change that exposes it: every existing caller keeps the two-value signature
 // it was written against, and only the sites that publish take the third value.
-func (s *Service) issueSession(ctx context.Context, user User) (AuthTokens, string, error) {
+//
+// auth is how the user was proved, and it is a required parameter on purpose:
+// it is recorded on the session (AuthMethods, MFAAt) and carried on every
+// access token the session mints as amr and mfa_at, so a new way of opening a
+// session cannot compile without stating what it verified. See
+// authentication_context.go.
+func (s *Service) issueSession(ctx context.Context, user User, auth sessionAuth) (AuthTokens, string, error) {
 	sessionID, err := newID("ses")
 	if err != nil {
 		return AuthTokens{}, "", err
@@ -504,27 +513,40 @@ func (s *Service) issueSession(ctx context.Context, user User) (AuthTokens, stri
 	if err != nil {
 		return AuthTokens{}, "", err
 	}
-	accessToken, _, err := s.issueToken(ctx, user, sessionID, "access", s.cfg.AccessTokenTTL)
-	if err != nil {
-		return AuthTokens{}, "", err
-	}
+	// CreatedAt is read after the refresh token is minted, as it always was,
+	// so that a session never outlives its refresh token: ExpiresAt -
+	// CreatedAt is at most RefreshTokenTTL.
 	now := s.now()
-	_, err = s.sessions.CreateSession(ctx, Session{
+	session := Session{
 		ID:               sessionID,
 		UserID:           user.ID,
 		TenantID:         user.TenantID,
 		RefreshTokenHash: hashToken(refreshToken),
 		CreatedAt:        now,
 		ExpiresAt:        refreshExp,
-	})
+	}
+	auth.apply(&session, now)
+	// The factor this session may step up with is the one its user holds as
+	// it opens (Session.TOTPBinding): a factor enrolled later, through this
+	// session's own access token or any other, is not. A session whose opener
+	// cannot say how its user was proved records none, so it never steps up.
+	if len(auth.methods) > 0 {
+		session.TOTPBinding = s.totpBinding(user)
+	}
+	accessToken, _, err := s.issueAccessToken(ctx, user, session)
 	if err != nil {
+		return AuthTokens{}, "", err
+	}
+	if _, err := s.sessions.CreateSession(ctx, session); err != nil {
 		return AuthTokens{}, "", err
 	}
 	return AuthTokens{AccessToken: accessToken, RefreshToken: refreshToken, ExpiresIn: s.cfg.AccessTokenTTL}, sessionID, nil
 }
 
-func (s *Service) newSessionTokens(ctx context.Context, user User) (AuthTokens, error) {
-	tokens, _, err := s.issueSession(ctx, user)
+// newSessionTokens is issueSession for the callers that do not publish the
+// session id: the OAuth callback paths.
+func (s *Service) newSessionTokens(ctx context.Context, user User, auth sessionAuth) (AuthTokens, error) {
+	tokens, _, err := s.issueSession(ctx, user, auth)
 	return tokens, err
 }
 
@@ -540,7 +562,7 @@ func (s *Service) newSessionTokens(ctx context.Context, user User) (AuthTokens, 
 // copies is what keeps the dev line's single site single: neither entry point
 // can drift from the other, and no caller can reach both and publish twice.
 func (s *Service) completeLocalLogin(ctx context.Context, user User) (AuthTokens, error) {
-	tokens, sessionID, err := s.issueSession(ctx, user)
+	tokens, sessionID, err := s.issueSession(ctx, user, authBy(AMRPassword))
 	if err != nil {
 		return AuthTokens{}, err
 	}
@@ -838,8 +860,20 @@ func (s *Service) ConsumeMagicLink(ctx context.Context, in MagicLinkVerifyInput)
 // and the decision to honour it is the caller's. Pass the User that
 // ConsumeMagicLink returned, not one looked up some other way. It does not mark
 // the address verified; VerifyMagicLink does that for the login path.
+//
+// The session it opens records a login by email link alone (amr ["email"]),
+// with no second factor: that is what a magic-link login is. The step-up
+// branch, VerifyMagicLinkForUser, records the link as the second factor of a
+// password login instead.
 func (s *Service) CompleteMagicLinkLogin(ctx context.Context, user User) (AuthTokens, error) {
-	tokens, sessionID, err := s.issueSession(ctx, user)
+	return s.completeMagicLinkLogin(ctx, user, authBy(AMREmail))
+}
+
+// completeMagicLinkLogin is CompleteMagicLinkLogin with the authentication the
+// session records stated by the caller: the login branch and the step-up
+// branch differ in that and in nothing else.
+func (s *Service) completeMagicLinkLogin(ctx context.Context, user User, auth sessionAuth) (AuthTokens, error) {
+	tokens, sessionID, err := s.issueSession(ctx, user, auth)
 	if err != nil {
 		return AuthTokens{}, err
 	}
@@ -921,7 +955,14 @@ func (s *Service) VerifySMSCode(ctx context.Context, in SMSCodeVerifyInput) (Use
 	if err := ss.ClearSMSCode(ctx, matched.ID, matched.TenantID); err != nil {
 		return User{}, AuthTokens{}, err
 	}
-	tokens, sessionID, err := s.issueSession(ctx, matched)
+	// The same route is a login of its own and the second factor of a
+	// password login, and only the caller knows which: SecondFactor is set by
+	// the adapters after they verified the step-up token that named the user.
+	auth := authBy(AMRSMS)
+	if in.SecondFactor {
+		auth = authBySecondFactor(AMRPassword, AMRSMS)
+	}
+	tokens, sessionID, err := s.issueSession(ctx, matched, auth)
 	if err != nil {
 		return User{}, AuthTokens{}, err
 	}
@@ -1131,7 +1172,9 @@ func (s *Service) VerifyTOTP(ctx context.Context, userID, tenantID, code string)
 	if !validateTOTPCode(user.TOTPSecret, code, s.now()) {
 		return User{}, AuthTokens{}, ErrInvalidCode
 	}
-	tokens, sessionID, err := s.issueSession(ctx, user)
+	// The second factor of a password login: the step-up token that named
+	// this user is only ever minted after the password verified.
+	tokens, sessionID, err := s.issueSession(ctx, user, authBySecondFactor(AMRPassword, AMROTP))
 	if err != nil {
 		return User{}, AuthTokens{}, err
 	}

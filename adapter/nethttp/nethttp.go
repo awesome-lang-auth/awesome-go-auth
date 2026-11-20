@@ -200,7 +200,7 @@ func (a *Adapter) Mount(mux *http.ServeMux) {
 	}
 }
 
-// mountCredentialRoutes registers the nineteen routes that create, prove,
+// mountCredentialRoutes registers the twenty routes that create, prove,
 // deliver or change a credential — auth.ResourceServerGatedRoutes, which is the
 // same list and carries the reasoning. HTTPConfig.ResourceServer is the switch
 // that skips this call, and HTTPConfig.ClosedRegistration the one that skips
@@ -229,6 +229,7 @@ func (a *Adapter) mountCredentialRoutes(mux *http.ServeMux, prefix string) {
 	mux.Handle("POST "+prefix+"/2fa/verify-setup", a.guard(a.enrolmentGate(http.HandlerFunc(a.TwoFactorVerifySetup))))
 	mux.Handle("POST "+prefix+"/2fa/verify", a.guard(http.HandlerFunc(a.TwoFactorVerify)))
 	mux.Handle("POST "+prefix+"/2fa/disable", a.guard(a.Middleware()(http.HandlerFunc(a.TwoFactorDisable))))
+	mux.Handle("POST "+prefix+auth.StepUpRoute, a.guard(a.Middleware()(http.HandlerFunc(a.TwoFactorStepUp))))
 	// Password management and email verification (wire-contract §2). Handlers in
 	// password_email.go.
 	mux.Handle("POST "+prefix+"/forgot-password", a.guard(http.HandlerFunc(a.ForgotPassword)))

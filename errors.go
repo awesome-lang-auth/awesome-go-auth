@@ -26,6 +26,13 @@ var (
 	// the whole family the token belongs to. See IDPRefreshTokenStore.
 	ErrRefreshTokenReused = errors.New("auth: refresh token already used")
 
+	// ErrReauthenticationRequired is Service.StepUpTOTP's answer for a session
+	// that cannot step up with the account's current TOTP factor: the factor
+	// was enrolled after the session opened, or the session recorded none it
+	// may step up with (Session.TOTPBinding). The remedy is a fresh sign-in,
+	// whose session is bound to the factor it presents.
+	ErrReauthenticationRequired = errors.New("auth: the second factor is newer than the session; sign in again")
+
 	// ErrInvalidInput is a registration missing one of the two fields the route
 	// cannot proceed without. It is deliberately not ErrWeakPassword: an absent
 	// password is not a rejected one, and the default register handler on the

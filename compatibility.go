@@ -240,6 +240,74 @@ func CompatibilityNotes() APICompatibilityNotes {
 				},
 			},
 			{
+				ID: "access-tokens-carry-the-authentication-context",
+				Title: "Access tokens carry `amr`, `auth_time` and `mfa_at`, and `POST <prefix>/2fa/step-up` " +
+					"re-verifies the second factor",
+				Surface: "Every access token a session mints — `POST <prefix>/login`, `/refresh`, `/2fa/verify`, " +
+					"`/sms/verify`, `/magic-link/verify`, the OAuth callback, `/link-verify` and the IdP's " +
+					"`/token` — `POST <prefix>/2fa/step-up`, and `Config.BuildTokenClaims`",
+				Behaviour: "The session records how its user was proved, and every access token it mints " +
+					"carries that as three claims after the reserved ones: `amr`, RFC 8176 values in the order " +
+					"the factors were presented (`[\"pwd\"]` for a password login, `[\"pwd\",\"otp\",\"mfa\"]` " +
+					"after `/2fa/verify`, `sms` or `email` in place of `otp` for the SMS and magic-link step-up, " +
+					"`[\"email\"]` for a magic-link login, `[\"oauth\"]` for an OAuth one); `auth_time`, when " +
+					"the session opened; and `mfa_at`, when a second factor was last presented — absent for a " +
+					"session that never presented one, which includes the OAuth callback. A refresh carries " +
+					"all three forward unchanged, the IdP's `refresh_token` grant too, and " +
+					"`POST <prefix>/2fa/step-up` — `{\"totpCode\"}` with an access token — re-verifies TOTP " +
+					"for the current session, moves `mfa_at` to now, adds `otp` and `mfa` to `amr` and answers " +
+					"a fresh access token alone: the access cookie, or `accessToken` under " +
+					"`X-Auth-Strategy: bearer`; a session store without `SessionAuthenticationStore` answers " +
+					"`501`. The step-up accepts only the factor the session is bound to — the TOTP secret its " +
+					"user held when it opened (`Session.TOTPBinding`) — and answers any other " +
+					"`403 REAUTHENTICATION_REQUIRED` before looking at the code, so a factor enrolled through " +
+					"the session's own access token never moves its `mfa_at`; and the wrong code that reaches " +
+					"`StepUpFailureLimit` revokes the session. The three names are reserved, like the session " +
+					"claims, in every spelling `encoding/json` folds onto them: `BuildTokenClaims`, and so a " +
+					"`ClaimsWebhook`, cannot set them on any token, and `UserFieldClaims` refuses to map onto " +
+					"them. The admin " +
+					"console's own login mints a token of another type that carries none of them. " +
+					"`VerifyAccess`, and so the adapters' middleware, exposes them as `User.AuthMethods`, " +
+					"`User.AuthTime` and `User.MFAAt`.",
+				Reference: "The payload is `buildPayload(user)` — the six base claims with " +
+					"`config.buildTokenPayload(user)` spread over them — plus `sid`, and nothing in it says " +
+					"how the session was obtained: a password login and a password-and-TOTP login mint the " +
+					"same claims. The hook may set any name but the session claims, `amr` and `mfa_at` " +
+					"included, and there is no route that re-verifies a factor for an existing session.",
+				Citations: []string{"auth.router.ts:378-384", "auth.router.ts:433", "token.service.ts:19"},
+				Why: "A privileged action wants proof of a recent second factor, and with the reference's " +
+					"payload a resource server has nothing to read: the only way to know is to ask the auth " +
+					"service on every call, which is the round trip a self-contained token exists to avoid. " +
+					"Recording the context on the session and minting it on the token answers the question " +
+					"locally, and reserving the names is what makes the answer worth believing — an `mfa_at` " +
+					"a claims hook or a webhook could write is not evidence of anything. The claims are " +
+					"additive for every client, which ignores claims it does not know; the one thing taken " +
+					"away is a host hook's ability to emit those three names, and the step-up route is new " +
+					"surface the reference has no counterpart for.",
+				Notes: []DeviationNote{
+					{
+						Label: "Matching the reference exactly",
+						Text: "Not available from configuration: the claims are minted on every access token. " +
+							"A client that does not read them sees the reference's payload with three extra " +
+							"members. A host hook that set `amr`, `auth_time` or `mfa_at` must rename the " +
+							"claim; a `UserFieldClaims` mapping onto one now fails at startup.",
+					},
+					{
+						Label: "What a session store owes",
+						Text: "Persist `Session.AuthMethods`, `Session.MFAAt`, `Session.TOTPBinding` and " +
+							"`Session.StepUpAttempts` with the rest of the row; a store that does not loses them " +
+							"on the first refresh, and the tokens then claim no method and the step-up answers " +
+							"`403` — which fails closed. Implement `SessionAuthenticationStore` for the step-up " +
+							"route: `RecordSecondFactor`, a write of those fields alone that refuses a revoked " +
+							"session atomically, so a step-up can never revive a refresh token a rotation spent " +
+							"or a session a logout revoked; and `RecordStepUpAttempt`, which counts an attempt " +
+							"before its code is checked and revokes the session past the limit in the same atomic " +
+							"step. " +
+							"`MemorySessionStore` does all of it.",
+					},
+				},
+			},
+			{
 				ID:      "refresh-secret-falls-back-to-secret",
 				Title:   "The refresh-token secret is optional and may equal the access-token secret",
 				Surface: "`auth.Config.RefreshSecret` / `auth.WithRefreshSecret`, and every refresh token `POST <prefix>/login`, `POST <prefix>/register` and `POST <prefix>/refresh` mint",
@@ -637,15 +705,16 @@ func CompatibilityNotes() APICompatibilityNotes {
 			{
 				ID:      "resource-server-gates-all-credential-routes",
 				Title:   "Resource-server mode unmounts the whole credential set, not six routes of it",
-				Surface: "`HTTPConfig.ResourceServer`: the nineteen routes of `ResourceServerGatedRoutes`",
-				Behaviour: "Registers none of the nineteen routes that mint, deliver or consume a " +
+				Surface: "`HTTPConfig.ResourceServer`: the twenty routes of `ResourceServerGatedRoutes`",
+				Behaviour: "Registers none of the twenty routes that mint, deliver or consume a " +
 					"credential, so each answers `404` — `/register`, `/login`, " +
 					"`/refresh`, `/logout`, `/forgot-password`, `/reset-password`, " +
 					"`/change-password`, `/send-verification-email`, `/verify-email`, " +
 					"`/change-email/request`, `/change-email/confirm`, `/magic-link/send`, " +
 					"`/magic-link/verify`, `/sms/send`, `/sms/verify`, `/2fa/setup`, " +
-					"`/2fa/verify-setup`, `/2fa/verify` and `/2fa/disable`. " +
-					"`GenerateOpenAPISpec` drops the same nineteen under " +
+					"`/2fa/verify-setup`, `/2fa/verify`, `/2fa/disable` and `/2fa/step-up`, the " +
+					"last of which is this port's own. " +
+					"`GenerateOpenAPISpec` drops the same twenty under " +
 					"`OpenAPIInfo.ResourceServer`, so the published spec and the mount agree. " +
 					"What stays is `/me`, the session routes, `/profile`, `/add-phone`, " +
 					"`/account` and the OAuth and linking group — and those still need a local " +
@@ -677,7 +746,7 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"an SMS code cannot be stored and a TOTP secret cannot be enrolled without " +
 					"the store the mode has removed. Leaving them mounted turns a configuration " +
 					"mistake into a runtime failure on a credential route, which is the worst " +
-					"place to discover it. Gating all nineteen makes the mode mean one thing, " +
+					"place to discover it. Gating all twenty makes the mode mean one thing, " +
 					"and makes it checkable: the same list drives the mount, the OpenAPI spec " +
 					"and the conformance suite. It is drawn at the credential and not at the " +
 					"store deliberately: gating every store-reading route would unmount `/me` " +

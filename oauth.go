@@ -687,7 +687,7 @@ func (s *OAuthService) HandleCallbackWithPolicy(
 		if err != nil {
 			return User{}, AuthTokens{}, ErrInvalidCredentials
 		}
-		tokens, err := authSvc.newSessionTokens(ctx, user)
+		tokens, err := authSvc.newSessionTokens(ctx, user, authBy(AMROAuth))
 		return user, tokens, err
 	}
 
@@ -698,7 +698,7 @@ func (s *OAuthService) HandleCallbackWithPolicy(
 		if err != nil {
 			return User{}, AuthTokens{}, ErrInvalidCredentials
 		}
-		tokens, err := authSvc.newSessionTokens(ctx, user)
+		tokens, err := authSvc.newSessionTokens(ctx, user, authBy(AMROAuth))
 		return user, tokens, err
 	}
 
@@ -731,7 +731,7 @@ func (s *OAuthService) HandleCallbackWithPolicy(
 				Email:     info.Email,
 				CreatedAt: time.Now(),
 			})
-			tokens, err := authSvc.newSessionTokens(ctx, user)
+			tokens, err := authSvc.newSessionTokens(ctx, user, authBy(AMROAuth))
 			return user, tokens, err
 		}
 	}
@@ -782,7 +782,7 @@ func (s *OAuthService) HandleCallbackWithPolicy(
 		Email:     info.Email,
 		CreatedAt: now,
 	})
-	tokens, err := authSvc.newSessionTokens(ctx, newUser)
+	tokens, err := authSvc.newSessionTokens(ctx, newUser, authBy(AMROAuth))
 	return newUser, tokens, err
 }
 

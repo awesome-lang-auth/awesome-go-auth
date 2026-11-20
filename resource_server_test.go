@@ -924,8 +924,8 @@ func TestResourceServerGatedRoutesAreDocumentedRoutes(t *testing.T) {
 	prefix := DefaultAPIPrefix
 	paths := openAPIPaths(prefix)
 	gated := ResourceServerGatedRoutes()
-	if len(gated) != 19 {
-		t.Errorf("gated routes = %d, want 19", len(gated))
+	if len(gated) != 20 {
+		t.Errorf("gated routes = %d, want 20", len(gated))
 	}
 	for route := range gated {
 		if _, ok := paths[prefix+route]; !ok {

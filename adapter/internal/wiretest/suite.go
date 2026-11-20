@@ -75,6 +75,7 @@ func Run(t *testing.T, mount Mounter) {
 	t.Run("TwoFactor", func(t *testing.T) { testTwoFactor(t, mount) })
 	t.Run("LoginTwoFactor", func(t *testing.T) { testLoginTwoFactor(t, mount) })
 	t.Run("ForcedEnrolment", func(t *testing.T) { testForcedEnrolment(t, mount) })
+	t.Run("StepUp", func(t *testing.T) { testStepUp(t, mount) })
 	t.Run("StepUpModeDefault", func(t *testing.T) { testStepUpModeDefault(t, mount) })
 	t.Run("StepUpEmptyBody", func(t *testing.T) { testStepUpEmptyBody(t, mount) })
 	t.Run("CredentialEmptyBody", func(t *testing.T) { testCredentialEmptyBody(t, mount) })
@@ -131,6 +132,7 @@ var documentedRoutes = map[string]string{
 	"/2fa/verify-setup":  http.MethodPost,
 	"/2fa/verify":        http.MethodPost,
 	"/2fa/disable":       http.MethodPost,
+	"/2fa/step-up":       http.MethodPost,
 
 	"/forgot-password":         http.MethodPost,
 	"/reset-password":          http.MethodPost,

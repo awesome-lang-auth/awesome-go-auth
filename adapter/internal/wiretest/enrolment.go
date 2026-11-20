@@ -166,6 +166,9 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 			AssertCookieAttrs(t, Cookie(t, verify, hostAccess), accessCookieSpec())
 			AssertCookieAttrs(t, Cookie(t, verify, hostRefresh), refreshCookieSpec())
 
+			// The session records what was proved — the password and the code —
+			// as /2fa/verify's does: amr [pwd otp mfa] and an mfa_at.
+			assertAuthContext(t, verify, []string{auth.AMRPassword, auth.AMROTP, auth.AMRMFA}, true)
 			// The session is a real one, and it says the factor is there.
 			me := env.Do(Replay(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+"/me", nil), verify))
 			AssertStatus(t, me, http.StatusOK)
@@ -182,7 +185,7 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 			env.Seed("forcedbearer@example.com")
 			token := setupRequiredToken(t, env, "forcedbearer@example.com")
 
-			_, verify := enrolWithToken(t, env, token, true)
+			secret, verify := enrolWithToken(t, env, token, true)
 			AssertStatus(t, verify, http.StatusOK)
 			body := Body(t, verify)
 			AssertKeys(t, body, "success", "accessToken", "refreshToken")
@@ -190,6 +193,14 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 			AssertNoCookie(t, verify, hostRefresh)
 			access, _ := body["accessToken"].(string)
 			AssertStatus(t, env.Do(bearerRequest(http.MethodGet, env.Config.Prefix()+"/me", access)), http.StatusOK)
+			assertAuthContext(t, verify, []string{auth.AMRPassword, auth.AMROTP, auth.AMRMFA}, true)
+
+			// The session is bound to the factor it enrolled, so it steps up
+			// with it.
+			step := env.Do(passwordlessBearer(env.Request(http.MethodPost, auth.StepUpRoute, map[string]any{
+				"totpCode": totpCode(t, secret, time.Now()),
+			}), access))
+			AssertStatus(t, step, http.StatusOK)
 		})
 
 		t.Run("the token as a bearer credential", func(t *testing.T) {

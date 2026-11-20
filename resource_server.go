@@ -632,6 +632,14 @@ var HTTPErrInvalidTokenRS = HTTPError{
 // builds its principal with this same function, from the claims of a locally
 // verified HS256 token. Both are the same six base claims plus tid, because
 // issueToken writes exactly them (token.go).
+//
+// The authentication context is read too: amr into AuthMethods, auth_time into
+// AuthTime and mfa_at into MFAAt (authentication_context.go). amr and
+// auth_time are the OIDC Core claims of those names, so a remote issuer that
+// sets them is read the same way; mfa_at is this library's. A claim that is
+// absent or of the wrong type leaves its field zero — an amr holding anything
+// but strings is dropped whole rather than in part, and MFAAt zero is what a
+// check for a recent second factor refuses.
 func UserFromRS256Claims(claims map[string]any) User {
 	str := func(name string) string {
 		v, _ := claims[name].(string)
@@ -649,6 +657,9 @@ func UserFromRS256Claims(claims map[string]any) User {
 		LoginProvider:   str("loginProvider"),
 		IsEmailVerified: boolean("isEmailVerified"),
 		IsTOTPEnabled:   boolean("isTotpEnabled"),
+		AuthMethods:     claimStrings(claims[ClaimAMR]),
+		AuthTime:        claimNumericDate(claims[ClaimAuthTime]),
+		MFAAt:           claimNumericDate(claims[ClaimMFAAt]),
 	}
 	if len(claims) > 0 {
 		user.CustomClaims = make(map[string]any, len(claims))
@@ -657,6 +668,36 @@ func UserFromRS256Claims(claims map[string]any) User {
 		}
 	}
 	return user
+}
+
+// claimStrings reads a JSON array of strings, as encoding/json decodes one into
+// map[string]any. Anything else — absent, not an array, an array holding a
+// non-string — is nil.
+func claimStrings(value any) []string {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		s, ok := item.(string)
+		if !ok {
+			return nil
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// claimNumericDate reads a JWT NumericDate, seconds since the epoch, as
+// encoding/json decodes a number into map[string]any. Anything else is the
+// zero time.
+func claimNumericDate(value any) time.Time {
+	seconds, ok := value.(float64)
+	if !ok || seconds <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(seconds), 0)
 }
 
 // ResourceServerMiddleware guards a host route in resource-server mode
@@ -843,7 +884,7 @@ func UserFromContext(ctx context.Context) (User, bool) {
 // ResourceServerGatedRoutes is the credential surface HTTPConfig.ResourceServer
 // unmounts, as method-keyed paths relative to the mount prefix.
 //
-// Nineteen routes, and the rule behind the list is one sentence: a route is
+// Twenty routes, and the rule behind the list is one sentence: a route is
 // here when it mints, delivers or consumes a credential. Nothing more is
 // claimed for it — in particular, this is not the set of routes that need a
 // local user database; see below.
@@ -867,6 +908,7 @@ func UserFromContext(ctx context.Context) (User, bool) {
 //	POST   /2fa/verify-setup          confirm the enrolment
 //	POST   /2fa/verify                spend a second factor for a session
 //	POST   /2fa/disable               drop the enrolment
+//	POST   /2fa/step-up               re-verify the factor for an access token
 //
 // What stays mounted is GET /me, the session routes, PATCH /profile,
 // POST /add-phone, DELETE /account, and the whole OAuth and account-linking
@@ -907,8 +949,9 @@ func UserFromContext(ctx context.Context) (User, bool) {
 // The reference gates six of these — /login, /logout, /refresh, /register,
 // /forgot-password and /reset-password (auth.router.ts:541, :590, :622, :713,
 // :777, :802) — and leaves the other thirteen mounted, where they fail at
-// runtime against a database that is not there. Gating all nineteen is the
-// resource-server-gates-all-credential-routes deviation; see
+// runtime against a database that is not there. The twentieth, /2fa/step-up,
+// is this port's own and the reference has no counterpart for it. Gating all
+// twenty is the resource-server-gates-all-credential-routes deviation; see
 // CompatibilityNotes.
 //
 // The returned map is freshly built, so a caller may edit it.
@@ -935,5 +978,6 @@ func ResourceServerGatedRoutes() map[string]string {
 		"/2fa/verify-setup":  http.MethodPost,
 		"/2fa/verify":        http.MethodPost,
 		"/2fa/disable":       http.MethodPost,
+		StepUpRoute:          http.MethodPost,
 	}
 }

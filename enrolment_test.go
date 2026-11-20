@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -327,6 +328,11 @@ func TestCompleteTOTPEnrolment(t *testing.T) {
 	}
 	if !principal.IsTOTPEnabled {
 		t.Error("the session's access token says isTotpEnabled false after enrolment")
+	}
+	// What was proved — the password, then the code — is what the session
+	// records, as /2fa/verify's does.
+	if !slices.Equal(principal.AuthMethods, []string{AMRPassword, AMROTP, AMRMFA}) || principal.MFAAt.IsZero() {
+		t.Errorf("principal context = %v / %v, want [pwd otp mfa] and an mfa_at", principal.AuthMethods, principal.MFAAt)
 	}
 
 	got := h.events()

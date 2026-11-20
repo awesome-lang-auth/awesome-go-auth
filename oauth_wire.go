@@ -1058,7 +1058,9 @@ func (a *Auth) LinkVerify(ctx context.Context, in LinkVerifyInput) (LinkVerifyRe
 	if !in.LoginAfterLinking {
 		return LinkVerifyResult{}, nil
 	}
-	user, tokens, err := a.service.IssueTokensForUser(ctx, meta.UserID, meta.TenantID)
+	// The proof is the account-link token, which reached the user through
+	// their mailbox: the session records a login by email link.
+	user, tokens, err := a.service.issueTokensForUser(ctx, meta.UserID, meta.TenantID, authBy(AMREmail))
 	if err != nil {
 		return LinkVerifyResult{}, err
 	}
@@ -1071,12 +1073,22 @@ func (a *Auth) LinkVerify(ctx context.Context, in LinkVerifyInput) (LinkVerifyRe
 // not have: every other issuance path (Register, Login, VerifyMagicLink,
 // VerifySMSCode, VerifyTOTP) reaches newSessionTokens through a credential
 // check that does not apply.
+//
+// It takes the proof on trust and cannot say what it was, so the session it
+// opens records no authentication methods: its access tokens carry auth_time
+// and no amr or mfa_at, rather than a guess a resource server would believe.
+// POST <prefix>/link-verify opens its session through the same path with the
+// method stated (amr ["email"]).
 func (s *Service) IssueTokensForUser(ctx context.Context, userID, tenantID string) (User, AuthTokens, error) {
+	return s.issueTokensForUser(ctx, userID, tenantID, unknownAuth)
+}
+
+func (s *Service) issueTokensForUser(ctx context.Context, userID, tenantID string, auth sessionAuth) (User, AuthTokens, error) {
 	user, err := s.users.GetUserByID(ctx, userID, tenantID)
 	if err != nil {
 		return User{}, AuthTokens{}, ErrInvalidCredentials
 	}
-	tokens, err := s.newSessionTokens(ctx, user)
+	tokens, err := s.newSessionTokens(ctx, user, auth)
 	if err != nil {
 		return User{}, AuthTokens{}, err
 	}

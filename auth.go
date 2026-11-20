@@ -303,8 +303,8 @@ func WithTwoFactorAppName(name string) Option {
 
 // WithTokenClaimsBuilder customizes token claims creation. The hook may add
 // claims and override the six base claims; the session claims (sid, tid, jti,
-// typ, iss, iat, exp) are reserved and cannot be set from it — see
-// Config.BuildTokenClaims.
+// typ, iss, iat, exp) and the authentication context (amr, auth_time, mfa_at)
+// are reserved and cannot be set from it — see Config.BuildTokenClaims.
 //
 // TokenClaimsBuilder is an alias of the func type this always took, so a
 // literal still satisfies it; StaticClaims, UserFieldClaims, ChainClaims and

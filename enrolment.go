@@ -232,7 +232,10 @@ func (s *Service) CompleteTOTPEnrolment(ctx context.Context, enrolmentToken, sec
 	}
 	user.IsTOTPEnabled = true
 	user.TOTPSecret = minted
-	tokens, sessionID, err := s.issueSession(ctx, user)
+	// A password, proved by the login that minted the token, and a TOTP code,
+	// proved by this request: the session /2fa/verify would have opened, with
+	// the same amr and mfa_at, bound to the factor just enrolled.
+	tokens, sessionID, err := s.issueSession(ctx, user, authBySecondFactor(AMRPassword, AMROTP))
 	if err != nil {
 		return User{}, AuthTokens{}, err
 	}

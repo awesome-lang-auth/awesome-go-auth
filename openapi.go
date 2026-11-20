@@ -694,6 +694,14 @@ func openAPISchemas() map[string]any {
 		// The two second-factor answers POST /login can give instead of a session.
 		// Neither is the Error envelope: the first is a 200 with no error member at
 		// all, the second a 403 with a code and no message. See login_2fa.go.
+		"AccessTokenResult": map[string]any{
+			"type":     "object",
+			"required": []string{"success"},
+			"properties": map[string]any{
+				"success":     map[string]any{"type": "boolean", "enum": []bool{true}},
+				"accessToken": map[string]any{"type": "string", "description": "Bearer callers only. No refresh token: it is not rotated."},
+			},
+		},
 		"TwoFactorChallenge": map[string]any{
 			"type":     "object",
 			"required": []string{"requiresTwoFactor", "tempToken", "available2faMethods"},
@@ -1337,6 +1345,31 @@ func openAPIPaths(prefix string) map[string]any {
 				})),
 				"responses": respond(http.StatusOK, "Session issued", schema("AuthResult"),
 					HTTPErrInvalidBody, HTTPErrInvalidStepUpToken, HTTPErrInvalidTOTPCode, HTTPErrTOTPNotSetUp),
+			},
+		},
+		prefix + StepUpRoute: map[string]any{
+			"post": map[string]any{
+				"summary": "Re-verify the second factor for the current session",
+				"description": "The signed-in user presents a TOTP code again. The session records it — `mfa_at` moves to now, and `amr` gains " +
+					"`" + AMROTP + "` and `" + AMRMFA + "` — and a fresh access token carrying the new claims is delivered alone: the access " +
+					"cookie in cookie mode, a top-level `accessToken` under `X-Auth-Strategy: bearer`. The refresh token is not rotated, " +
+					"and the next refresh carries the new `mfa_at` forward. The session is validated whatever the session-check mode, " +
+					"and a session store that cannot record the factor answers 501. The code field is named `totpCode`, as on /2fa/verify. " +
+					"Only the TOTP factor the user held when the session opened is accepted: a factor enrolled since — through this " +
+					"session's own access token or any other — is 403 `" + CodeReauthenticationRequired + "`, and the user signs in again. " +
+					"Every wrong code counts against the session, and the " + strconv.Itoa(StepUpFailureLimit) + "th in a row revokes it " +
+					"(401 `" + CodeSessionRevoked + "`).",
+				"operationId": "stepUpTwoFactor",
+				"tags":        []string{"TwoFactor"},
+				"security":    anyCredential,
+				"parameters":  protected,
+				"requestBody": body(inline([]string{"totpCode"}, map[string]any{
+					"totpCode": map[string]any{"type": "string", "description": "The code from the authenticator app."},
+				})),
+				"responses": respond(http.StatusOK, "Second factor recorded; a fresh access token", schema("AccessTokenResult"),
+					HTTPErrInvalidBody, HTTPErrTOTPNotSetUp, HTTPErrInvalidTOTPCode, HTTPErrSessionRevoked,
+					HTTPErrReauthenticationRequired,
+					HTTPErrUserNotFound, HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid, HTTPErrNotImplemented),
 			},
 		},
 		prefix + "/2fa/disable": map[string]any{

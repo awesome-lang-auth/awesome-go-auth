@@ -179,7 +179,7 @@ func (ad *Adapter) smsVerify(c *gin.Context) {
 		auth.WriteHTTPError(c.Writer, auth.HTTPErrUserIDRequired)
 		return
 	}
-	_, tokens, err := ad.auth.VerifySMSCode(c.Request.Context(), auth.SMSCodeVerifyInput{UserID: userID, TenantID: tenantID, Code: req.Code})
+	_, tokens, err := ad.auth.VerifySMSCode(c.Request.Context(), auth.SMSCodeVerifyInput{UserID: userID, TenantID: tenantID, Code: req.Code, SecondFactor: auth.TwoFactorMode(req.Mode)})
 	if err != nil {
 		auth.WriteHTTPError(c.Writer, auth.SMSVerifyHTTPError(err))
 		return
@@ -287,6 +287,22 @@ func (ad *Adapter) twoFactorVerify(c *gin.Context) {
 		return
 	}
 	ad.cfg.WriteTokens(c.Writer, c.Request, http.StatusOK, tokens, nil)
+}
+
+// twoFactorStepUp is POST <prefix>/2fa/step-up, behind Middleware: the code
+// is re-verified, the session records it and a fresh access token is delivered
+// alone. See auth.Service.StepUpTOTP.
+func (ad *Adapter) twoFactorStepUp(c *gin.Context) {
+	var req auth.StepUpRequest
+	if !auth.DecodeOptionalJSON(c.Writer, c.Request, &req) {
+		return
+	}
+	tokens, err := ad.auth.StepUpTOTP(c.Request.Context(), auth.AccessTokenFromRequest(c.Request), req.TOTPCode)
+	if err != nil {
+		auth.WriteHTTPError(c.Writer, auth.StepUpHTTPError(err))
+		return
+	}
+	ad.cfg.WriteAccessToken(c.Writer, c.Request, http.StatusOK, tokens)
 }
 
 func (ad *Adapter) twoFactorDisable(c *gin.Context) {

@@ -307,7 +307,10 @@ func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, cli
 	// The session's own refresh token stays inside the session. The
 	// refresh_token of this response, when there is one, is the grant's opaque
 	// token below, which is redeemed here and not at <prefix>/refresh.
-	tokens, sessionID, err := idp.authSvc.issueSession(ctx, user)
+	// The code was granted by /authorize, whose credential check is a
+	// password login (Service.Login, which refuses an account a second factor
+	// is required of), so the session records exactly that.
+	tokens, sessionID, err := idp.authSvc.issueSession(ctx, user, authBy(AMRPassword))
 	if err != nil {
 		return nil, tokenServerError()
 	}
@@ -479,7 +482,10 @@ func (idp *IDP) refreshTokenGrant(ctx context.Context, r *http.Request, client I
 		return nil, tokenServerError()
 	}
 
-	access, _, err := idp.authSvc.issueToken(ctx, user, rec.SessionID, "access", idp.authSvc.cfg.AccessTokenTTL)
+	// From the session row checked above, so the access token carries the
+	// session's amr, auth_time and mfa_at forward exactly as the session
+	// recorded them, as POST <prefix>/refresh does.
+	access, _, err := idp.authSvc.issueAccessToken(ctx, user, session)
 	if err != nil {
 		return nil, tokenServerError()
 	}

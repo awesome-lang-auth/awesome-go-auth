@@ -1036,7 +1036,7 @@ func TestIssueIdPTokenPairBaseClaimsMatchSessionTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IssueIdPTokenPair: %v", err)
 	}
-	session, err := svc.newSessionTokens(ctx, user)
+	session, err := svc.newSessionTokens(ctx, user, authBy(AMRPassword))
 	if err != nil {
 		t.Fatalf("newSessionTokens: %v", err)
 	}
