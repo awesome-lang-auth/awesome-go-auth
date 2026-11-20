@@ -68,13 +68,21 @@ type TwoFactorChallenge struct {
 	// TempToken is the step-up credential the §3 routes accept. It is typed
 	// tokenTypeTemp, so unlike the reference's it is not also an access token —
 	// see the tokenTypeTemp comment for why that deliberate difference is kept.
+	//
+	// When SetupRequired is set under Config.EnrolOnLogin it is an enrolment
+	// token instead, typed tokenTypeEnrolment: POST <prefix>/2fa/setup and POST
+	// <prefix>/2fa/verify-setup accept it, and nothing else does. See
+	// enrolment.go. Without the option it is the step-up token, which no route
+	// completes for an account with no factor.
 	TempToken string
 	// Methods is available2faMethods: the factors this user can use, in the
 	// reference's order. It is empty only when SetupRequired is set.
 	Methods []string
 	// SetupRequired selects the second of the reference's two branches: a policy
 	// demands a second factor and the account has no method at all, so the client
-	// must enrol one before it can be challenged.
+	// must enrol one before it can be challenged — under Config.EnrolOnLogin
+	// with TempToken, through the two enrolment routes, which open the session
+	// once the factor is enrolled; otherwise out of band.
 	SetupRequired bool
 }
 
@@ -229,10 +237,28 @@ func (s *Service) LoginWithChallenge(ctx context.Context, in LoginInput) (LoginR
 // twoFactorChallenge mints the challenge for a user whose password has already
 // verified. It is unexported because it takes no password: the only correct
 // caller is the one above it.
+//
+// The two reference branches mint the same token with the same overridden
+// expiries (auth.router.ts:564-567 and :572-575). This port mints two different
+// ones: the step-up token when the user has a factor to present, and the
+// enrolment token when a factor is demanded and there is none
+// (mustEnrolSecondFactor, enrolment.go). They are typed apart, so the token
+// that may only enrol can never complete a step-up, and the step-up token —
+// which a user with an enrolled factor holds after the password alone — can
+// never enrol a replacement factor.
+//
+// The enrolment token is minted only under Config.EnrolOnLogin. Without it the
+// setup-required branch carries the step-up token, as it did before the option
+// existed: no route completes it, and the account is enrolled out of band.
 func (s *Service) twoFactorChallenge(ctx context.Context, user User) (*TwoFactorChallenge, error) {
+	if s.cfg.EnrolOnLogin && s.mustEnrolSecondFactor(user) {
+		token, err := s.issueEnrolmentToken(ctx, user)
+		if err != nil {
+			return nil, err
+		}
+		return &TwoFactorChallenge{TempToken: token, Methods: []string{}, SetupRequired: true}, nil
+	}
 	methods := s.availableTwoFactorMethods(user)
-	// Both reference branches mint the same token with the same overridden
-	// expiries (auth.router.ts:564-567 and :572-575), so it is minted once here.
 	token, err := s.IssueTempToken(ctx, user)
 	if err != nil {
 		return nil, err

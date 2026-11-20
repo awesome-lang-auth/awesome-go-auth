@@ -69,6 +69,7 @@ var wantDeviationIDs = []string{
 	"csrf-cookie-not-reissued-with-tokens",
 	"docs-routes-are-opt-in",
 	"event-handler-panic-does-not-fail-the-publisher",
+	"forced-enrolment-opens-a-session",
 	"forgot-password-succeeds-on-delivery-failure",
 	"identity-events-are-raised-from-the-development-line",
 	"idp-mode-adds-an-oauth-authorization-server",
@@ -104,7 +105,21 @@ var wantClaims = map[string][]string{
 	"jwks-cors-wildcard-string-form": {
 		"Access-Control-Allow-Origin", "string | string[]", "corsOrigins === '*'",
 	},
-	"temp-token-is-typed-not-an-access-token": {"access token", "second factor"},
+	"temp-token-is-typed-not-an-access-token": {"access token", "second factor", "forced-enrolment-opens-a-session"},
+	// What the token is accepted by and refused by, both transports, the
+	// condition that makes a replay fail, both answers of verify-setup and the
+	// two events — and the reference's mechanism, a tempToken that is an
+	// access token, which is the reason the two behaviours differ at all. An
+	// entry that lost "every other route refuses it" would read as a widening
+	// of the enrolment routes rather than a narrowing of the token.
+	"forced-enrolment-opens-a-session": {
+		"2FA_SETUP_REQUIRED", "Config.Require2FA", "Authorization: Bearer", "tempToken",
+		"every other route refuses it", "401 INVALID_TEMP_TOKEN", "POST <prefix>/2fa/verify",
+		"X-Auth-Strategy: bearer", "identity.user.2fa.enabled", "identity.auth.login.success",
+		"authMiddleware", "{success: true}", "temp-token-is-typed-not-an-access-token",
+		"Config.EnrolOnLogin", "off by default", "password change", "a secret the server derives",
+		"enrolled out of band", "Trust on first use",
+	},
 	"idp-mode-adds-an-oauth-authorization-server": {
 		"S256", "plain", "client_secret_basic", "client_secret_post", "refresh_token", "offline_access",
 		"invalid_grant", "§5.2", "JWKS", "family",

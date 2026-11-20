@@ -28,6 +28,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reference serves it without a hook. Unset — the default — nothing
   changes. The `register-route-is-always-mounted` deviation now describes the
   flag, and its "not available from configuration" note is retired.
+- **Forced second-factor enrolment at login, behind `Config.EnrolOnLogin`
+  (`WithEnrolOnLogin(true)`), off by default.** Under `Config.Require2FA`
+  (`WithRequire2FA(true)`) or a user's own `Require2FA` flag, a login by an
+  account with no factor to present still opens no session and answers the
+  reference's `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}`.
+  With the option on, that `tempToken` can now be used. It is an **enrolment
+  token**, a third token type beside the access and step-up tokens, accepted by
+  `POST <prefix>/2fa/setup` and `POST <prefix>/2fa/verify-setup` (as the
+  body's `tempToken`, or as `Authorization: Bearer`, which is how a client
+  written against the reference sends it) and refused everywhere else. A
+  `verify-setup` that completes with it stores the factor and opens the session
+  exactly as `POST <prefix>/2fa/verify` does — the session cookies, or
+  `accessToken`/`refreshToken` under `X-Auth-Strategy: bearer` — and raises
+  `identity.user.2fa.enabled` then `identity.auth.login.success` with
+  `method: "totp"`. Voluntary enrolment with an access token is unchanged and
+  opens no session. Until now the setup answer had no route that could complete
+  it, and an account under a mandatory policy had to be enrolled out of band —
+  which stays the behaviour with the option off.
+  - **The secret is the server's.** `/2fa/setup` with an enrolment token
+    answers a secret derived from the token (an HMAC under `Config.Secret` of
+    its tenant, subject and id, 160 bits), and `verify-setup` with that token
+    accepts that secret and no other: an empty secret, an all-zero key, the RFC
+    6238 test key, a secret of the client's own or another token's secret is
+    `400 "Invalid TOTP code"` and enrols nothing, since the session that follows
+    claims the factor.
+  - **The token is bound to the password that minted it**: it carries an HMAC
+    of the stored hash (a `cred` claim), so once the password changes every
+    enrolment token minted before is `401 INVALID_TEMP_TOKEN`. It lives
+    `Config.TempTokenTTL`, the login's email-verification gate is applied again
+    on every use, and it is honoured only while the login would still answer
+    `2FA_SETUP_REQUIRED` for its user, so it dies the moment a factor exists: a
+    replay after a successful enrolment, or a second outstanding token, is
+    `401 INVALID_TEMP_TOKEN`.
+  - New: `Config.EnrolOnLogin`, `WithEnrolOnLogin`, `Auth.EnrolOnLogin`,
+    `Service.VerifyEnrolmentToken`, `Service.NewForcedTOTPEnrolment`,
+    `Service.CompleteTOTPEnrolment` (with `Auth` delegates),
+    `Auth.TOTPEnrolmentCaller` (the gate the four adapters put on the two
+    routes under the option), `TOTPEnrolmentCaller`, `TOTPEnrolmentRequest`,
+    `TOTPEnrolmentHTTPError` and `(*nethttp.Adapter).EnrolmentGate`.
+  - Registered as the deviation `forced-enrolment-opens-a-session`: the
+    reference's `tempToken` reaches the enrolment routes because it is a full
+    access token, and its `verify-setup` never opens a session.
+
+### Security
+- **`EnrolOnLogin` is trust on first use, which is why it is off by default.**
+  With it on, whoever holds an unenrolled account's password — a leaked
+  invitation or initial password, or the password of an account whose factor an
+  administrator has just reset — binds a factor of their choosing and gets a
+  full session, and the owner's next login is a challenge they cannot answer.
+  Before this release such an account could not sign in at all. Turn it on
+  where the first sign-in with the password is the owner's by construction, and
+  reset the password together with the factor; deployments that enrol out of
+  band leave it off and see no change.
+
+### Changed
+- **Only with `EnrolOnLogin`: the `tempToken` of a `2FA_SETUP_REQUIRED`
+  answer is no longer a step-up token**, so the step-up routes refuse it with
+  their own answer for a bad `tempToken`: `POST <prefix>/2fa/verify`
+  `401 INVALID_ACCESS_TOKEN` (it answered `400 "User not found or 2FA not set
+  up"`, and still does with the option off), the SMS and magic-link routes in
+  `mode: "2fa"` `401 INVALID_TEMP_TOKEN` (they answered for the missing phone
+  number, the missing sender or the bad code). The token never completed any of
+  them — the account it names has no factor to present — so only the status of
+  a dead end moves, and only for a deployment that opts in. The challenge
+  `tempToken` of an account that has a factor is unchanged.
+- **Only with `EnrolOnLogin`: `POST <prefix>/2fa/setup` and
+  `POST <prefix>/2fa/verify-setup` authenticate themselves** instead of sitting
+  behind the access middleware, on all four adapters, as `GET <prefix>/me`
+  already does. A request that carries no enrolment token is answered exactly
+  as before — `403 No access token provided`, `403 Invalid or expired access
+  token`, `401 SESSION_REVOKED`, `403 CSRF_INVALID` for a cookie call without
+  the header, and the credential before the body. With the option off both
+  routes are mounted behind the middleware, as they always were.
+  `(*nethttp.Adapter).TwoFactorSetup` and `TwoFactorVerifySetup` act for the
+  user already in the request context when there is one — `Middleware`'s, or a
+  host's own through `auth.ContextWithUser` on a hand mount — exactly as
+  before, and authenticate the request themselves only when there is none.
 
 ## [0.13.0] - 2026-11-20
 

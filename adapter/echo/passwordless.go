@@ -191,13 +191,41 @@ func (ad *Adapter) smsVerify(c echo.Context) error {
 	return nil
 }
 
+// enrolmentCaller is who an enrolment request acts for: the user Middleware
+// put in the context, when the routes sit behind it (Config.EnrolOnLogin
+// off), and otherwise whoever auth.Auth.TOTPEnrolmentCaller resolves from the
+// request — an access token, or under Config.EnrolOnLogin the enrolment token
+// of a 2FA_SETUP_REQUIRED answer.
+func (ad *Adapter) enrolmentCaller(c echo.Context, tempToken string) (auth.TOTPEnrolmentCaller, auth.HTTPError, bool) {
+	if user, ok := UserFromContext(c); ok {
+		return auth.TOTPEnrolmentCaller{User: user}, auth.HTTPError{}, true
+	}
+	return ad.auth.TOTPEnrolmentCaller(c.Request().Context(), c.Request(), tempToken)
+}
+
+// twoFactorSetup serves a voluntary enrolment, and under Config.EnrolOnLogin
+// a forced one, whose secret is the one the server minted for the enrolment
+// token (enrolmentCaller says which).
 func (ad *Adapter) twoFactorSetup(c echo.Context) error {
-	user, ok := UserFromContext(c)
+	// The reference reads no body here, so one that is not JSON simply carries
+	// no enrolment token.
+	var req auth.TOTPEnrolmentRequest
+	_ = auth.DecodeOptionalJSONBody(c.Request(), &req)
+	caller, herr, ok := ad.enrolmentCaller(c, req.TempToken)
 	if !ok {
-		auth.WriteHTTPError(c.Response(), auth.HTTPErrNoAccessToken)
+		auth.WriteHTTPError(c.Response(), herr)
 		return nil
 	}
-	setup, err := ad.auth.NewTOTPEnrolment(user.Email)
+	if caller.Forced {
+		setup, err := ad.auth.NewForcedTOTPEnrolment(c.Request().Context(), caller.EnrolmentToken)
+		if err != nil {
+			auth.WriteHTTPError(c.Response(), auth.TOTPEnrolmentHTTPError(err))
+			return nil
+		}
+		auth.WriteJSON(c.Response(), http.StatusOK, setup)
+		return nil
+	}
+	setup, err := ad.auth.NewTOTPEnrolment(caller.User.Email)
 	if err != nil {
 		auth.WriteServiceError(c.Response(), err)
 		return nil
@@ -207,21 +235,35 @@ func (ad *Adapter) twoFactorSetup(c echo.Context) error {
 	return nil
 }
 
+// twoFactorVerifySetup resolves its caller as twoFactorSetup does. A forced
+// enrolment, with the secret /2fa/setup minted for its token, opens the
+// session the login could not; a voluntary one answers {"success":true} as it
+// always has. The code field is "token" on this route and "totpCode" on
+// /2fa/verify.
 func (ad *Adapter) twoFactorVerifySetup(c echo.Context) error {
-	user, ok := UserFromContext(c)
+	var req auth.TOTPEnrolmentRequest
+	bodyErr := auth.DecodeOptionalJSONBody(c.Request(), &req)
+	// The caller first, then the body: the order the middleware and the decoder
+	// behind it answered in.
+	caller, herr, ok := ad.enrolmentCaller(c, req.TempToken)
 	if !ok {
-		auth.WriteHTTPError(c.Response(), auth.HTTPErrNoAccessToken)
+		auth.WriteHTTPError(c.Response(), herr)
 		return nil
 	}
-	// The code field is "token" on this route and "totpCode" on /2fa/verify.
-	var req struct {
-		Token  string `json:"token"`
-		Secret string `json:"secret"`
-	}
-	if !auth.DecodeOptionalJSON(c.Response(), c.Request(), &req) {
+	if bodyErr != nil {
+		auth.WriteHTTPError(c.Response(), auth.HTTPErrInvalidBody)
 		return nil
 	}
-	if err := ad.auth.VerifyTOTPSetup(c.Request().Context(), user.ID, user.TenantID, req.Secret, req.Token); err != nil {
+	if caller.Forced {
+		_, tokens, err := ad.auth.CompleteTOTPEnrolment(c.Request().Context(), caller.EnrolmentToken, req.Secret, req.Token)
+		if err != nil {
+			auth.WriteHTTPError(c.Response(), auth.TOTPEnrolmentHTTPError(err))
+			return nil
+		}
+		ad.cfg.WriteTokens(c.Response(), c.Request(), http.StatusOK, tokens, nil)
+		return nil
+	}
+	if err := ad.auth.VerifyTOTPSetup(c.Request().Context(), caller.User.ID, caller.User.TenantID, req.Secret, req.Token); err != nil {
 		auth.WriteHTTPError(c.Response(), auth.TOTPSetupHTTPError(err))
 		return nil
 	}

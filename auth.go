@@ -111,6 +111,13 @@ func (a *Auth) Service() *Service { return a.service }
 // OIDCMounts for the four OIDC endpoints.
 func (a *Auth) IDP() *IDP { return a.idp }
 
+// EnrolOnLogin reports Config.EnrolOnLogin. The adapters read it to decide how
+// they mount POST <prefix>/2fa/setup and POST <prefix>/2fa/verify-setup: behind
+// the access middleware, as they always were, when it is off, and
+// authenticating themselves — so that the enrolment token reaches them — when
+// it is on.
+func (a *Auth) EnrolOnLogin() bool { return a.service.cfg.EnrolOnLogin }
+
 // JWKSHandler returns the handler serving the IdP's JWKS document with the
 // reference's headers, or nil when no WithIDP was given: the same handler the
 // adapters mount at <prefix><IDPConfig.JWKSPath>. See (*IDP).JWKSHandler.
@@ -242,6 +249,23 @@ func WithTenantProvider(store TenantStore) Option {
 func WithRequire2FA(enabled bool) Option {
 	return func(b *authBuilder) error {
 		b.cfg.Require2FA = enabled
+		return nil
+	}
+}
+
+// WithEnrolOnLogin sets Config.EnrolOnLogin: whether an account that must
+// present a second factor and has none enrols one at login, through the
+// tempToken of its 2FA_SETUP_REQUIRED answer, and gets its session when it
+// does.
+//
+//	auth.WithRequire2FA(true), auth.WithEnrolOnLogin(true) // mandatory TOTP, enrolled at first login
+//
+// Off by default: the answer's token then completes nothing and the account
+// is enrolled out of band, as before the option existed. Turning it on is
+// trust on first use — see Config.EnrolOnLogin before you do.
+func WithEnrolOnLogin(enabled bool) Option {
+	return func(b *authBuilder) error {
+		b.cfg.EnrolOnLogin = enabled
 		return nil
 	}
 }
