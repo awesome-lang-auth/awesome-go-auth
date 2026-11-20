@@ -265,14 +265,24 @@ func (ad *Adapter) mountCredentialRoutes(group gin.IRoutes, prefix string) {
 	group.POST(prefix+"/logout", ad.guard(ad.logout))
 
 	// Passwordless and 2FA (passwordless.go). The four send/verify routes are
-	// unauthenticated by contract; the three enrolment routes sit behind the
-	// access-token middleware and are therefore the only ones CSRF-checked.
+	// unauthenticated by contract; the three enrolment routes are authenticated
+	// and are therefore the only ones CSRF-checked. Under Config.EnrolOnLogin,
+	// /2fa/setup and /2fa/verify-setup authenticate themselves rather than
+	// sitting behind the access middleware, because they also accept the
+	// enrolment token of a 2FA_SETUP_REQUIRED answer
+	// (auth.Auth.TOTPEnrolmentCaller); without it they sit behind the
+	// middleware, as they always did.
 	group.POST(prefix+"/magic-link/send", ad.guard(ad.magicLinkSend))
 	group.POST(prefix+"/magic-link/verify", ad.guard(ad.magicLinkVerify))
 	group.POST(prefix+"/sms/send", ad.guard(ad.smsSend))
 	group.POST(prefix+"/sms/verify", ad.guard(ad.smsVerify))
-	group.POST(prefix+"/2fa/setup", ad.guard(ad.Middleware()), ad.twoFactorSetup)
-	group.POST(prefix+"/2fa/verify-setup", ad.guard(ad.Middleware()), ad.twoFactorVerifySetup)
+	if ad.auth.EnrolOnLogin() {
+		group.POST(prefix+"/2fa/setup", ad.guard(ad.twoFactorSetup))
+		group.POST(prefix+"/2fa/verify-setup", ad.guard(ad.twoFactorVerifySetup))
+	} else {
+		group.POST(prefix+"/2fa/setup", ad.guard(ad.Middleware()), ad.twoFactorSetup)
+		group.POST(prefix+"/2fa/verify-setup", ad.guard(ad.Middleware()), ad.twoFactorVerifySetup)
+	}
 	group.POST(prefix+"/2fa/verify", ad.guard(ad.twoFactorVerify))
 	group.POST(prefix+"/2fa/disable", ad.guard(ad.Middleware()), ad.twoFactorDisable)
 	// Password management and email verification (password_email.go).

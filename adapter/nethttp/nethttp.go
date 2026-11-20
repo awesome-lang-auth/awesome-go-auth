@@ -214,14 +214,19 @@ func (a *Adapter) mountCredentialRoutes(mux *http.ServeMux, prefix string) {
 	mux.Handle("POST "+prefix+"/logout", a.guard(http.HandlerFunc(a.Logout)))
 
 	// Passwordless and 2FA (passwordless.go). The four send/verify routes are
-	// unauthenticated by contract; the three enrolment routes sit behind the
-	// access-token middleware and are therefore the only ones CSRF-checked.
+	// unauthenticated by contract; the three enrolment routes are authenticated
+	// and are therefore the only ones CSRF-checked. Under Config.EnrolOnLogin,
+	// /2fa/setup and /2fa/verify-setup authenticate themselves rather than
+	// sitting behind the access middleware, because they also accept the
+	// enrolment token of a 2FA_SETUP_REQUIRED answer
+	// (auth.Auth.TOTPEnrolmentCaller); without it they sit behind the
+	// middleware, as they always did.
 	mux.Handle("POST "+prefix+"/magic-link/send", a.guard(http.HandlerFunc(a.MagicLinkSend)))
 	mux.Handle("POST "+prefix+"/magic-link/verify", a.guard(http.HandlerFunc(a.MagicLinkVerify)))
 	mux.Handle("POST "+prefix+"/sms/send", a.guard(http.HandlerFunc(a.SMSSend)))
 	mux.Handle("POST "+prefix+"/sms/verify", a.guard(http.HandlerFunc(a.SMSVerify)))
-	mux.Handle("POST "+prefix+"/2fa/setup", a.guard(a.Middleware()(http.HandlerFunc(a.TwoFactorSetup))))
-	mux.Handle("POST "+prefix+"/2fa/verify-setup", a.guard(a.Middleware()(http.HandlerFunc(a.TwoFactorVerifySetup))))
+	mux.Handle("POST "+prefix+"/2fa/setup", a.guard(a.enrolmentGate(http.HandlerFunc(a.TwoFactorSetup))))
+	mux.Handle("POST "+prefix+"/2fa/verify-setup", a.guard(a.enrolmentGate(http.HandlerFunc(a.TwoFactorVerifySetup))))
 	mux.Handle("POST "+prefix+"/2fa/verify", a.guard(http.HandlerFunc(a.TwoFactorVerify)))
 	mux.Handle("POST "+prefix+"/2fa/disable", a.guard(a.Middleware()(http.HandlerFunc(a.TwoFactorDisable))))
 	// Password management and email verification (wire-contract §2). Handlers in
@@ -259,6 +264,37 @@ func (a *Adapter) mountCredentialRoutes(mux *http.ServeMux, prefix string) {
 // answers is host-reachable code, and it should find the correlation id already
 // installed. See that function for the rest of the reasoning, and
 // auth.HTTPConfig.RateLimiter for why the other two are in this order.
+// enrolmentGate is what the two enrolment routes sit behind inside guard: the
+// access middleware when Config.EnrolOnLogin is off, exactly as before the
+// option existed; and when it is on, a marker that tells the handlers to
+// authenticate the request themselves, because they then take the enrolment
+// token too. The marker is what keeps a user an outer middleware put in the
+// request context from standing in for the credential the access middleware
+// used to demand on these routes: behind the gate, only the request's own
+// credential counts. EnrolmentGate exposes it to the chi adapter, which mounts
+// the same handlers.
+func (a *Adapter) enrolmentGate(h http.Handler) http.Handler {
+	if a.auth.EnrolOnLogin() {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), selfAuthenticatedKey{}, true)))
+		})
+	}
+	return a.Middleware()(h)
+}
+
+// selfAuthenticatedKey marks a request enrolmentGate let through under
+// Config.EnrolOnLogin: the enrolment handlers authenticate it from its own
+// credential and ignore any user already in its context.
+type selfAuthenticatedKey struct{}
+
+// EnrolmentGate returns the middleware Mount puts between guard and
+// TwoFactorSetup or TwoFactorVerifySetup: Middleware when Config.EnrolOnLogin
+// is off, and a pass-through when it is on. An adapter that mounts those two
+// handlers on its own router wraps them in it to serve what Mount serves.
+func (a *Adapter) EnrolmentGate() func(http.Handler) http.Handler {
+	return a.enrolmentGate
+}
+
 func (a *Adapter) guard(h http.Handler) http.Handler {
 	return auth.EventContextMiddleware(a.cfg)(auth.RateLimitMiddleware(a.cfg)(auth.CSRFMiddleware(a.cfg)(h)))
 }

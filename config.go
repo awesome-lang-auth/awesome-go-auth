@@ -107,6 +107,26 @@ type Config struct {
 	// gates.
 	IssueSessionOnRegister bool
 	Require2FA             bool
+	// EnrolOnLogin lets an account that must present a second factor and has
+	// none enrol one at login, and opens its session when it does: the
+	// tempToken of the 403 2FA_SETUP_REQUIRED answer POST <prefix>/login gives
+	// it is then an enrolment token, which POST <prefix>/2fa/setup and POST
+	// <prefix>/2fa/verify-setup accept (see enrolment.go).
+	//
+	// It is trust on first use. Whoever holds the account's password — a
+	// leaked invitation or initial password, or the password of an account
+	// whose factor an administrator has just reset — binds a factor of their
+	// choosing and gets a full session, and the owner's next login is then a
+	// challenge they cannot answer. That is what enrolling at login means;
+	// a deployment that delivers passwords it does not control, or resets
+	// factors without resetting passwords, should enrol out of band instead.
+	//
+	// False — the zero value, and what DefaultConfig leaves — keeps the
+	// behaviour this field predates: the 2FA_SETUP_REQUIRED tempToken is a
+	// step-up token no route accepts, the two enrolment routes take an access
+	// token only, and an account under a mandatory policy is enrolled out of
+	// band. WithEnrolOnLogin sets it.
+	EnrolOnLogin bool
 	// TwoFactorAppName is the issuer an authenticator app files a TOTP
 	// enrolment under: the `issuer` of the otpauth:// URI POST <prefix>/2fa/setup
 	// returns, and the prefix of its label. It is the reference's
