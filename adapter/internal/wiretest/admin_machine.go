@@ -98,6 +98,30 @@ func testAdminMachineAccess(t *testing.T, mount Mounter) {
 		AssertError(t, rec, http.StatusInternalServerError, "Internal server error", "")
 	})
 
+	t.Run("a request a browser originated is never a machine call", func(t *testing.T) {
+		// An operator's browser can hold what the function trusts — a client
+		// certificate, a network position — and a cross-site form post would
+		// carry it. Such a request is not offered to the function: here the
+		// policy admits nobody, so it is the guard's 401, and nothing is deleted.
+		env := newAdminEnv(t, mount, adminEnvOptions{admin: machineOptions(), seeds: seeds})
+		for name, header := range map[string][2]string{
+			"Origin":         {"Origin", "https://attacker.example"},
+			"Sec-Fetch-Site": {"Sec-Fetch-Site", "cross-site"},
+		} {
+			req := env.machineRequest(http.MethodDelete, auth.AdminUsersPath+"/a-user", "", "svc:identity")
+			req.Header.Set(header[0], header[1])
+			rec := env.Do(req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s: %d %s, want the guard's 401", name, rec.Code, rec.Body.String())
+			}
+		}
+		rec := env.Do(env.machineRequest(http.MethodGet, auth.AdminUsersPath, "", "svc:identity"))
+		AssertStatus(t, rec, http.StatusOK)
+		if users := adminEntries(t, Body(t, rec), "users"); len(users) != 2 {
+			t.Errorf("users = %v, want both seeds still there", users)
+		}
+	})
+
 	t.Run("a function that declines leaves the session policy in charge", func(t *testing.T) {
 		// The open policy, so the fall-through is visible as a grant: a request
 		// the machine function does not admit is the request the guard always

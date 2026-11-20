@@ -1563,9 +1563,12 @@ revision the whole contract was extracted from.
   `identity.admin.machine.access` is raised with the principal, the method and
   the path. `ok` false, and `ok` with an empty principal, leave the request to
   the guard exactly as if the function were absent. The machine path reads no
-  cookie, so a machine caller needs no CSRF pair. The event is outside the
-  `identity.*` vocabulary `EventNames` returns, and with no event bus nothing is
-  recorded. Nil, the default, is the reference's guard.
+  cookie, so a machine caller needs no CSRF pair, and the function is not asked
+  about a request a browser originated — an `Origin` header, or `Sec-Fetch-Site`
+  other than `none` — which meets the session policy instead. The event is
+  outside the `identity.*` vocabulary `EventNames` returns, and with no event
+  bus each grant is logged through `Config.Logger` instead. Nil, the default, is
+  the reference's guard.
 - **The reference**: Offers two ways into the admin router: the deprecated
   `adminSecret`, one shared bearer string compared for every caller with no
   identity behind it, and the session policies, which judge a user's token. A

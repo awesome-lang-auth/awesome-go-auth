@@ -188,7 +188,7 @@ func TestAdminMachineAccess(t *testing.T) {
 		}
 	})
 
-	t.Run("with no event bus the call is granted and nothing is recorded", func(t *testing.T) {
+	t.Run("with no event bus the grant is logged instead", func(t *testing.T) {
 		f := newMachineFixture(t, denyAll(), nil)
 		f.auth.service.cfg.Events = nil
 		rec := f.serve(http.MethodGet, "/admin/api/users", "", map[string]string{"X-Machine": "svc:identity"})
@@ -197,6 +197,68 @@ func TestAdminMachineAccess(t *testing.T) {
 		}
 		if len(f.raised()) != 0 {
 			t.Errorf("raised %v on a detached bus", eventNamesOf(f.raised()))
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if len(f.logged) == 0 || !strings.Contains(f.logged[len(f.logged)-1], "machine access granted") {
+			t.Errorf("logged %v, want the grant recorded through Config.Logger", f.logged)
+		}
+	})
+
+	t.Run("with an event bus the grant is not logged", func(t *testing.T) {
+		f := newMachineFixture(t, denyAll(), nil)
+		rec := f.serve(http.MethodGet, "/admin/api/users", "", map[string]string{"X-Machine": "svc:identity"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for _, line := range f.logged {
+			if strings.Contains(line, "machine access granted") {
+				t.Errorf("logged %q beside the event", line)
+			}
+		}
+	})
+
+	t.Run("a request a browser originated is not offered to the function", func(t *testing.T) {
+		// An operator's browser may hold the ambient credential the function
+		// trusts — a client certificate, a network position — so a cross-site
+		// form post must not become a machine call. The function is not asked,
+		// and the request meets the session policy, here a 401.
+		for name, header := range map[string]map[string]string{
+			"Origin":                     {"Origin": "https://evil.example"},
+			"Sec-Fetch-Site cross-site":  {"Sec-Fetch-Site": "cross-site"},
+			"Sec-Fetch-Site same-site":   {"Sec-Fetch-Site": "same-site"},
+			"Sec-Fetch-Site same-origin": {"Sec-Fetch-Site": "same-origin"},
+		} {
+			t.Run(name, func(t *testing.T) {
+				asked := false
+				f := newMachineFixture(t, AdminIsAdminFlag(), func(o *AdminOptions) {
+					inner := o.MachineAccess
+					o.MachineAccess = func(r *http.Request) (string, bool) {
+						asked = true
+						return inner(r)
+					}
+				})
+				header["X-Machine"] = "svc:identity"
+				rec := f.serve(http.MethodDelete, "/admin/api/users/usr_x", "", header)
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("browser-originated machine call = %d %s, want the guard's 401", rec.Code, rec.Body.String())
+				}
+				if asked {
+					t.Error("MachineAccess was asked about a browser-originated request")
+				}
+				if len(f.raised()) != 0 {
+					t.Errorf("a refused request was audited: %v", eventNamesOf(f.raised()))
+				}
+			})
+		}
+		// A navigation the user typed (Sec-Fetch-Site: none) is not cross-site,
+		// and is offered.
+		f := newMachineFixture(t, denyAll(), nil)
+		rec := f.serve(http.MethodGet, "/admin/api/users", "", map[string]string{"X-Machine": "svc:identity", "Sec-Fetch-Site": "none"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Sec-Fetch-Site none = %d, want the machine grant", rec.Code)
 		}
 	})
 

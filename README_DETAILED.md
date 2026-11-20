@@ -3817,18 +3817,39 @@ policy and before the legacy `Secret`:
 `{"principal": …, "method": …, "path": …}` and the request's correlation id,
 client address and user agent. It is not in `EventNames()`, which is the
 reference's vocabulary alone, so subscribe to it by name or with the wildcard.
-With no event bus, nothing is recorded. The machine path reads no cookie, so a
-machine caller sends no CSRF pair; the admin router has no double-submit layer
-in any case. `AdminMounted()` still needs an `AccessPolicy` or a `Secret`, which
-is why the example configures a policy that admits nobody. The seam is
-registered as `admin-machine-access-is-a-host-seam` in [README.md](README.md).
+With no event bus, each grant is written through `Config.Logger` instead, with
+the same three values. The machine path reads no cookie, so a machine caller
+sends no CSRF pair; the admin router has no double-submit layer in any case.
+`AdminMounted()` still needs an `AccessPolicy` or a `Secret`, which is why the
+example configures a policy that admits nobody. The seam is registered as
+`admin-machine-access-is-a-host-seam` in [README.md](README.md).
+
+**Trust nothing a browser sends on its own.** Because there is no CSRF layer,
+the function must not admit a request on a credential an operator's browser
+presents unasked, or any web page could drive that browser into a machine
+call with a cross-site form post. A cookie is one such ambient credential; so
+are a client TLS certificate the browser holds, and the network position of a
+browser on the internal network (an IP allow-list, "inside the VPC"). Trust a
+signature the gateway verified (SigV4), or a header a browser cannot send
+cross-site without a CORS preflight. As a backstop the function is **not asked**
+about a request a browser originated — one with an `Origin` header, or a
+`Sec-Fetch-Site` header other than `none` — and such a request meets the
+session policy as if `MachineAccess` were nil. Machine clients send neither
+header.
+
+A function that verifies a signature over the request body has to leave
+`r.Body` readable for the handler: read it, then put back an equivalent reader
+(`r.Body = io.NopCloser(bytes.NewReader(body))`).
 
 `DELETE <admin>/api/users/{id}` and `POST <admin>/users/{id}/promote` with
 `method=flag` resolve the user's tenant through `UserLookupStore` before they
 write. They therefore reach a user stored under a tenant, the one
 `GET <admin>/api/users` lists, rather than looking in the empty tenant. Without
 the capability, or for an id no tenant holds, they pass the empty tenant as
-before, so an unknown id still gets the store's own answer.
+before, so an unknown id still gets the store's own answer. Note that this
+lets every administrator the access policy admits delete and promote users in
+every tenant, as the reads already let them see every tenant: a policy that
+admits per-tenant administrators should take that into account.
 
 ## Security Helpers
 

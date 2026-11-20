@@ -355,6 +355,7 @@ var wantClaims = map[string][]string{
 		"AdminOptions.MachineAccess", "before the session policy", "AdminMachinePrincipalFromContext",
 		"identity.admin.machine.access", "empty principal", "no cookie", "CSRF", "EventNames",
 		"no event bus", "adminSecret", "AdminMounted", "AdminPredicate",
+		"browser originated", "Sec-Fetch-Site", "Config.Logger",
 	},
 	// M9's guard, and the one entry of this milestone that declines a reference
 	// default outright. The claims keep the refusal, the three things a mount

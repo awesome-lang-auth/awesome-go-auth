@@ -373,11 +373,26 @@ type AdminOptions struct {
 	//
 	// The machine path reads no cookie, so a machine caller needs no CSRF
 	// pair; the admin router has no double-submit layer to exempt it from, and
-	// the function must not authenticate by a cookie either, or it would turn
-	// a browser's ambient credential into machine access. Whatever the
-	// function trusts — a header a gateway sets, a value an outer middleware
-	// put on the request context — must be something an internet caller
-	// cannot forge, which is the host's guarantee and not this package's.
+	// the function must not authenticate by a credential a browser presents on
+	// its own either, or it would turn an operator's browser into a machine
+	// caller that any web page can drive with a cross-site form post. A cookie
+	// is one such ambient credential; so are a client TLS certificate the
+	// browser holds and the network position of a browser on the internal
+	// network (an IP allow-list, "inside the VPC"). Whatever the function
+	// trusts — a header a gateway sets after verifying a signature, a value an
+	// outer middleware put on the request context — must be something neither
+	// an internet caller nor a browser can produce unasked, which is the
+	// host's guarantee and not this package's.
+	//
+	// As a backstop the function is not asked at all about a request a
+	// browser originated: one that carries an Origin header, or a
+	// Sec-Fetch-Site header other than "none". Browsers send them on every
+	// cross-site request, and machine clients do not; such a request is left
+	// to the session policy, as if this field were nil.
+	//
+	// A function that verifies a signature over the request body must leave
+	// r.Body readable for the handler: read it, then put back an equivalent
+	// reader (io.NopCloser(bytes.NewReader(body))).
 	//
 	// It does not mount the console on its own: AdminMounted still needs an
 	// AccessPolicy or a Secret. A deployment that wants machine access only

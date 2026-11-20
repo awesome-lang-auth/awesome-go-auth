@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 )
 
 // Machine access to the admin API: AdminOptions.MachineAccess, a seam through
@@ -39,8 +40,9 @@ import (
 // declaring it first. So IsEventName reports false for it, and a webhook
 // subscription offered the vocabulary does not list it — a subscriber that
 // wants it subscribes to the name, or to the wildcard. With no event bus
-// configured nothing is recorded at all; a deployment that relies on this as
-// its audit trail configures one.
+// configured each grant is written through Config.Logger instead, with the
+// same principal, method and path, so the trail is never silently absent; a
+// deployment that relies on it as its audit trail configures a bus.
 const EventAdminMachineAccess = "identity.admin.machine.access"
 
 type adminMachinePrincipalContextKey struct{}
@@ -54,12 +56,26 @@ func AdminMachinePrincipalFromContext(ctx context.Context) (string, bool) {
 	return principal, ok && principal != ""
 }
 
+// browserOriginated reports whether r carries the headers a browser adds to a
+// request a page made, and a machine client does not: Origin, or
+// Sec-Fetch-Site with any value but "none" (which a browser sends for a
+// navigation the user typed). AdminOptions.MachineAccess is not asked about
+// such a request.
+func browserOriginated(r *http.Request) bool {
+	if r.Header.Get("Origin") != "" {
+		return true
+	}
+	site := r.Header.Get("Sec-Fetch-Site")
+	return site != "" && !strings.EqualFold(site, "none")
+}
+
 // machineAccess runs AdminOptions.MachineAccess for r. It reports whether the
 // request is admitted, and the context the handler should see when it is: the
-// principal installed, the audit event raised.
+// principal installed, the audit event raised — or, with no event bus, the
+// grant logged. A request a browser originated is not offered to the function.
 func (g *AdminGuard) machineAccess(r *http.Request) (bool, context.Context) {
 	decide := g.cfg.Admin.MachineAccess
-	if decide == nil {
+	if decide == nil || browserOriginated(r) {
 		return false, nil
 	}
 	principal, ok := decide(r)
@@ -72,6 +88,10 @@ func (g *AdminGuard) machineAccess(r *http.Request) (bool, context.Context) {
 		return false, nil
 	}
 	path := adminRouterPath(r, g.cfg)
+	if g.auth.service.cfg.Events == nil {
+		g.auth.service.logf("auth: admin: machine access granted: principal %q, %s %s (no event bus; %s not raised)",
+			principal, r.Method, path, EventAdminMachineAccess)
+	}
 	g.auth.publishAdminEvent(r, g.cfg, func() Event {
 		return Event{
 			Name: EventAdminMachineAccess,
