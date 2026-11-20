@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	auth "github.com/nik2208/awesome-go-auth"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Forced enrolment: the 2FA_SETUP_REQUIRED branch of POST /login, made
@@ -28,13 +30,14 @@ import (
 // reason login_2fa.go gives: a token minted by the test is a token no client
 // could have obtained.
 
-// enrolmentEnv is a deployment that demands a second factor and can deliver
-// none: no SMS sender, no mail sender, so an account without TOTP has no method
-// at all and the login answers 2FA_SETUP_REQUIRED. The secret is fixed so the
-// expiry case can sign a token the deployment accepts.
+// enrolmentEnv is a deployment that demands a second factor, enrols it at
+// login (Config.EnrolOnLogin) and can deliver none: no SMS sender, no mail
+// sender, so an account without TOTP has no method at all and the login
+// answers 2FA_SETUP_REQUIRED. The secret is fixed so the expiry case can sign
+// a token the deployment accepts.
 func enrolmentEnv(t *testing.T, mount Mounter, cfg auth.HTTPConfig, opts ...auth.Option) *Env {
 	t.Helper()
-	opts = append([]auth.Option{auth.WithRequire2FA(true), auth.WithSecret(wiretestAccessSecret)}, opts...)
+	opts = append([]auth.Option{auth.WithRequire2FA(true), auth.WithEnrolOnLogin(true), auth.WithSecret(wiretestAccessSecret)}, opts...)
 	env := newEnv(t, mount, cfg, opts...)
 	env.Delivered = &Deliveries{}
 	return env
@@ -226,40 +229,132 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 		})
 	})
 
-	t.Run("an empty secret is no factor", func(t *testing.T) {
-		// An empty secret is an empty HMAC key: its code verifies, and anybody
-		// can compute it. The forced path refuses it before anything is stored.
+	t.Run("only the secret /2fa/setup minted completes", func(t *testing.T) {
+		// The session a forced enrolment opens claims the factor, so the factor
+		// must be one nobody else can compute codes for: the secret the server
+		// minted for the token. An empty secret is an empty HMAC key, and all
+		// zeros and the RFC 6238 test key are known to everybody; a strong
+		// secret of the client's own, or the one another token minted, is no
+		// better. Each is refused before anything is stored.
 		env := enrolmentEnv(t, mount, auth.DefaultHTTPConfig())
-		env.Seed("emptysecret@example.com")
-		token := setupRequiredToken(t, env, "emptysecret@example.com")
+		env.Seed("mintedsecret@example.com")
+		token := setupRequiredToken(t, env, "mintedsecret@example.com")
+		other := setupRequiredToken(t, env, "mintedsecret@example.com")
+		otherSetup := env.Do(env.Request(http.MethodPost, "/2fa/setup", map[string]any{"tempToken": other}))
+		AssertStatus(t, otherSetup, http.StatusOK)
+		otherSecret, _ := Body(t, otherSetup)["secret"].(string)
+
+		for name, secret := range map[string]string{
+			"empty":               "",
+			"all zeros, 128 bits": "AAAAAAAAAAAAAAAAAAAAAAAAAA",
+			"the RFC 6238 key":    "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+			"the client's own":    "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+			"another token's":     otherSecret,
+		} {
+			t.Run(name, func(t *testing.T) {
+				rec := env.Do(env.Request(http.MethodPost, "/2fa/verify-setup", map[string]any{
+					"tempToken": token, "secret": secret, "token": totpCode(t, secret, time.Now()),
+				}))
+				AssertError(t, rec, http.StatusBadRequest, "Invalid TOTP code", "")
+				AssertNoCookie(t, rec, hostAccess)
+			})
+		}
+		// Nothing enrolled: the login still asks for setup, and the token still
+		// completes — with the secret /2fa/setup answers for it, every time.
+		setupRequiredToken(t, env, "mintedsecret@example.com")
+		secret, verify := enrolWithToken(t, env, token, false)
+		AssertStatus(t, verify, http.StatusOK)
+		if secret == otherSecret {
+			t.Fatal("two enrolment tokens were minted the same secret")
+		}
+	})
+
+	t.Run("the enrolment token as the access cookie is refused", func(t *testing.T) {
+		// This port never sets an enrolment token as a cookie, and presented as
+		// the access cookie it is any other bad access token.
+		env := enrolmentEnv(t, mount, auth.DefaultHTTPConfig())
+		env.Seed("cookietoken@example.com")
+		rec := env.Do(env.Request(http.MethodPost, "/login", credentials("cookietoken@example.com")))
+		AssertStatus(t, rec, http.StatusForbidden)
+		token, _ := Body(t, rec)["tempToken"].(string)
+		for _, route := range []string{"/2fa/setup", "/2fa/verify-setup"} {
+			req := csrfMirror(env.Request(http.MethodPost, route, map[string]any{"secret": "x", "token": "000000"}), rec)
+			req.AddCookie(&http.Cookie{Name: hostAccess, Value: token})
+			AssertError(t, env.Do(req), http.StatusForbidden, "Invalid or expired access token", "")
+		}
+	})
+
+	t.Run("a token minted before a password change is refused", func(t *testing.T) {
+		// The token is bound to the credential that minted it, so a password
+		// reset after a suspected compromise takes outstanding tokens with it.
+		store := auth.NewMemoryUserStore()
+		env := enrolmentEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithUserStore(store))
+		user, _ := env.Seed("pwchange@example.com")
+		token := setupRequiredToken(t, env, "pwchange@example.com")
+		setup := env.Do(env.Request(http.MethodPost, "/2fa/setup", map[string]any{"tempToken": token}))
+		AssertStatus(t, setup, http.StatusOK)
+		secret, _ := Body(t, setup)["secret"].(string)
+
+		hash, err := bcrypt.GenerateFromPassword([]byte("a-new-password-1"), bcrypt.MinCost)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdatePassword(context.Background(), user.ID, user.TenantID, string(hash)); err != nil {
+			t.Fatalf("update password: %v", err)
+		}
 		rec := env.Do(env.Request(http.MethodPost, "/2fa/verify-setup", map[string]any{
-			"tempToken": token, "secret": "", "token": totpCode(t, "", time.Now()),
+			"tempToken": token, "secret": secret, "token": totpCode(t, secret, time.Now()),
 		}))
-		AssertError(t, rec, http.StatusBadRequest, "Invalid TOTP code", "")
+		AssertError(t, rec, http.StatusUnauthorized, "Invalid or expired temp token", auth.CodeInvalidTempToken)
 		AssertNoCookie(t, rec, hostAccess)
-		// Nothing enrolled: the login still asks for setup, and the token works.
-		setupRequiredToken(t, env, "emptysecret@example.com")
-		AssertStatus(t, env.Do(env.Request(http.MethodPost, "/2fa/setup", map[string]any{"tempToken": token})), http.StatusOK)
+		rec = env.Do(env.Request(http.MethodPost, "/2fa/setup", map[string]any{"tempToken": token}))
+		AssertError(t, rec, http.StatusUnauthorized, "Invalid or expired temp token", auth.CodeInvalidTempToken)
+	})
+
+	t.Run("without EnrolOnLogin the setup answer completes nothing", func(t *testing.T) {
+		// The default: the 2FA_SETUP_REQUIRED tempToken is the step-up token it
+		// always was, the enrolment routes take an access token alone, and the
+		// account is enrolled out of band.
+		env := challengeEnv(t, mount, challengeOpts{}, auth.WithRequire2FA(true))
+		env.Seed("optout@example.com")
+		token := setupRequiredToken(t, env, "optout@example.com")
+		rec := env.Do(env.Request(http.MethodPost, "/2fa/setup", map[string]any{"tempToken": token}))
+		AssertError(t, rec, http.StatusForbidden, "No access token provided", "")
+		rec = env.Do(passwordlessBearer(env.Request(http.MethodPost, "/2fa/setup", nil), token))
+		AssertError(t, rec, http.StatusForbidden, "Invalid or expired access token", "")
+		rec = env.Do(env.Request(http.MethodPost, "/2fa/verify-setup", map[string]any{
+			"tempToken": token, "secret": "JBSWY3DPEHPK3PXP", "token": totpCode(t, "JBSWY3DPEHPK3PXP", time.Now()),
+		}))
+		AssertError(t, rec, http.StatusForbidden, "No access token provided", "")
+		AssertNoCookie(t, rec, hostAccess)
+		// The step-up route answers it as it did before enrolment existed.
+		rec = env.Do(env.Request(http.MethodPost, "/2fa/verify", map[string]any{"tempToken": token, "totpCode": "000000"}))
+		AssertError(t, rec, http.StatusBadRequest, "User not found or 2FA not set up", "")
 	})
 
 	t.Run("a voluntary enrolment still opens nothing", func(t *testing.T) {
-		// The access-token path is unchanged: {"success":true} and no session,
-		// in cookie mode too.
-		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
-		env.Seed("voluntary@example.com")
-		login := env.Do(env.Request(http.MethodPost, "/login", credentials("voluntary@example.com")))
-		AssertStatus(t, login, http.StatusOK)
+		// The access-token path is unchanged, whether the routes sit behind the
+		// middleware or authenticate themselves: {"success":true} and no
+		// session, in cookie mode too.
+		for _, enrol := range []bool{false, true} {
+			t.Run(fmt.Sprintf("EnrolOnLogin=%v", enrol), func(t *testing.T) {
+				env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithEnrolOnLogin(enrol))
+				env.Seed("voluntary@example.com")
+				login := env.Do(env.Request(http.MethodPost, "/login", credentials("voluntary@example.com")))
+				AssertStatus(t, login, http.StatusOK)
 
-		setup := env.Do(csrfMirror(env.Request(http.MethodPost, "/2fa/setup", nil), login))
-		AssertStatus(t, setup, http.StatusOK)
-		secret, _ := Body(t, setup)["secret"].(string)
-		verify := env.Do(csrfMirror(env.Request(http.MethodPost, "/2fa/verify-setup", map[string]any{
-			"secret": secret, "token": totpCode(t, secret, time.Now()),
-		}), login))
-		AssertStatus(t, verify, http.StatusOK)
-		AssertKeys(t, Body(t, verify), "success")
-		AssertNoCookie(t, verify, hostAccess)
-		AssertNoCookie(t, verify, hostRefresh)
+				setup := env.Do(csrfMirror(env.Request(http.MethodPost, "/2fa/setup", nil), login))
+				AssertStatus(t, setup, http.StatusOK)
+				secret, _ := Body(t, setup)["secret"].(string)
+				verify := env.Do(csrfMirror(env.Request(http.MethodPost, "/2fa/verify-setup", map[string]any{
+					"secret": secret, "token": totpCode(t, secret, time.Now()),
+				}), login))
+				AssertStatus(t, verify, http.StatusOK)
+				AssertKeys(t, Body(t, verify), "success")
+				AssertNoCookie(t, verify, hostAccess)
+				AssertNoCookie(t, verify, hostRefresh)
+			})
+		}
 	})
 
 	// ── the token does one thing ────────────────────────────────────────────────
@@ -302,7 +397,7 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 		// The step-up token is the one that matters: a user with a factor holds
 		// one after the password alone, and an enrolment route that took it
 		// would let that password replace the factor.
-		env := challengeEnv(t, mount, challengeOpts{})
+		env := challengeEnv(t, mount, challengeOpts{}, auth.WithEnrolOnLogin(true))
 		secret := enrolledTOTPEnv(t, env, "hasfactor@example.com")
 		stepUp, _ := loginChallenge(t, env, "hasfactor@example.com")
 		_, tokens := env.Seed("plain@example.com")
@@ -384,42 +479,49 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 	// ── everything else answers as it did ──────────────────────────────────────
 
 	t.Run("a request with no enrolment token answers as before", func(t *testing.T) {
-		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithSessionCheckOn(auth.SessionCheckOnAllCalls))
-		_, tokens := env.Seed("asbefore@example.com")
+		// Behind the middleware (EnrolOnLogin off) or authenticating
+		// themselves (on), the two routes answer a request that carries no
+		// enrolment token exactly as the middleware always did.
+		for _, enrol := range []bool{false, true} {
+			t.Run(fmt.Sprintf("EnrolOnLogin=%v", enrol), func(t *testing.T) {
+				env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithSessionCheckOn(auth.SessionCheckOnAllCalls), auth.WithEnrolOnLogin(enrol))
+				_, tokens := env.Seed("asbefore@example.com")
 
-		for _, route := range []string{"/2fa/setup", "/2fa/verify-setup"} {
-			rec := env.Do(env.Request(http.MethodPost, route, nil))
-			AssertError(t, rec, http.StatusForbidden, "No access token provided", "")
-			rec = env.Do(passwordlessBearer(env.Request(http.MethodPost, route, nil), "not-a-token"))
-			AssertError(t, rec, http.StatusForbidden, "Invalid or expired access token", "")
-		}
-		// The credential is answered before the body, as the middleware and the
-		// decoder behind it answered.
-		malformed := httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/2fa/verify-setup", strings.NewReader("{not json"))
-		malformed.Header.Set("Content-Type", "application/json")
-		AssertError(t, env.Do(malformed), http.StatusForbidden, "No access token provided", "")
-		authed := passwordlessBearer(httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/2fa/verify-setup", strings.NewReader("{not json")), tokens.AccessToken)
-		authed.Header.Set("Content-Type", "application/json")
-		rec := env.Do(authed)
-		AssertStatus(t, rec, http.StatusBadRequest)
-		// /2fa/setup reads no body in the reference, so an unparsable one is
-		// still a voluntary enrolment.
-		setup := passwordlessBearer(httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/2fa/setup", strings.NewReader("{not json")), tokens.AccessToken)
-		AssertStatus(t, env.Do(setup), http.StatusOK)
+				for _, route := range []string{"/2fa/setup", "/2fa/verify-setup"} {
+					rec := env.Do(env.Request(http.MethodPost, route, nil))
+					AssertError(t, rec, http.StatusForbidden, "No access token provided", "")
+					rec = env.Do(passwordlessBearer(env.Request(http.MethodPost, route, nil), "not-a-token"))
+					AssertError(t, rec, http.StatusForbidden, "Invalid or expired access token", "")
+				}
+				// The credential is answered before the body, as the middleware and the
+				// decoder behind it answered.
+				malformed := httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/2fa/verify-setup", strings.NewReader("{not json"))
+				malformed.Header.Set("Content-Type", "application/json")
+				AssertError(t, env.Do(malformed), http.StatusForbidden, "No access token provided", "")
+				authed := passwordlessBearer(httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/2fa/verify-setup", strings.NewReader("{not json")), tokens.AccessToken)
+				authed.Header.Set("Content-Type", "application/json")
+				rec := env.Do(authed)
+				AssertStatus(t, rec, http.StatusBadRequest)
+				// /2fa/setup reads no body in the reference, so an unparsable one is
+				// still a voluntary enrolment.
+				setup := passwordlessBearer(httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/2fa/setup", strings.NewReader("{not json")), tokens.AccessToken)
+				AssertStatus(t, env.Do(setup), http.StatusOK)
 
-		// A cookie-authenticated call is still CSRF-checked.
-		login := env.Do(env.Request(http.MethodPost, "/login", credentials("asbefore@example.com")))
-		rec = env.Do(Replay(env.Request(http.MethodPost, "/2fa/setup", nil), login))
-		AssertError(t, rec, http.StatusForbidden, auth.HTTPErrCSRFInvalid.Message, auth.CodeCSRFInvalid)
+				// A cookie-authenticated call is still CSRF-checked.
+				login := env.Do(env.Request(http.MethodPost, "/login", credentials("asbefore@example.com")))
+				rec = env.Do(Replay(env.Request(http.MethodPost, "/2fa/setup", nil), login))
+				AssertError(t, rec, http.StatusForbidden, auth.HTTPErrCSRFInvalid.Message, auth.CodeCSRFInvalid)
 
-		// A revoked session is still SESSION_REVOKED under allcalls.
-		if err := env.Auth.Service().RevokeSessionByID(context.Background(), sessionIDOf(t, tokens.AccessToken)); err != nil {
-			t.Fatalf("revoke: %v", err)
-		}
-		rec = env.Do(passwordlessBearer(env.Request(http.MethodPost, "/2fa/setup", nil), tokens.AccessToken))
-		AssertStatus(t, rec, http.StatusUnauthorized)
-		if got := Body(t, rec)["code"]; got != auth.CodeSessionRevoked {
-			t.Errorf("code = %v, want %s", got, auth.CodeSessionRevoked)
+				// A revoked session is still SESSION_REVOKED under allcalls.
+				if err := env.Auth.Service().RevokeSessionByID(context.Background(), sessionIDOf(t, tokens.AccessToken)); err != nil {
+					t.Fatalf("revoke: %v", err)
+				}
+				rec = env.Do(passwordlessBearer(env.Request(http.MethodPost, "/2fa/setup", nil), tokens.AccessToken))
+				AssertStatus(t, rec, http.StatusUnauthorized)
+				if got := Body(t, rec)["code"]; got != auth.CodeSessionRevoked {
+					t.Errorf("code = %v, want %s", got, auth.CodeSessionRevoked)
+				}
+			})
 		}
 	})
 }

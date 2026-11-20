@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base32"
 	"errors"
 	"fmt"
@@ -48,6 +50,25 @@ import (
 //     the login that minted the token and the TOTP code by this request, so the
 //     session is the one a password-and-TOTP login would have produced.
 //
+//   - The secret is the server's, not the client's. POST /2fa/setup with an
+//     enrolment token answers a secret derived from the token
+//     (forcedEnrolmentSecret), and POST /2fa/verify-setup with the same token
+//     accepts that secret and no other. The session that follows claims the
+//     factor, so the factor must be one nobody else can compute codes for — an
+//     all-zero key, or the RFC 6238 test vector, is refused like any secret
+//     the server did not mint.
+//   - The token is bound to the credential that minted it (enrolmentCredential,
+//     the cred claim): once the account's password changes, every enrolment
+//     token minted before is dead, so a reset after a suspected compromise
+//     takes outstanding tokens with it. The login's email-verification gate is
+//     applied again on every use.
+//
+// All of it is behind Config.EnrolOnLogin, off by default. It is trust on
+// first use — whoever holds the password enrols the factor — and a deployment
+// opts in to that; with the option off the 2FA_SETUP_REQUIRED tempToken is the
+// step-up token it always was and the enrolment routes take an access token
+// alone.
+//
 // Voluntary enrolment is unchanged: a signed-in user presents an access token,
 // /2fa/verify-setup answers {"success":true}, and no new session is opened.
 
@@ -73,83 +94,144 @@ func (s *Service) mustEnrolSecondFactor(user User) bool {
 
 // issueEnrolmentToken mints the token a 2FA_SETUP_REQUIRED answer carries. Its
 // lifetime is Config.TempTokenTTL, the step-up token's, 5 minutes by default.
+// It carries the cred claim, written after the hook merge like the session
+// claims, so no hook can forge or drop it.
 func (s *Service) issueEnrolmentToken(ctx context.Context, user User) (string, error) {
-	token, _, err := s.issueToken(ctx, user, "", tokenTypeEnrolment, s.cfg.TempTokenTTL)
+	token, _, err := s.mintToken(ctx, user, "", tokenTypeEnrolment, s.cfg.TempTokenTTL,
+		map[string]any{"cred": s.enrolmentCredential(user)})
 	return token, err
+}
+
+// enrolmentCredential binds an enrolment token to the credential state of the
+// login that minted it: an HMAC under Config.Secret of the stored password
+// hash. It reveals nothing about the hash, and any change to the password —
+// a reset, a change, a migration rehash — changes it, so every token minted
+// before no longer matches.
+func (s *Service) enrolmentCredential(user User) string {
+	return sign("awesome-go-auth/enrolment-credential/v1\x00"+user.PasswordHash, s.cfg.Secret)
+}
+
+// forcedEnrolmentSecretBytes is the length of the key forcedEnrolmentSecret
+// derives: 160 bits, RFC 4226's recommendation, above its R6 floor of 128.
+const forcedEnrolmentSecretBytes = 20
+
+// forcedEnrolmentSecret is the TOTP secret of the forced enrolment an
+// enrolment token authorises: an HMAC under Config.Secret of the token's
+// tenant, subject and id, the first 160 bits base32-encoded. The server mints
+// it from the token, so POST /2fa/setup can hand it out and POST
+// /2fa/verify-setup recognise it without storing anything, and a client
+// cannot substitute a secret of its own choosing — one whose codes anybody
+// could compute — for the factor the session it is about to get will claim.
+// Each token derives its own: a client that logs in again calls /2fa/setup
+// again.
+//
+// The message carries a NUL and a slash, which no JWS signing input does, so
+// no derived value is ever a signature under the same key.
+func (s *Service) forcedEnrolmentSecret(claims tokenClaims) string {
+	mac := hmac.New(sha256.New, []byte(s.cfg.Secret))
+	_, _ = mac.Write([]byte("awesome-go-auth/forced-enrolment-secret/v1\x00" + claims.Tid + "\x00" + claims.Sub + "\x00" + claims.Jti))
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(mac.Sum(nil)[:forcedEnrolmentSecretBytes])
 }
 
 // VerifyEnrolmentToken resolves the user an enrolment token names, re-read from
 // the store, for as long as that user still has to enrol.
 //
-// The answer is ErrInvalidToken for a token that does not verify as an
-// enrolment token — a step-up token, an access token and a refresh token
-// included — for one past its lifetime, for a user the store no longer has,
-// and for a user who no longer needs to enrol: a factor has been enrolled since
-// the token was minted, or the policy that demanded one has been lifted. Any
-// other store failure is returned as itself, so a caller can answer it 500
-// rather than read an outage as a bad credential.
+// The answer is ErrInvalidToken whenever Config.EnrolOnLogin is off; for a
+// token that does not verify as an enrolment token — a step-up token, an
+// access token and a refresh token included — for one past its lifetime, for
+// a user the store no longer has, and for a user who no longer needs to enrol:
+// a factor has been enrolled since the token was minted, or the policy that
+// demanded one has been lifted. It is ErrInvalidToken as well when the
+// account's password has changed since the token was minted (the token's cred
+// claim no longer matches), and when the login's email-verification gate
+// would now refuse the account. Any other store failure is returned as
+// itself, so a caller can answer it 500 rather than read an outage as a bad
+// credential.
 //
 // The returned User is the stored row, so Require2FA, the TOTP state and the
 // email are current rather than whatever the token carried.
 func (s *Service) VerifyEnrolmentToken(ctx context.Context, token string) (User, error) {
+	user, _, err := s.verifyEnrolmentToken(ctx, token)
+	return user, err
+}
+
+func (s *Service) verifyEnrolmentToken(ctx context.Context, token string) (User, tokenClaims, error) {
+	if !s.cfg.EnrolOnLogin {
+		return User{}, tokenClaims{}, ErrInvalidToken
+	}
 	claims, err := s.parseToken(token, tokenTypeEnrolment)
 	if err != nil {
-		return User{}, ErrInvalidToken
+		return User{}, tokenClaims{}, ErrInvalidToken
 	}
 	user, err := s.users.GetUserByID(ctx, claims.Sub, claims.Tid)
 	switch {
 	case errors.Is(err, ErrUserNotFound):
-		return User{}, ErrInvalidToken
+		return User{}, tokenClaims{}, ErrInvalidToken
 	case err != nil:
-		return User{}, fmt.Errorf("auth: enrolment token: read user: %w", err)
+		return User{}, tokenClaims{}, fmt.Errorf("auth: enrolment token: read user: %w", err)
 	}
 	if !s.mustEnrolSecondFactor(user) {
-		return User{}, ErrInvalidToken
+		return User{}, tokenClaims{}, ErrInvalidToken
 	}
-	return user, nil
+	// The credential that minted the token is still the account's, and the
+	// login that minted it would still let the account in.
+	if claims.Cred == "" || !secureEqual(claims.Cred, s.enrolmentCredential(user)) {
+		return User{}, tokenClaims{}, ErrInvalidToken
+	}
+	if s.emailVerificationBlocksLogin(user) {
+		return User{}, tokenClaims{}, ErrInvalidToken
+	}
+	return user, claims, nil
 }
 
-// CompleteTOTPEnrolment confirms a TOTP secret for a user an enrolment token
-// named and opens the session that user's login could not: the forced half of
-// POST /2fa/verify-setup.
+// NewForcedTOTPEnrolment is the forced half of POST <prefix>/2fa/setup: the
+// secret and provisioning URI of the enrolment an enrolment token authorises.
+// The secret is the server's (forcedEnrolmentSecret) and the same for every
+// call with the same token; CompleteTOTPEnrolment accepts it and no other. A
+// token VerifyEnrolmentToken refuses is ErrInvalidToken, a store failure
+// itself. Nothing is stored.
+func (s *Service) NewForcedTOTPEnrolment(ctx context.Context, enrolmentToken string) (TOTPSetup, error) {
+	user, claims, err := s.verifyEnrolmentToken(ctx, enrolmentToken)
+	if err != nil {
+		return TOTPSetup{}, err
+	}
+	secret := s.forcedEnrolmentSecret(claims)
+	return TOTPSetup{Secret: secret, OTPAuthURL: totpProvisioningURI(secret, user.Email, s.cfg.totpIssuer())}, nil
+}
+
+// CompleteTOTPEnrolment confirms the TOTP factor an enrolment token authorises
+// and opens the session its user's login could not: the forced half of POST
+// <prefix>/2fa/verify-setup.
 //
-// The user is re-read and must still need to enrol (ErrInvalidToken
-// otherwise), so a direct caller cannot use this to replace a factor an account
-// already has. The secret must be a base32 key of at least 128 bits (RFC 4226
-// R6; ErrInvalidCode otherwise), because the session that follows claims the
-// factor. Then it is VerifyTOTPSetup — the code checked against secret
+// The token is verified again (VerifyEnrolmentToken; ErrInvalidToken), so a
+// direct caller cannot use this to replace a factor an account already has.
+// The secret must be the one NewForcedTOTPEnrolment answered for this token
+// (ErrInvalidCode otherwise): the session that follows claims the factor, so
+// it has to be one the server minted rather than one the client chose. Then
+// it is VerifyTOTPSetup — the code checked against the secret
 // (ErrInvalidCode), the secret stored, identity.user.2fa.enabled raised — and
-// then the tail of POST /2fa/verify: a session, and identity.auth.login.success
-// with `method: "totp"`. The two events are the two the voluntary enrolment and
-// the step-up login raise, in the order the two steps happen.
+// then the tail of POST /2fa/verify: a session, and
+// identity.auth.login.success with `method: "totp"`. The two events are the
+// two the voluntary enrolment and the step-up login raise, in the order the
+// two steps happen.
 //
 // A session that fails to open leaves the factor enrolled, which is the only
 // order there is: the secret has to be stored before the account counts as
 // holding a factor. The user then signs in with the password and the code.
-func (s *Service) CompleteTOTPEnrolment(ctx context.Context, userID, tenantID, secret, code string) (User, AuthTokens, error) {
-	user, err := s.users.GetUserByID(ctx, userID, tenantID)
-	switch {
-	case errors.Is(err, ErrUserNotFound):
-		return User{}, AuthTokens{}, ErrInvalidToken
-	case err != nil:
-		return User{}, AuthTokens{}, fmt.Errorf("auth: complete enrolment: read user: %w", err)
+func (s *Service) CompleteTOTPEnrolment(ctx context.Context, enrolmentToken, secret, code string) (User, AuthTokens, error) {
+	user, claims, err := s.verifyEnrolmentToken(ctx, enrolmentToken)
+	if err != nil {
+		return User{}, AuthTokens{}, err
 	}
-	if !s.mustEnrolSecondFactor(user) {
-		return User{}, AuthTokens{}, ErrInvalidToken
-	}
-	// The session this opens says the account holds a second factor, so the
-	// secret has to be one: an empty string decodes to an empty HMAC key whose
-	// codes anybody can compute, and it would leave the account still owing
-	// enrolment while its session claimed otherwise. A secret below the RFC
-	// 4226 floor is refused as a code that does not verify.
-	if !totpSecretIsStrong(secret) {
+	minted := s.forcedEnrolmentSecret(claims)
+	if !secureEqual(secret, minted) {
 		return User{}, AuthTokens{}, ErrInvalidCode
 	}
-	if err := s.VerifyTOTPSetup(ctx, user.ID, user.TenantID, secret, code); err != nil {
+	if err := s.VerifyTOTPSetup(ctx, user.ID, user.TenantID, minted, code); err != nil {
 		return User{}, AuthTokens{}, err
 	}
 	user.IsTOTPEnabled = true
-	user.TOTPSecret = secret
+	user.TOTPSecret = minted
 	tokens, sessionID, err := s.issueSession(ctx, user)
 	if err != nil {
 		return User{}, AuthTokens{}, err
@@ -171,20 +253,6 @@ func (s *Service) CompleteTOTPEnrolment(ctx context.Context, userID, tenantID, s
 	return user, tokens, nil
 }
 
-// minTOTPSecretBytes is RFC 4226 §4 requirement R6: "The length of the shared
-// secret MUST be at least 128 bits." The secrets POST /2fa/setup mints are well
-// above it (generateTOTPSecret).
-const minTOTPSecretBytes = 16
-
-// totpSecretIsStrong reports whether secret is a base32 key of at least
-// minTOTPSecretBytes, which is what a forced enrolment requires before it opens
-// a session on the strength of it. The voluntary path checks nothing of the
-// kind, as the reference's does not; it opens no session.
-func totpSecretIsStrong(secret string) bool {
-	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secret)
-	return err == nil && len(key) >= minTOTPSecretBytes
-}
-
 // TOTPEnrolmentRequest is the body POST <prefix>/2fa/setup and POST
 // <prefix>/2fa/verify-setup read. The four adapters decode it with
 // DecodeOptionalJSONBody, so an absent body is a body with every member
@@ -199,7 +267,7 @@ type TOTPEnrolmentRequest struct {
 	// route and the served client sends it (auth.js:599-601).
 	Token string `json:"token"`
 	// Secret is the client's copy of the secret /2fa/setup returned
-	// (verify-setup).
+	// (verify-setup). On a forced enrolment it must be that secret exactly.
 	Secret string `json:"secret"`
 }
 
@@ -215,6 +283,10 @@ type TOTPEnrolmentCaller struct {
 	// POST /2fa/verify-setup opens a session for a forced enrolment and not for
 	// a voluntary one.
 	Forced bool
+	// EnrolmentToken is the enrolment token a forced request presented, body
+	// or bearer: what NewForcedTOTPEnrolment and CompleteTOTPEnrolment take.
+	// Empty on a voluntary enrolment.
+	EnrolmentToken string
 }
 
 // TOTPEnrolmentCaller resolves who an enrolment request acts for, or the
@@ -245,13 +317,18 @@ type TOTPEnrolmentCaller struct {
 //     403 "Invalid or expired access token", or 401 SESSION_REVOKED.
 //
 // A store failure while re-reading the user is the generic 500.
+//
+// With Config.EnrolOnLogin off there is no enrolment token to look for: steps
+// 1 and 4 are skipped, a body tempToken is ignored as the routes always
+// ignored it, and the gate is the access middleware exactly.
 func (a *Auth) TOTPEnrolmentCaller(ctx context.Context, r *http.Request, tempToken string) (TOTPEnrolmentCaller, HTTPError, bool) {
-	if tempToken != "" {
+	enrol := a.service.cfg.EnrolOnLogin
+	if enrol && tempToken != "" {
 		user, err := a.service.VerifyEnrolmentToken(ctx, tempToken)
 		if err != nil {
 			return TOTPEnrolmentCaller{}, enrolmentTokenHTTPError(err), false
 		}
-		return TOTPEnrolmentCaller{User: user, Forced: true}, HTTPError{}, true
+		return TOTPEnrolmentCaller{User: user, Forced: true, EnrolmentToken: tempToken}, HTTPError{}, true
 	}
 	accessToken := AccessTokenFromRequest(r)
 	if accessToken == "" {
@@ -261,11 +338,11 @@ func (a *Auth) TOTPEnrolmentCaller(ctx context.Context, r *http.Request, tempTok
 	if accessErr == nil {
 		return TOTPEnrolmentCaller{User: user}, HTTPError{}, true
 	}
-	if bearer := BearerToken(r.Header.Get("Authorization")); bearer != "" && bearer == accessToken {
+	if bearer := BearerToken(r.Header.Get("Authorization")); enrol && bearer != "" && bearer == accessToken {
 		forced, err := a.service.VerifyEnrolmentToken(ctx, bearer)
 		switch {
 		case err == nil:
-			return TOTPEnrolmentCaller{User: forced, Forced: true}, HTTPError{}, true
+			return TOTPEnrolmentCaller{User: forced, Forced: true, EnrolmentToken: bearer}, HTTPError{}, true
 		case !errors.Is(err, ErrInvalidToken):
 			return TOTPEnrolmentCaller{}, enrolmentTokenHTTPError(err), false
 		}
@@ -283,11 +360,12 @@ func enrolmentTokenHTTPError(err error) HTTPError {
 	return HTTPErrorFor(err)
 }
 
-// TOTPEnrolmentHTTPError maps a Service.CompleteTOTPEnrolment failure: a user
-// who no longer needs to enrol is INVALID_TEMP_TOKEN, as the gate answers for
-// the same token, and everything else is what POST /2fa/verify-setup answers on
-// the voluntary path (TOTPSetupHTTPError) — a bad code is
-// 400 "Invalid TOTP code".
+// TOTPEnrolmentHTTPError maps a Service.NewForcedTOTPEnrolment or
+// Service.CompleteTOTPEnrolment failure: a token no longer honoured is
+// INVALID_TEMP_TOKEN, as the gate answers for the same token, and everything
+// else is what POST /2fa/verify-setup answers on the voluntary path
+// (TOTPSetupHTTPError) — a bad code, or a secret the server did not mint for
+// the token, is 400 "Invalid TOTP code".
 func TOTPEnrolmentHTTPError(err error) HTTPError {
 	if errors.Is(err, ErrInvalidToken) {
 		return HTTPErrInvalidTempToken
@@ -300,7 +378,12 @@ func (a *Auth) VerifyEnrolmentToken(ctx context.Context, token string) (User, er
 	return a.service.VerifyEnrolmentToken(ctx, token)
 }
 
+// NewForcedTOTPEnrolment delegates to Service.NewForcedTOTPEnrolment.
+func (a *Auth) NewForcedTOTPEnrolment(ctx context.Context, enrolmentToken string) (TOTPSetup, error) {
+	return a.service.NewForcedTOTPEnrolment(ctx, enrolmentToken)
+}
+
 // CompleteTOTPEnrolment delegates to Service.CompleteTOTPEnrolment.
-func (a *Auth) CompleteTOTPEnrolment(ctx context.Context, userID, tenantID, secret, code string) (User, AuthTokens, error) {
-	return a.service.CompleteTOTPEnrolment(ctx, userID, tenantID, secret, code)
+func (a *Auth) CompleteTOTPEnrolment(ctx context.Context, enrolmentToken, secret, code string) (User, AuthTokens, error) {
+	return a.service.CompleteTOTPEnrolment(ctx, enrolmentToken, secret, code)
 }

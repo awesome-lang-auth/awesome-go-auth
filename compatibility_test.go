@@ -117,6 +117,8 @@ var wantClaims = map[string][]string{
 		"every other route refuses it", "401 INVALID_TEMP_TOKEN", "POST <prefix>/2fa/verify",
 		"X-Auth-Strategy: bearer", "identity.user.2fa.enabled", "identity.auth.login.success",
 		"authMiddleware", "{success: true}", "temp-token-is-typed-not-an-access-token",
+		"Config.EnrolOnLogin", "off by default", "password change", "a secret the server derives",
+		"enrolled out of band", "Trust on first use",
 	},
 	"idp-mode-adds-an-oauth-authorization-server": {
 		"S256", "plain", "client_secret_basic", "client_secret_post", "refresh_token", "offline_access",

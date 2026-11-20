@@ -157,9 +157,10 @@ async function doLogin() {
     }
   } catch (e) {
     // The other 2FA branch: a policy demands a second factor and this account has
-    // none. Its tempToken authenticates nothing in this port — /2fa/setup is
-    // behind the access-token gate — so enrolment has to happen from a signed-in
-    // session, which is why this only reports the situation.
+    // none. Its tempToken completes nothing unless the deployment sets
+    // Config.EnrolOnLogin, which makes it an enrolment token for /2fa/setup and
+    // /2fa/verify-setup; this page does not walk that flow, so it only reports
+    // the situation.
     if (e.code === '2FA_SETUP_REQUIRED') {
       showError('login-error', 'This account must enrol a second factor before it can sign in.');
     } else {

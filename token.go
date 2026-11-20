@@ -23,6 +23,9 @@ type tokenClaims struct {
 	Iss string `json:"iss"`
 	Iat int64  `json:"iat"`
 	Exp int64  `json:"exp"`
+	// Cred is the enrolment token's binding to the credential that minted it
+	// (enrolmentCredential); no other type carries it.
+	Cred string `json:"cred,omitempty"`
 }
 
 // joseHeader is the JWT header of an issued token.
@@ -61,6 +64,14 @@ func isReservedClaim(name string) bool {
 // order is the guarantee: a hook can rename what the user is, not what the
 // token is.
 func (s *Service) issueToken(ctx context.Context, user User, sessionID, tokenType string, ttl time.Duration) (string, time.Time, error) {
+	return s.mintToken(ctx, user, sessionID, tokenType, ttl, nil)
+}
+
+// mintToken is the one place a token is assembled. extra is written last,
+// after the session claims, so that no hook value survives under one of its
+// names: it is how a token type that carries a claim of its own — the
+// enrolment token's binding to its credential — adds it.
+func (s *Service) mintToken(ctx context.Context, user User, sessionID, tokenType string, ttl time.Duration, extra map[string]any) (string, time.Time, error) {
 	now := s.now()
 	expiresAt := now.Add(ttl)
 	jti, err := newID("jti")
@@ -116,6 +127,9 @@ func (s *Service) issueToken(ctx context.Context, user User, sessionID, tokenTyp
 	payloadClaims["iss"] = s.cfg.Issuer
 	payloadClaims["iat"] = now.Unix()
 	payloadClaims["exp"] = expiresAt.Unix()
+	for key, value := range extra {
+		payloadClaims[key] = value
+	}
 
 	// A refresh token is signed with Config.RefreshSecret when one is set, as
 	// the reference signs it with refreshTokenSecret (token.service.ts:25-29);

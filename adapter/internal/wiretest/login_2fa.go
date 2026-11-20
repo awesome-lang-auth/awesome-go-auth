@@ -300,12 +300,15 @@ func testLoginTwoFactor(t *testing.T, mount Mounter) {
 	// no message. The tempToken is minted here too, exactly as in the reference
 	// (auth.router.ts:564-568).
 	//
-	// That token is an enrolment token: POST /2fa/setup and POST
-	// /2fa/verify-setup accept it and nothing else does, and a verify-setup that
-	// completes with it opens the session. The reference's tempToken is an
-	// ordinary access token, which is how it reaches the enrolment routes there;
-	// this port types it instead, so it cannot double as a session credential.
-	// testForcedEnrolment (enrolment.go) pins the whole flow.
+	// Under Config.EnrolOnLogin that token is an enrolment token: POST
+	// /2fa/setup and POST /2fa/verify-setup accept it and nothing else does,
+	// and a verify-setup that completes with it opens the session. The
+	// reference's tempToken is an ordinary access token, which is how it
+	// reaches the enrolment routes there; this port types it instead, so it
+	// cannot double as a session credential. testForcedEnrolment (enrolment.go)
+	// pins the whole flow. Without the option — this env, and the default —
+	// it is the step-up token, which no route completes for an account with no
+	// factor, and the account is enrolled out of band.
 	t.Run("a policy with no enrolled factor answers 2FA_SETUP_REQUIRED", func(t *testing.T) {
 		env := challengeEnv(t, mount, challengeOpts{}, auth.WithRequire2FA(true))
 		env.Seed("setupreq@example.com")

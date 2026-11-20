@@ -69,18 +69,20 @@ type TwoFactorChallenge struct {
 	// tokenTypeTemp, so unlike the reference's it is not also an access token —
 	// see the tokenTypeTemp comment for why that deliberate difference is kept.
 	//
-	// When SetupRequired is set it is an enrolment token instead, typed
-	// tokenTypeEnrolment: POST <prefix>/2fa/setup and POST
+	// When SetupRequired is set under Config.EnrolOnLogin it is an enrolment
+	// token instead, typed tokenTypeEnrolment: POST <prefix>/2fa/setup and POST
 	// <prefix>/2fa/verify-setup accept it, and nothing else does. See
-	// enrolment.go.
+	// enrolment.go. Without the option it is the step-up token, which no route
+	// completes for an account with no factor.
 	TempToken string
 	// Methods is available2faMethods: the factors this user can use, in the
 	// reference's order. It is empty only when SetupRequired is set.
 	Methods []string
 	// SetupRequired selects the second of the reference's two branches: a policy
 	// demands a second factor and the account has no method at all, so the client
-	// must enrol one before it can be challenged — with TempToken, through the
-	// two enrolment routes, which open the session once the factor is enrolled.
+	// must enrol one before it can be challenged — under Config.EnrolOnLogin
+	// with TempToken, through the two enrolment routes, which open the session
+	// once the factor is enrolled; otherwise out of band.
 	SetupRequired bool
 }
 
@@ -244,19 +246,24 @@ func (s *Service) LoginWithChallenge(ctx context.Context, in LoginInput) (LoginR
 // that may only enrol can never complete a step-up, and the step-up token —
 // which a user with an enrolled factor holds after the password alone — can
 // never enrol a replacement factor.
+//
+// The enrolment token is minted only under Config.EnrolOnLogin. Without it the
+// setup-required branch carries the step-up token, as it did before the option
+// existed: no route completes it, and the account is enrolled out of band.
 func (s *Service) twoFactorChallenge(ctx context.Context, user User) (*TwoFactorChallenge, error) {
-	if s.mustEnrolSecondFactor(user) {
+	if s.cfg.EnrolOnLogin && s.mustEnrolSecondFactor(user) {
 		token, err := s.issueEnrolmentToken(ctx, user)
 		if err != nil {
 			return nil, err
 		}
 		return &TwoFactorChallenge{TempToken: token, Methods: []string{}, SetupRequired: true}, nil
 	}
+	methods := s.availableTwoFactorMethods(user)
 	token, err := s.IssueTempToken(ctx, user)
 	if err != nil {
 		return nil, err
 	}
-	return &TwoFactorChallenge{TempToken: token, Methods: s.availableTwoFactorMethods(user)}, nil
+	return &TwoFactorChallenge{TempToken: token, Methods: methods, SetupRequired: len(methods) == 0}, nil
 }
 
 // availableTwoFactorMethods lists the factors this user can present, in the

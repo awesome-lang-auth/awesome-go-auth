@@ -71,8 +71,10 @@ func main() {
 - TOTP 2FA (`SetupTOTP`, `VerifyTOTPSetup`, `VerifyTOTP`, `DisableTOTP`).
 - Mandatory second factor with forced enrolment at first login: under
   `WithRequire2FA(true)` or a user's `Require2FA` flag, an account with no
-  factor gets `2FA_SETUP_REQUIRED` and an enrolment token that only
-  `/2fa/setup` and `/2fa/verify-setup` accept; enrolling with it opens the
+  factor gets `2FA_SETUP_REQUIRED`; with `WithEnrolOnLogin(true)` (trust on
+  first use, off by default) its token is an enrolment token that only
+  `/2fa/setup` and `/2fa/verify-setup` accept, bound to the password that
+  minted it, and enrolling the secret the server mints for it opens the
   session ([Mandatory second factor and forced enrolment](README_DETAILED.md#mandatory-second-factor-and-forced-enrolment--require2fa)).
 - Email verification (`SendVerificationEmailToken`, `VerifyEmail`) and email change (`RequestEmailChange`, `ConfirmEmailChange`).
 - Session admin helpers (`ListSessions`, `RevokeSessionByID`, `CleanupExpiredSessions`).
@@ -201,18 +203,23 @@ revision the whole contract was extracted from.
   user's `Require2FA` flag — and the account has none to present, the login
   answers the reference's
   `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}` and
-  opens no session. That `tempToken` is an enrolment token, typed apart from the
-  access, step-up and refresh tokens: `POST <prefix>/2fa/setup` and
-  `POST <prefix>/2fa/verify-setup` accept it, as the body's `tempToken` or as
-  `Authorization: Bearer`, and every other route refuses it. It is honoured only
-  while the login would still answer `2FA_SETUP_REQUIRED` for its user, so it
-  dies the moment a factor exists, and a replay is `401 INVALID_TEMP_TOKEN`. A
-  `verify-setup` that completes with it stores the factor and opens the session
-  exactly as `POST <prefix>/2fa/verify` does — cookies, or `accessToken` and
-  `refreshToken` under `X-Auth-Strategy: bearer` — raising
+  opens no session. Under `Config.EnrolOnLogin`, off by default, that
+  `tempToken` is an enrolment token, typed apart from the access, step-up and
+  refresh tokens: `POST <prefix>/2fa/setup` and `POST <prefix>/2fa/verify-setup`
+  accept it, as the body's `tempToken` or as `Authorization: Bearer`, and every
+  other route refuses it. It is honoured only while the login would still answer
+  `2FA_SETUP_REQUIRED` for its user, so it dies the moment a factor exists, and
+  a replay is `401 INVALID_TEMP_TOKEN`; it is bound to the password that minted
+  it, and dies with a password change. `/2fa/setup` with it answers a secret the
+  server derives from the token, and `verify-setup` accepts that secret and no
+  other. A `verify-setup` that completes with it stores the factor and opens the
+  session exactly as `POST <prefix>/2fa/verify` does — cookies, or `accessToken`
+  and `refreshToken` under `X-Auth-Strategy: bearer` — raising
   `identity.user.2fa.enabled` and then `identity.auth.login.success` with
   `method: "totp"`. With an access token, the voluntary path, `verify-setup`
-  answers `{"success":true}` and opens nothing, as before.
+  answers `{"success":true}` and opens nothing, as before. Without
+  `EnrolOnLogin` the `tempToken` is the step-up token, which completes nothing
+  for an account with no factor, and the account is enrolled out of band.
 - **The reference**: Mints that `tempToken` as an ordinary 5-minute access
   token, so a client sends it as a bearer credential to `/2fa/setup` and
   `/2fa/verify-setup`, both behind `authMiddleware`, and also to every other
@@ -230,12 +237,17 @@ revision the whole contract was extracted from.
   the reference's second login, which would re-prove the same two factors this
   request has just proved: the password, by the login that minted the token, and
   the code, by this request.
-- **For a client written against the reference**: It keeps working. Sending the
-  `tempToken` as `Authorization: Bearer` to the two enrolment routes is
-  accepted, and a client that ignores the session `verify-setup` now delivers
-  and logs in again gets the step-up challenge for the factor it just enrolled.
-  What it can no longer do is use that token on any other route before the
-  second factor exists.
+- **For a client written against the reference**: It keeps working under
+  `EnrolOnLogin`. Sending the `tempToken` as `Authorization: Bearer` to the two
+  enrolment routes is accepted, and a client that ignores the session
+  `verify-setup` now delivers and logs in again gets the step-up challenge for
+  the factor it just enrolled. What it can no longer do is use that token on any
+  other route before the second factor exists, or enrol a secret it generated
+  itself rather than the one `/2fa/setup` answered.
+- **Trust on first use**: Enrolling at login lets whoever holds the account's
+  password bind the factor — the reference's behaviour, since its token is an
+  access token. This port asks for it explicitly: `Config.EnrolOnLogin` is off
+  by default, and a deployment that enrols out of band leaves it off.
 
 ### The refresh-token secret is optional and may equal the access-token secret
 

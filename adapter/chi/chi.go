@@ -187,11 +187,13 @@ func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(h
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/magic-link/verify", h.MagicLinkVerify)
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/sms/send", h.SMSSend)
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/sms/verify", h.SMSVerify)
-	// The two enrolment routes authenticate themselves (nethttp's
-	// TwoFactorSetup), because they also accept the enrolment token of a
-	// 2FA_SETUP_REQUIRED answer, which the access middleware would refuse.
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/2fa/setup", h.TwoFactorSetup)
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/2fa/verify-setup", h.TwoFactorVerifySetup)
+	// The two enrolment routes sit behind nethttp's EnrolmentGate: the access
+	// middleware when Config.EnrolOnLogin is off, and nothing when it is on,
+	// because the handlers then also accept the enrolment token of a
+	// 2FA_SETUP_REQUIRED answer, which the middleware would refuse, and
+	// authenticate themselves (nethttp's TwoFactorSetup).
+	r.With(guard, h.EnrolmentGate()).MethodFunc(http.MethodPost, prefix+"/2fa/setup", h.TwoFactorSetup)
+	r.With(guard, h.EnrolmentGate()).MethodFunc(http.MethodPost, prefix+"/2fa/verify-setup", h.TwoFactorVerifySetup)
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/2fa/verify", h.TwoFactorVerify)
 	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+"/2fa/disable", h.TwoFactorDisable)
 	// Password management and email verification (wire-contract §2).

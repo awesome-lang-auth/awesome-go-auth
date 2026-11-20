@@ -714,9 +714,10 @@ func openAPISchemas() map[string]any {
 				"requires2FASetup": map[string]any{"type": "boolean", "enum": []bool{true}},
 				"tempToken": map[string]any{
 					"type": "string",
-					"description": "Enrolment token: present it to /2fa/setup and /2fa/verify-setup, as the body's tempToken " +
-						"or as a bearer credential, and to no other route. It is honoured only while this account still has " +
-						"to enrol, and verify-setup with it opens the session.",
+					"description": "With Config.EnrolOnLogin, an enrolment token: present it to /2fa/setup and /2fa/verify-setup, " +
+						"as the body's tempToken or as a bearer credential, and to no other route. It is honoured only while this " +
+						"account still has to enrol and its password is unchanged, and verify-setup with it opens the session. " +
+						"Without the option it completes nothing, and the account is enrolled out of band.",
 				},
 				"code": map[string]any{"type": "string", "enum": []string{CodeTwoFactorSetupRequired}},
 			},
@@ -1281,9 +1282,10 @@ func openAPIPaths(prefix string) map[string]any {
 			"post": map[string]any{
 				"summary": "Begin authenticator enrolment",
 				"description": "Stateless: nothing is persisted until the secret comes back to /2fa/verify-setup with a code that verifies against it. " +
-					"The caller is a signed-in user (an access token), or a user whose login answered `" + CodeTwoFactorSetupRequired +
+					"The caller is a signed-in user (an access token), or — with Config.EnrolOnLogin — a user whose login answered `" + CodeTwoFactorSetupRequired +
 					"`, presenting that answer's enrolment token as the body's `tempToken` or as a bearer credential. " +
-					"A body `tempToken` takes precedence over an access credential and must be a valid enrolment token.",
+					"A body `tempToken` takes precedence over an access credential and must be a valid enrolment token. " +
+					"A forced enrolment is answered the secret the server mints for its token, the same on every call.",
 				"operationId": "setupTwoFactor",
 				"tags":        []string{"TwoFactor"},
 				"security":    anyCredential,
@@ -1304,7 +1306,8 @@ func openAPIPaths(prefix string) map[string]any {
 				"description": "The code field is named `token` on this route — not `code`, and not `totpCode`. " +
 					"On a voluntary enrolment (an access token) the answer is `{\"success\":true}` and no session is opened. " +
 					"On a forced one — the enrolment token of a `" + CodeTwoFactorSetupRequired + "` answer, as the body's `tempToken` " +
-					"or as a bearer credential — the factor is stored and the session is opened exactly as /2fa/verify opens it: " +
+					"or as a bearer credential, with Config.EnrolOnLogin — `secret` must be the one /2fa/setup answered for that " +
+					"token, the factor is stored and the session is opened exactly as /2fa/verify opens it: " +
 					"the session cookies, or `accessToken` and `refreshToken` under `X-Auth-Strategy: bearer`.",
 				"operationId": "verifyTwoFactorSetup",
 				"tags":        []string{"TwoFactor"},

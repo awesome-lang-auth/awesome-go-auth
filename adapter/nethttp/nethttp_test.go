@@ -1,11 +1,17 @@
 package nethttp_test
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base32"
+	"encoding/binary"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	auth "github.com/nik2208/awesome-go-auth"
 	"github.com/nik2208/awesome-go-auth/adapter/internal/wiretest"
@@ -122,4 +128,67 @@ func TestMiddlewareGuardsHostRoutes(t *testing.T) {
 	anonymous := httptest.NewRecorder()
 	protected.ServeHTTP(anonymous, httptest.NewRequest(http.MethodGet, "/protected", nil))
 	wiretest.AssertError(t, anonymous, http.StatusForbidden, "No access token provided", "")
+}
+
+// TestEnrolmentHandlersHonourAHostsUser pins the exported handlers' contract
+// for a host that mounts them by hand behind its own authentication: the user
+// the host put in the request context with auth.ContextWithUser is the caller,
+// and the enrolment is voluntary — as it was before the two handlers learned to
+// authenticate themselves — whatever Config.EnrolOnLogin says. The request
+// carries none of the library's credentials.
+func TestEnrolmentHandlersHonourAHostsUser(t *testing.T) {
+	for _, enrol := range []bool{false, true} {
+		t.Run(fmt.Sprintf("EnrolOnLogin=%v", enrol), func(t *testing.T) {
+			env := wiretest.NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithEnrolOnLogin(enrol))
+			user, _ := env.Seed("hostauth@example.com")
+			adapter := nethttpadapter.New(env.Auth)
+			hostAuth := func(next http.HandlerFunc) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					next(w, r.WithContext(auth.ContextWithUser(r.Context(), user)))
+				})
+			}
+
+			setup := httptest.NewRecorder()
+			hostAuth(adapter.TwoFactorSetup).ServeHTTP(setup, httptest.NewRequest(http.MethodPost, "/host/2fa/setup", nil))
+			wiretest.AssertStatus(t, setup, http.StatusOK)
+			secret, _ := wiretest.Body(t, setup)["secret"].(string)
+			if secret == "" {
+				t.Fatal("setup returned no secret")
+			}
+
+			code, err := totpCodeNow(secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/host/2fa/verify-setup",
+				strings.NewReader(fmt.Sprintf(`{"secret":%q,"token":%q}`, secret, code)))
+			req.Header.Set("Content-Type", "application/json")
+			verify := httptest.NewRecorder()
+			hostAuth(adapter.TwoFactorVerifySetup).ServeHTTP(verify, req)
+			wiretest.AssertStatus(t, verify, http.StatusOK)
+			wiretest.AssertKeys(t, wiretest.Body(t, verify), "success")
+
+			stored, err := env.Auth.FindUser(context.Background(), user.ID, "", user.TenantID)
+			if err != nil || !stored.IsTOTPEnabled {
+				t.Fatalf("stored user = %+v, %v, want the factor enrolled for the host's user", stored, err)
+			}
+		})
+	}
+}
+
+// totpCodeNow is the current code of a base32 TOTP secret, computed the way
+// an authenticator app computes it (RFC 6238, SHA-1, 6 digits, 30 seconds).
+func totpCodeNow(secret string) (string, error) {
+	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secret)
+	if err != nil {
+		return "", err
+	}
+	var counter [8]byte
+	binary.BigEndian.PutUint64(counter[:], uint64(time.Now().Unix()/30))
+	mac := hmac.New(sha1.New, key)
+	_, _ = mac.Write(counter[:])
+	sum := mac.Sum(nil)
+	offset := sum[len(sum)-1] & 0x0f
+	value := binary.BigEndian.Uint32(sum[offset:offset+4]) & 0x7fffffff
+	return fmt.Sprintf("%06d", value%1000000), nil
 }
