@@ -286,8 +286,16 @@ func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, cli
 		return nil, idp.invalidGrant("a public client's code was issued without a code_challenge")
 	}
 
+	// A user deleted between /authorize and /token: the code, already
+	// consumed, names an account that no longer exists, which is a dead grant
+	// (invalid_grant) rather than a server fault. Any other store failure is
+	// server_error.
 	user, err := idp.authSvc.users.GetUserByID(ctx, meta.UserID, meta.TenantID)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrUserNotFound):
+		return nil, idp.invalidGrant("the user the authorization code was issued to no longer exists")
+	case err != nil:
+		idp.logf("auth: idp: token: user %s: %v", meta.UserID, err)
 		return nil, tokenServerError()
 	}
 	// The session pair, HS256. Which pair /token returns is decision D-15 of
@@ -453,12 +461,20 @@ func (idp *IDP) refreshTokenGrant(ctx context.Context, r *http.Request, client I
 		idp.revokeRefreshFamily(ctx, rec.FamilyID, rec.ExpiresAt)
 		return nil, idp.invalidGrant("the session behind the refresh token has ended")
 	}
-	// UserStore has no not-found sentinel, so a deleted user and a failing
-	// store look alike here. Both are refused without revoking: nothing is
-	// issued either way, and DeleteAccount revokes the user's sessions where
-	// the store can list them, which ends the family at the session check.
+	// A user the store no longer has (ErrUserNotFound) can never be served
+	// again, so the grant is dead: invalid_grant (RFC 6749 §5.2), and the
+	// family is revoked like any other grant that lost its backing.
+	// DeleteAccount usually ends the family earlier, at the session check, by
+	// revoking the user's sessions; this covers a row removed at the store
+	// that left its session behind. Any other store failure is an outage, not
+	// evidence: server_error, and nothing is revoked, as for the session
+	// lookup above.
 	user, err := idp.authSvc.users.GetUserByID(ctx, rec.UserID, rec.TenantID)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrUserNotFound):
+		idp.revokeRefreshFamily(ctx, rec.FamilyID, rec.ExpiresAt)
+		return nil, idp.invalidGrant("the user behind the refresh token no longer exists; family " + rec.FamilyID + " revoked")
+	case err != nil:
 		idp.logf("auth: idp: refresh: user %s: %v", rec.UserID, err)
 		return nil, tokenServerError()
 	}

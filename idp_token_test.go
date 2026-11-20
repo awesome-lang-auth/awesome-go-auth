@@ -504,6 +504,89 @@ func (s noLookupSessionStore) UpdateSession(ctx context.Context, session Session
 	return s.inner.UpdateSession(ctx, session)
 }
 
+// failingUserStore answers every GetUserByID with a store error that is not
+// ErrUserNotFound, as a user store that is down would.
+type failingUserStore struct{ UserStore }
+
+func (failingUserStore) GetUserByID(context.Context, string, string) (User, error) {
+	return User{}, errors.New("user store unreachable")
+}
+
+// refreshFamily returns the family a refresh token belongs to and whether the
+// memory store holds that family revoked.
+func refreshFamily(t *testing.T, f *idpFixture, token string) (string, bool) {
+	t.Helper()
+	store := f.idp.refreshTokens.(*MemoryIDPRefreshTokenStore)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	entry, ok := store.tokens[hashToken(token)]
+	if !ok {
+		t.Fatalf("the store does not hold the refresh token")
+	}
+	_, revoked := store.revoked[entry.token.FamilyID]
+	return entry.token.FamilyID, revoked
+}
+
+// TestIDPRefreshTokenUserDeleted: a refresh for a user the store no longer has
+// (ErrUserNotFound) is a dead grant, invalid_grant, and the family is revoked,
+// even though the session behind it was left in place.
+func TestIDPRefreshTokenUserDeleted(t *testing.T) {
+	f := newIDPFixture(t)
+	grant := f.offlineGrant(t, "openid offline_access")
+	token := grant["refresh_token"].(string)
+	users := f.idp.authSvc.users.(*MemoryUserStore)
+	if err := users.DeleteUser(context.Background(), f.user.ID, idpTestTenant); err != nil {
+		t.Fatal(err)
+	}
+	status, body, header := f.refresh(t, token, idpTestClient)
+	assertTokenError(t, status, body, header, http.StatusBadRequest, "invalid_grant")
+	if family, revoked := refreshFamily(t, f, token); !revoked {
+		t.Fatalf("family %s of a deleted user's refresh token was not revoked", family)
+	}
+}
+
+// TestIDPRefreshTokenUserStoreFailure: a user store that fails for any other
+// reason is an outage, not evidence: server_error, and the family survives, so
+// the client can refresh again once the store is back.
+func TestIDPRefreshTokenUserStoreFailure(t *testing.T) {
+	f := newIDPFixture(t)
+	token := f.offlineGrant(t, "openid offline_access")["refresh_token"].(string)
+	healthy := f.idp.authSvc.users
+	f.idp.authSvc.users = failingUserStore{healthy}
+	status, body, header := f.refresh(t, token, idpTestClient)
+	assertTokenError(t, status, body, header, http.StatusInternalServerError, "server_error")
+	if family, revoked := refreshFamily(t, f, token); revoked {
+		t.Fatalf("a user-store outage revoked family %s", family)
+	}
+}
+
+// TestIDPCodeExchangeUserDeleted: a code redeemed after its user was deleted
+// is invalid_grant, not a server error.
+func TestIDPCodeExchangeUserDeleted(t *testing.T) {
+	f := newIDPFixture(t)
+	code := f.authorize(t, idpTestClient, url.Values{"scope": {"openid"}})
+	users := f.idp.authSvc.users.(*MemoryUserStore)
+	if err := users.DeleteUser(context.Background(), f.user.ID, idpTestTenant); err != nil {
+		t.Fatal(err)
+	}
+	status, body := f.token(t, code, idpTestClient)
+	if status != http.StatusBadRequest || body["error"] != "invalid_grant" {
+		t.Fatalf("POST /token for a deleted user = %d %v, want 400 invalid_grant", status, body)
+	}
+}
+
+// TestIDPCodeExchangeUserStoreFailure: any other user-store failure during the
+// exchange stays server_error.
+func TestIDPCodeExchangeUserStoreFailure(t *testing.T) {
+	f := newIDPFixture(t)
+	code := f.authorize(t, idpTestClient, url.Values{"scope": {"openid"}})
+	f.idp.authSvc.users = failingUserStore{f.idp.authSvc.users}
+	status, body := f.token(t, code, idpTestClient)
+	if status != http.StatusInternalServerError || body["error"] != "server_error" {
+		t.Fatalf("POST /token with a failing user store = %d %v, want 500 server_error", status, body)
+	}
+}
+
 // TestIDPNoRefreshTokenWithoutSessionLookup: the grant checks the session on
 // every refresh, so with a store that cannot look one up no token is issued.
 func TestIDPNoRefreshTokenWithoutSessionLookup(t *testing.T) {

@@ -318,8 +318,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       a new access token for the same session.
     - A token is `400 invalid_grant`, and every token of that grant is revoked
       (RFC 9700 §4.14.2), when it is presented again, presented by another
-      client, or presented after its session ended.
-    - A store error is a `500 server_error` and revokes nothing.
+      client, or presented after its session ended, or after its user was
+      deleted: a `UserStore` answering `ErrUserNotFound` (#31). A code redeemed
+      after its user was deleted is `400 invalid_grant` too.
+    - Any other store error is a `500 server_error` and revokes nothing.
     - `scope` narrows and never widens (`400 invalid_scope`).
     - A grant lasts as long as its session, `Config.RefreshTokenTTL`.
     - The state lives in the new `IDPRefreshTokenStore` interface, set as
