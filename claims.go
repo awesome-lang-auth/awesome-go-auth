@@ -90,7 +90,7 @@ func UserFieldClaims(fields map[string]string) (TokenClaimsBuilder, error) {
 			return nil, fmt.Errorf("auth: user field claims: empty claim name for user field %q", field)
 		}
 		if isReservedClaim(claim) {
-			return nil, fmt.Errorf("auth: user field claims: claim %q is a reserved session claim (%s) and would be discarded on every mint; choose another name",
+			return nil, fmt.Errorf("auth: user field claims: claim %q is a reserved claim, or a spelling a case-insensitive decoder reads as one (%s), and would be discarded on every mint; choose another name",
 				claim, strings.Join(reservedClaimNames, ", "))
 		}
 		read, ok := userClaimFields[field]

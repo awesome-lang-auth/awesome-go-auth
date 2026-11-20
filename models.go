@@ -218,6 +218,28 @@ type Session struct {
 	// session that never presented one: the mfa_at claim, absent when nil. The
 	// same persistence rule applies.
 	MFAAt *time.Time
+	// TOTPBinding names the one TOTP secret POST <prefix>/2fa/step-up accepts a
+	// code of on this session: a keyed fingerprint of the secret the user had
+	// enrolled when the session opened. It is empty when the user had no TOTP
+	// factor then, and for a session whose opener could not say how its user
+	// was proved (Service.IssueTokensForUser), and an empty one never steps
+	// up.
+	//
+	// It is what keeps a factor enrolled after the session opened — by
+	// whoever holds the session's access token, through the voluntary
+	// /2fa/setup and /2fa/verify-setup — from moving the session's mfa_at.
+	// Such a factor proves nothing the session did not already prove; its
+	// holder gets a session that can step up with it by signing in again.
+	//
+	// A SessionStore persists it with the rest of the row. One that does not
+	// fails closed: the step-up answers 403 REAUTHENTICATION_REQUIRED.
+	TOTPBinding string
+	// StepUpAttempts counts the codes POST <prefix>/2fa/step-up has checked,
+	// or is about to check, on this session since the last one it accepted:
+	// each attempt is counted before its code is. The wrong code that reaches
+	// StepUpFailureLimit revokes the session
+	// (SessionAuthenticationStore.RecordStepUpAttempt).
+	StepUpAttempts int
 }
 
 // AuthTokens are the issued access/refresh pair.
@@ -288,7 +310,10 @@ type SMSCodeVerifyInput struct {
 	// branch of POST <prefix>/sms/verify does. The session then records it
 	// (amr ["pwd","sms","mfa"] and an mfa_at); without it the code is a login
 	// of its own (amr ["sms"]). Set it only after verifying that token — it is
-	// what tells a resource server a second factor was presented.
+	// what tells a resource server a second factor was presented, and nothing
+	// checks it: the service cannot tell the two branches apart, so the value
+	// is the caller's assertion. A direct caller that is not completing a
+	// step-up token's challenge leaves it false.
 	SecondFactor bool
 }
 

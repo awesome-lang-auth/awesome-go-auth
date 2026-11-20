@@ -1320,7 +1320,11 @@ func openAPIPaths(prefix string) map[string]any {
 					"`" + AMROTP + "` and `" + AMRMFA + "` — and a fresh access token carrying the new claims is delivered alone: the access " +
 					"cookie in cookie mode, a top-level `accessToken` under `X-Auth-Strategy: bearer`. The refresh token is not rotated, " +
 					"and the next refresh carries the new `mfa_at` forward. The session is validated whatever the session-check mode, " +
-					"and a session store that cannot record the factor answers 501. The code field is named `totpCode`, as on /2fa/verify.",
+					"and a session store that cannot record the factor answers 501. The code field is named `totpCode`, as on /2fa/verify. " +
+					"Only the TOTP factor the user held when the session opened is accepted: a factor enrolled since — through this " +
+					"session's own access token or any other — is 403 `" + CodeReauthenticationRequired + "`, and the user signs in again. " +
+					"Every wrong code counts against the session, and the " + strconv.Itoa(StepUpFailureLimit) + "th in a row revokes it " +
+					"(401 `" + CodeSessionRevoked + "`).",
 				"operationId": "stepUpTwoFactor",
 				"tags":        []string{"TwoFactor"},
 				"security":    anyCredential,
@@ -1330,6 +1334,7 @@ func openAPIPaths(prefix string) map[string]any {
 				})),
 				"responses": respond(http.StatusOK, "Second factor recorded; a fresh access token", schema("AccessTokenResult"),
 					HTTPErrInvalidBody, HTTPErrTOTPNotSetUp, HTTPErrInvalidTOTPCode, HTTPErrSessionRevoked,
+					HTTPErrReauthenticationRequired,
 					HTTPErrUserNotFound, HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid, HTTPErrNotImplemented),
 			},
 		},

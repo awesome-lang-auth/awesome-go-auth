@@ -182,9 +182,17 @@ func TestUserFieldClaims_RejectsReservedClaimNames(t *testing.T) {
 			}
 		})
 	}
-	// Exact match only: a differently cased or padded name is a claim of the
-	// hook's own, which issueToken leaves alone.
-	for _, claim := range []string{"Exp", "SID", " typ"} {
+	// Every spelling encoding/json folds onto a reserved name is refused too:
+	// a struct decoder reads "MFA_AT" as mfa_at, and "ſid" (U+017F) as sid,
+	// so the mapping would be setting the reserved claim for every such reader.
+	for _, claim := range []string{"Exp", "SID", "MFA_AT", "Amr", "Auth_Time", "\u017fid"} {
+		if _, err := UserFieldClaims(map[string]string{claim: "id"}); err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Fatalf("UserFieldClaims(%q) = %v, want the spelling of a reserved name refused", claim, err)
+		}
+	}
+	// A name that only resembles one is a claim of the hook's own: padding is
+	// not folded by any decoder.
+	for _, claim := range []string{" typ", "typ ", "mfa-at", "mfaAt"} {
 		if _, err := UserFieldClaims(map[string]string{claim: "id"}); err != nil {
 			t.Fatalf("UserFieldClaims(%q) = %v, want the name accepted as a non-reserved claim", claim, err)
 		}

@@ -115,6 +115,8 @@ var wantClaims = map[string][]string{
 		"amr", "auth_time", "mfa_at", "RFC 8176", "POST <prefix>/2fa/step-up", "carries all three forward",
 		"SessionAuthenticationStore", "501", "reserved", "BuildTokenClaims", "ClaimsWebhook",
 		"UserFieldClaims", "admin", "buildPayload", "VerifyAccess",
+		"Session.TOTPBinding", "REAUTHENTICATION_REQUIRED", "StepUpFailureLimit", "RecordStepUpAttempt",
+		"every spelling",
 	},
 	"idp-mode-adds-an-oauth-authorization-server": {
 		"S256", "plain", "client_secret_basic", "client_secret_post", "refresh_token", "offline_access",

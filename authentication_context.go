@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -73,6 +74,18 @@ const (
 	ClaimAuthTime = "auth_time"
 	ClaimMFAAt    = "mfa_at"
 )
+
+// deleteAuthContextClaims removes from claims the three claim names above in
+// every spelling encoding/json folds onto them (isReservedClaim says why): the
+// IdP pair, which carries no authentication context, strips them from the
+// hook's result this way.
+func deleteAuthContextClaims(claims map[string]any) {
+	for name := range claims {
+		if strings.EqualFold(name, ClaimAMR) || strings.EqualFold(name, ClaimAuthTime) || strings.EqualFold(name, ClaimMFAAt) {
+			delete(claims, name)
+		}
+	}
+}
 
 // sessionAuth is how a session about to be opened was authenticated. Every
 // caller of issueSession states one, so a new way of opening a session cannot
@@ -153,20 +166,60 @@ func sessionAuthClaims(session Session) map[string]any {
 // refresh token — or clear the RevokedAt a concurrent logout had just set,
 // resurrecting the session. Writing only the two fields closes both.
 //
-// What an implementor owes, as one atomic operation:
+// What an implementor owes, each method as one atomic operation:
 //
-//   - The session with sessionID that is not revoked has its AuthMethods
-//     replaced by methods and its MFAAt set to at; nothing else changes. The
-//     updated session is returned.
-//   - A session that is not there is ErrSessionNotFound, and a revoked one is
-//     ErrSessionRevoked — both decided in the same atomic step as the write, so
-//     that a revocation that wins the race is never undone. On DynamoDB that is
-//     one UpdateItem with a condition on the item existing and carrying no
-//     revocation, and ReturnValues ALL_NEW.
+//   - RecordSecondFactor: the session with sessionID that is not revoked has
+//     its AuthMethods replaced by methods, its MFAAt set to at and its
+//     StepUpAttempts reset to zero; nothing else changes. The updated session
+//     is returned.
+//   - RecordStepUpAttempt: the session with sessionID that is not revoked has
+//     its StepUpAttempts incremented and, when the new count exceeds limit,
+//     its RevokedAt set to at, in the same step; nothing else changes. The
+//     updated session is returned, so the caller reads the count and the
+//     revocation off it. The step-up counts an attempt before it checks the
+//     code, and counting and revoking in one step is what makes the budget
+//     hold against concurrent guesses: each one gets a count of its own, and
+//     none past the limit is checked at all.
+//   - For both, a session that is not there is ErrSessionNotFound, and a
+//     revoked one is ErrSessionRevoked — decided in the same atomic step as the
+//     write, so that a revocation that wins the race is never undone. On
+//     DynamoDB each is one UpdateItem with a condition on the item existing
+//     and carrying no revocation, and ReturnValues ALL_NEW: the attempt an
+//     ADD, and the revocation a second conditional UpdateItem the method
+//     issues when the count came back over the limit.
+//
+// A store that implements it also persists Session.TOTPBinding and
+// Session.StepUpAttempts with the rest of the row, as it does AuthMethods and
+// MFAAt: the step-up reads all four.
 //
 // MemorySessionStore implements it.
 type SessionAuthenticationStore interface {
 	RecordSecondFactor(ctx context.Context, sessionID string, methods []string, at time.Time) (Session, error)
+	RecordStepUpAttempt(ctx context.Context, sessionID string, limit int, at time.Time) (Session, error)
+}
+
+// StepUpFailureLimit is how many codes POST <prefix>/2fa/step-up checks on one
+// session without accepting one: the wrong code that reaches it revokes the
+// session, and no attempt past it is checked. A step-up presents a TOTP code
+// on the strength of an access token alone, so without a budget the route
+// would be an oracle that whoever holds a stolen token could query for as long
+// as the token lives — with three codes valid at any time out of a million,
+// enough guesses find one. Five in a row is more than a person mistyping
+// makes, and gives a guesser odds of about one in 67,000 before the session,
+// and the stolen token's refresh, are gone. An accepted code resets the count.
+const StepUpFailureLimit = 5
+
+// totpBinding is the Session.TOTPBinding of a session user opens now: a keyed
+// fingerprint of the TOTP secret the user has enrolled, or empty when there is
+// none. Keyed with Config.Secret, so the session store holds nothing an
+// offline guess at a weak secret could be checked against; a rotation of
+// Config.Secret therefore ends every session's ability to step up, which then
+// takes a fresh sign-in.
+func (s *Service) totpBinding(user User) string {
+	if !user.IsTOTPEnabled || strings.TrimSpace(user.TOTPSecret) == "" {
+		return ""
+	}
+	return sign("awesome-go-auth/session-totp-binding/v1\x00"+user.TOTPSecret, s.cfg.Secret)
 }
 
 // StepUpTOTP re-verifies the TOTP factor of the session an access token
@@ -182,11 +235,27 @@ type SessionAuthenticationStore interface {
 // The session is validated whatever Config.SessionCheckOn says — it is about to
 // be written to — so a revoked one is ErrSessionRevoked, and a missing,
 // expired or mismatched one ErrInvalidToken. The user is re-read: no TOTP
-// enrolled is ErrInvalidCredentials, a wrong code ErrInvalidCode, a user the
-// store no longer has ErrUserNotFound. A session store without
-// SessionAuthenticationStore, or with no way to look a session up by id, is
-// ErrFeatureNotSupported. The code is checked as /2fa/verify checks it, with
-// the same tolerance and, as there, no replay cache.
+// enrolled is ErrInvalidCredentials, a user the store no longer has
+// ErrUserNotFound. A session store without SessionAuthenticationStore, or with
+// no way to look a session up by id, is ErrFeatureNotSupported.
+//
+// The factor must be the one the session is bound to (Session.TOTPBinding):
+// the secret the user had enrolled when the session opened. A factor enrolled
+// since — a first one, or one that replaced it — is ErrReauthenticationRequired
+// whatever code comes with it, because whoever holds the session's access
+// token can enrol one, and a code of it proves nothing the token did not. The
+// same answer is given to a session that recorded no binding at all: one whose
+// user had no factor when it opened, one Service.IssueTokensForUser opened,
+// and one a store did not persist the binding for. Its user signs in again.
+//
+// Every attempt that gets that far counts against the session's budget before
+// its code is checked (SessionAuthenticationStore.RecordStepUpAttempt), and an
+// accepted code resets the count. A wrong code is ErrInvalidCode; the wrong
+// code that reaches StepUpFailureLimit revokes the session and is
+// ErrSessionRevoked, as is every step-up after it, and an attempt the budget
+// no longer covers is refused unchecked. The code is checked as /2fa/verify
+// checks it, with the same tolerance and, as there, no replay cache: a code
+// accepted once is accepted again within its window.
 //
 // It raises no event. A step-up is not a login, and neither tree has a
 // publication point for it.
@@ -221,9 +290,41 @@ func (s *Service) StepUpTOTP(ctx context.Context, accessToken, code string) (Aut
 	if !user.IsTOTPEnabled || user.TOTPSecret == "" {
 		return AuthTokens{}, ErrInvalidCredentials
 	}
+	// Before the code is looked at, so that a factor the session is not bound
+	// to is never worth a guess, and never costs the session its budget either.
+	if session.TOTPBinding == "" || !secureEqual(session.TOTPBinding, s.totpBinding(user)) {
+		return AuthTokens{}, ErrReauthenticationRequired
+	}
+	// The attempt is counted before the code is checked, so that concurrent
+	// guesses cannot all be checked against the one try the budget has left:
+	// each gets a count of its own, and one past the limit revokes the session
+	// instead of being checked.
 	now := s.now()
+	attempt, err := recorder.RecordStepUpAttempt(ctx, session.ID, StepUpFailureLimit, now)
+	switch {
+	case errors.Is(err, ErrSessionRevoked):
+		return AuthTokens{}, ErrSessionRevoked
+	case errors.Is(err, ErrSessionNotFound):
+		return AuthTokens{}, ErrInvalidToken
+	case err != nil:
+		return AuthTokens{}, fmt.Errorf("auth: step-up: count attempt: %w", err)
+	case attempt.RevokedAt != nil:
+		s.logf("auth: step-up: session %q of user %q revoked: attempt %d is past the budget of %d", session.ID, user.ID, attempt.StepUpAttempts, StepUpFailureLimit)
+		return AuthTokens{}, ErrSessionRevoked
+	}
 	if !validateTOTPCode(user.TOTPSecret, code, now) {
-		return AuthTokens{}, ErrInvalidCode
+		if attempt.StepUpAttempts < StepUpFailureLimit {
+			return AuthTokens{}, ErrInvalidCode
+		}
+		// That was the last try the budget held: end the session now rather
+		// than at its next attempt. The count goes past the limit, which is
+		// what revokes; a session revoked meanwhile is just as ended.
+		if _, err := recorder.RecordStepUpAttempt(ctx, session.ID, StepUpFailureLimit, now); err != nil &&
+			!errors.Is(err, ErrSessionRevoked) && !errors.Is(err, ErrSessionNotFound) {
+			return AuthTokens{}, fmt.Errorf("auth: step-up: revoke after the last attempt: %w", err)
+		}
+		s.logf("auth: step-up: session %q of user %q revoked after %d wrong codes", session.ID, user.ID, StepUpFailureLimit)
+		return AuthTokens{}, ErrSessionRevoked
 	}
 	methods := appendMethod(appendMethod(slices.Clone(session.AuthMethods), AMROTP), AMRMFA)
 	updated, err := recorder.RecordSecondFactor(ctx, session.ID, methods, now)
@@ -253,12 +354,30 @@ func (a *Auth) StepUpTOTP(ctx context.Context, accessToken, code string) (AuthTo
 // replays it.
 const StepUpRoute = "/2fa/step-up"
 
+// CodeReauthenticationRequired is the code of HTTPErrReauthenticationRequired.
+const CodeReauthenticationRequired = "REAUTHENTICATION_REQUIRED"
+
+// HTTPErrReauthenticationRequired is POST <prefix>/2fa/step-up's answer for a
+// session that may not step up with the account's current factor
+// (ErrReauthenticationRequired). It is a 403 rather than a 401: the session is
+// still good for everything it was good for, and only a fresh sign-in — the
+// password and then this factor — yields one that can step up.
+var HTTPErrReauthenticationRequired = HTTPError{
+	Status:  http.StatusForbidden,
+	Message: "Sign in again to use this second factor",
+	Code:    CodeReauthenticationRequired,
+}
+
 // StepUpHTTPError maps a Service.StepUpTOTP failure. The credential failures
 // are the access gate's own answers — the route authenticates itself, as GET
 // /me does — and the factor failures are /2fa/verify's: no TOTP enrolled is
 // 400 "User not found or 2FA not set up", a wrong code 401 "Invalid TOTP code".
+// A factor the session is not bound to is 403 REAUTHENTICATION_REQUIRED, and
+// the wrong code that exhausts the session's budget is 401 SESSION_REVOKED.
 func StepUpHTTPError(err error) HTTPError {
 	switch {
+	case errors.Is(err, ErrReauthenticationRequired):
+		return HTTPErrReauthenticationRequired
 	case errors.Is(err, ErrSessionRevoked):
 		return HTTPErrSessionRevoked
 	case errors.Is(err, ErrInvalidToken):

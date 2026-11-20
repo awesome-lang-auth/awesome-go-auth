@@ -423,7 +423,13 @@ func TestIDPTokensCarryTheContext(t *testing.T) {
 	}
 
 	f.idp.authSvc.cfg.BuildTokenClaims = func(context.Context, User) (map[string]any, error) {
-		return map[string]any{ClaimMFAAt: float64(4102444800), ClaimAMR: []any{"mfa"}, ClaimAuthTime: float64(1)}, nil
+		return map[string]any{
+			ClaimMFAAt: float64(4102444800), ClaimAMR: []any{"mfa"}, ClaimAuthTime: float64(1),
+			// The spellings a case-insensitive decoder folds onto the three.
+			"MFA_AT": float64(4102444800), "Amr": []any{"mfa"}, "AUTH_TIME": float64(1),
+			// Not the authentication context: kept, as the reference keeps it.
+			"plan": "pro",
+		}, nil
 	}
 	pair, err := f.idp.IssueIdPTokenPair(context.Background(), f.user)
 	if err != nil {
@@ -431,10 +437,13 @@ func TestIDPTokensCarryTheContext(t *testing.T) {
 	}
 	for _, token := range []string{pair.AccessToken, pair.RefreshToken} {
 		claims := payloadOf(t, token)
-		for _, name := range []string{ClaimAMR, ClaimAuthTime, ClaimMFAAt} {
+		for _, name := range []string{ClaimAMR, ClaimAuthTime, ClaimMFAAt, "MFA_AT", "Amr", "AUTH_TIME"} {
 			if _, ok := claims[name]; ok {
 				t.Errorf("the IdP pair carries the hook's %s", name)
 			}
+		}
+		if claims["plan"] != "pro" {
+			t.Error("the IdP pair lost a hook claim outside the authentication context")
 		}
 	}
 }
@@ -490,19 +499,30 @@ func TestStepUpTOTP(t *testing.T) {
 	})
 
 	t.Run("adds the factor to a session that had none", func(t *testing.T) {
+		// A magic-link login opens a one-factor session for an account that
+		// already holds TOTP: the factor predates the session, so a code of it
+		// is a second factor the session had not presented.
 		c := newClockedService(t)
-		user := c.register(t, "pwdonly@example.com")
-		_, tokens, err := c.svc.Login(ctx, LoginInput{Email: user.Email, Password: "password1", TenantID: "t1"})
+		registered := c.register(t, "onefactor@example.com")
+		secret := c.enrol(t, registered)
+		// The stored row, as ConsumeMagicLink hands it over.
+		user, err := c.users.GetUserByID(ctx, registered.ID, registered.TenantID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		secret := c.enrol(t, user)
+		tokens, err := c.svc.CompleteMagicLinkLogin(ctx, user)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opened := c.now
+		assertContext(t, tokens.AccessToken, []string{AMREmail}, opened, nil)
+		c.advance(time.Minute)
 		stepped, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, c.code(t, secret))
 		if err != nil {
 			t.Fatal(err)
 		}
 		now := c.now
-		assertContext(t, stepped.AccessToken, []string{AMRPassword, AMROTP, AMRMFA}, now, &now)
+		assertContext(t, stepped.AccessToken, []string{AMREmail, AMROTP, AMRMFA}, opened, &now)
 	})
 
 	t.Run("refusals", func(t *testing.T) {
@@ -738,5 +758,389 @@ func TestAdminLoginNeverCarriesASecondFactor(t *testing.T) {
 		if _, ok := claims[name]; ok {
 			t.Errorf("the admin token carries %s: %v", name, claims)
 		}
+	}
+}
+
+// TestStepUpRefusesAFactorNewerThanTheSession pins the fix for the step-up
+// bypass: whoever holds a session's access token can enrol a TOTP factor
+// through the voluntary routes, so a code of a factor enrolled after the
+// session opened proves nothing the token did not, and must not move mfa_at.
+// Each case is a session's token in the wrong hands — the factor enrolled
+// through it is the holder's own.
+func TestStepUpRefusesAFactorNewerThanTheSession(t *testing.T) {
+	ctx := context.Background()
+	refused := func(t *testing.T, c *clockedService, token, code string) {
+		t.Helper()
+		sid := payloadOf(t, token)["sid"].(string)
+		before, err := c.sessions.GetSessionByID(ctx, sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.advance(time.Second) // so that a write of mfa_at would show
+		_, err = c.svc.StepUpTOTP(ctx, token, code)
+		if !errors.Is(err, ErrReauthenticationRequired) {
+			t.Fatalf("StepUpTOTP = %v, want ErrReauthenticationRequired", err)
+		}
+		if got := StepUpHTTPError(err); got != HTTPErrReauthenticationRequired || got.Status != http.StatusForbidden {
+			t.Fatalf("StepUpHTTPError = %+v, want 403 %s", got, CodeReauthenticationRequired)
+		}
+		// Nothing was recorded on the session, and no budget was spent: the
+		// code was never worth a guess.
+		after, err := c.sessions.GetSessionByID(ctx, sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (before.MFAAt == nil) != (after.MFAAt == nil) || (after.MFAAt != nil && !after.MFAAt.Equal(*before.MFAAt)) ||
+			!slices.Equal(before.AuthMethods, after.AuthMethods) {
+			t.Fatalf("the refused step-up wrote the session: %v/%v -> %v/%v", before.AuthMethods, before.MFAAt, after.AuthMethods, after.MFAAt)
+		}
+		if after.StepUpAttempts != before.StepUpAttempts || after.RevokedAt != nil {
+			t.Fatalf("StepUpAttempts = %d (was %d), revoked %v: a refusal before the code costs nothing",
+				after.StepUpAttempts, before.StepUpAttempts, after.RevokedAt)
+		}
+	}
+	mfaLogin := func(t *testing.T, c *clockedService, email string) (User, string, AuthTokens) {
+		t.Helper()
+		user := c.register(t, email)
+		secret := c.enrol(t, user)
+		_, tokens, err := c.svc.VerifyTOTP(ctx, user.ID, user.TenantID, c.code(t, secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return user, secret, tokens
+	}
+
+	t.Run("a factor swapped in after an MFA login", func(t *testing.T) {
+		c := newClockedService(t)
+		user, original, tokens := mfaLogin(t, c, "swap@example.com")
+		c.advance(10 * time.Minute)
+		swapped := c.enrol(t, user) // the voluntary verify-setup, on the token alone
+		refused(t, c, tokens.AccessToken, c.code(t, swapped))
+		// The owner's own factor is gone from the account, so its code is no
+		// better; the session is not bound to the new one either way.
+		refused(t, c, tokens.AccessToken, c.code(t, original))
+	})
+
+	t.Run("a first factor enrolled on a password session", func(t *testing.T) {
+		c := newClockedService(t)
+		user := c.register(t, "first@example.com")
+		_, tokens, err := c.svc.Login(ctx, LoginInput{Email: user.Email, Password: "password1", TenantID: "t1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		secret := c.enrol(t, user)
+		refused(t, c, tokens.AccessToken, c.code(t, secret))
+
+		// The remedy: a fresh sign-in with the password and the new code opens
+		// a session bound to the factor, which then steps up.
+		_, fresh, err := c.svc.VerifyTOTP(ctx, user.ID, user.TenantID, c.code(t, secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.advance(time.Minute)
+		if _, err := c.svc.StepUpTOTP(ctx, fresh.AccessToken, c.code(t, secret)); err != nil {
+			t.Fatalf("a session opened after the enrolment = %v, want it to step up", err)
+		}
+	})
+
+	t.Run("a factor disabled and enrolled again", func(t *testing.T) {
+		c := newClockedService(t)
+		user, _, tokens := mfaLogin(t, c, "reenrol@example.com")
+		if err := c.svc.DisableTOTP(ctx, user.ID, user.TenantID); err != nil {
+			t.Fatal(err)
+		}
+		again := c.enrol(t, user)
+		refused(t, c, tokens.AccessToken, c.code(t, again))
+	})
+
+	t.Run("a session whose opener could not say how its user was proved", func(t *testing.T) {
+		c := newClockedService(t)
+		user := c.register(t, "trusted@example.com")
+		secret := c.enrol(t, user)
+		_, tokens, err := c.svc.IssueTokensForUser(ctx, user.ID, user.TenantID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Otherwise its step-up would claim mfa with no known first factor.
+		refused(t, c, tokens.AccessToken, c.code(t, secret))
+	})
+
+	t.Run("a store that did not keep the binding", func(t *testing.T) {
+		c := newClockedService(t)
+		_, secret, tokens := mfaLogin(t, c, "lost@example.com")
+		sid := payloadOf(t, tokens.AccessToken)["sid"].(string)
+		session, err := c.sessions.GetSessionByID(ctx, sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session.TOTPBinding = ""
+		if err := c.sessions.UpdateSession(ctx, session); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, c, tokens.AccessToken, c.code(t, secret))
+	})
+
+	t.Run("a rotation of Config.Secret ends the binding", func(t *testing.T) {
+		c := newClockedService(t)
+		_, secret, tokens := mfaLogin(t, c, "rotate@example.com")
+		if got := c.svc.totpBinding(User{IsTOTPEnabled: true, TOTPSecret: secret}); got == "" || strings.Contains(got, secret) {
+			t.Fatalf("binding %q is empty or carries the secret", got)
+		}
+		sid := payloadOf(t, tokens.AccessToken)["sid"].(string)
+		session, _ := c.sessions.GetSessionByID(ctx, sid)
+		c.svc.cfg.Secret = strings.Repeat("r", 40)
+		if secureEqual(session.TOTPBinding, c.svc.totpBinding(User{IsTOTPEnabled: true, TOTPSecret: secret})) {
+			t.Fatal("the binding does not depend on Config.Secret")
+		}
+	})
+}
+
+// TestStepUpFailureBudget: wrong codes are counted on the session, an accepted
+// code resets the count, and the wrong code that reaches StepUpFailureLimit
+// revokes the session — after which neither the step-up nor the refresh token
+// works, whatever is presented.
+func TestStepUpFailureBudget(t *testing.T) {
+	ctx := context.Background()
+	login := func(t *testing.T, c *clockedService, email string) (string, AuthTokens) {
+		t.Helper()
+		user := c.register(t, email)
+		secret := c.enrol(t, user)
+		_, tokens, err := c.svc.VerifyTOTP(ctx, user.ID, user.TenantID, c.code(t, secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return secret, tokens
+	}
+	sessionOf := func(t *testing.T, c *clockedService, tokens AuthTokens) Session {
+		t.Helper()
+		session, err := c.sessions.GetSessionByID(ctx, payloadOf(t, tokens.AccessToken)["sid"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return session
+	}
+
+	t.Run("an accepted code resets the count", func(t *testing.T) {
+		c := newClockedService(t)
+		secret, tokens := login(t, c, "budget-reset@example.com")
+		for i := 1; i < StepUpFailureLimit; i++ {
+			if _, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, wrongCode(t, c, secret)); !errors.Is(err, ErrInvalidCode) {
+				t.Fatalf("wrong code %d = %v, want ErrInvalidCode", i, err)
+			}
+		}
+		if got := sessionOf(t, c, tokens).StepUpAttempts; got != StepUpFailureLimit-1 {
+			t.Fatalf("StepUpAttempts = %d, want %d", got, StepUpFailureLimit-1)
+		}
+		if _, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, c.code(t, secret)); err != nil {
+			t.Fatalf("the right code after %d wrong ones = %v", StepUpFailureLimit-1, err)
+		}
+		if got := sessionOf(t, c, tokens).StepUpAttempts; got != 0 {
+			t.Fatalf("StepUpAttempts after an accepted code = %d, want 0", got)
+		}
+		// A fresh budget: StepUpFailureLimit-1 more wrong codes do not end it.
+		for i := 1; i < StepUpFailureLimit; i++ {
+			if _, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, wrongCode(t, c, secret)); !errors.Is(err, ErrInvalidCode) {
+				t.Fatalf("wrong code %d after the reset = %v, want ErrInvalidCode", i, err)
+			}
+		}
+	})
+
+	t.Run("the last wrong code revokes the session", func(t *testing.T) {
+		c := newClockedService(t)
+		secret, tokens := login(t, c, "budget-revoke@example.com")
+		for i := 1; i < StepUpFailureLimit; i++ {
+			if _, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, wrongCode(t, c, secret)); !errors.Is(err, ErrInvalidCode) {
+				t.Fatalf("wrong code %d = %v, want ErrInvalidCode", i, err)
+			}
+		}
+		_, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, wrongCode(t, c, secret))
+		if !errors.Is(err, ErrSessionRevoked) {
+			t.Fatalf("wrong code %d = %v, want ErrSessionRevoked", StepUpFailureLimit, err)
+		}
+		if got := StepUpHTTPError(err); got != HTTPErrSessionRevoked {
+			t.Fatalf("StepUpHTTPError = %+v, want 401 SESSION_REVOKED", got)
+		}
+		if session := sessionOf(t, c, tokens); session.RevokedAt == nil {
+			t.Fatal("the session is not revoked")
+		}
+		if _, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, c.code(t, secret)); !errors.Is(err, ErrSessionRevoked) {
+			t.Fatalf("the right code after the budget = %v, want ErrSessionRevoked", err)
+		}
+		if _, err := c.svc.Refresh(ctx, tokens.RefreshToken); err == nil {
+			t.Fatal("the refresh token outlived the revocation")
+		}
+	})
+
+	t.Run("a store without the seam is still refused before any code", func(t *testing.T) {
+		c := newClockedService(t)
+		secret, tokens := login(t, c, "budget-nostore@example.com")
+		c.svc.sessions = hiddenAuthStore{SessionStore: c.sessions, SessionLookupStore: c.sessions}
+		if _, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, wrongCode(t, c, secret)); !errors.Is(err, ErrFeatureNotSupported) {
+			t.Fatalf("no SessionAuthenticationStore = %v, want ErrFeatureNotSupported", err)
+		}
+	})
+}
+
+// TestRecordStepUpAttempt pins MemorySessionStore's half of the budget: the
+// count goes up one per call, and the call that takes it past the limit
+// revokes the session in the same step.
+func TestRecordStepUpAttempt(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemorySessionStore()
+	created := time.Now().Truncate(time.Second)
+	if _, err := store.CreateSession(ctx, Session{ID: "ses_1", UserID: "usr_1", RefreshTokenHash: "h1", CreatedAt: created}); err != nil {
+		t.Fatal(err)
+	}
+	at := created.Add(time.Minute)
+	for want := 1; want <= 3; want++ {
+		updated, err := store.RecordStepUpAttempt(ctx, "ses_1", 3, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.StepUpAttempts != want || updated.RevokedAt != nil || updated.RefreshTokenHash != "h1" {
+			t.Fatalf("attempt %d: %+v", want, updated)
+		}
+	}
+	revoked, err := store.RecordStepUpAttempt(ctx, "ses_1", 3, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked.StepUpAttempts != 4 || revoked.RevokedAt == nil || !revoked.RevokedAt.Equal(at) {
+		t.Fatalf("the attempt past the limit = %+v, want the session revoked at %v", revoked, at)
+	}
+	if _, err := store.RecordStepUpAttempt(ctx, "ses_1", 3, at); !errors.Is(err, ErrSessionRevoked) {
+		t.Errorf("a revoked session = %v, want ErrSessionRevoked", err)
+	}
+	if _, err := store.RecordStepUpAttempt(ctx, "ses_missing", 3, at); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("a missing session = %v, want ErrSessionNotFound", err)
+	}
+
+	// RecordSecondFactor resets the count.
+	if _, err := store.CreateSession(ctx, Session{ID: "ses_2", UserID: "usr_1", RefreshTokenHash: "h2", CreatedAt: created}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordStepUpAttempt(ctx, "ses_2", 3, at); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := store.RecordSecondFactor(ctx, "ses_2", []string{AMRPassword, AMROTP, AMRMFA}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.StepUpAttempts != 0 {
+		t.Fatalf("StepUpAttempts after RecordSecondFactor = %d, want 0", reset.StepUpAttempts)
+	}
+}
+
+// concurrentAttemptsStore runs before once at the start of the next
+// RecordStepUpAttempt: the attempts of concurrent requests that got their
+// counts first.
+type concurrentAttemptsStore struct {
+	*MemorySessionStore
+	before func()
+}
+
+func (s *concurrentAttemptsStore) RecordStepUpAttempt(ctx context.Context, sessionID string, limit int, at time.Time) (Session, error) {
+	if s.before != nil {
+		before := s.before
+		s.before = nil
+		before()
+	}
+	return s.MemorySessionStore.RecordStepUpAttempt(ctx, sessionID, limit, at)
+}
+
+// TestStepUpCountsTheAttemptBeforeTheCode: when concurrent requests have
+// already taken every try the budget holds, the next one is refused without
+// its code being checked — even the right code — so a burst of parallel
+// guesses gets StepUpFailureLimit checks and no more.
+func TestStepUpCountsTheAttemptBeforeTheCode(t *testing.T) {
+	ctx := context.Background()
+	c := newClockedService(t)
+	store := &concurrentAttemptsStore{MemorySessionStore: c.sessions}
+	c.svc.sessions = store
+	user := c.register(t, "burst@example.com")
+	secret := c.enrol(t, user)
+	_, tokens, err := c.svc.VerifyTOTP(ctx, user.ID, user.TenantID, c.code(t, secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := payloadOf(t, tokens.AccessToken)["sid"].(string)
+	store.before = func() {
+		for i := 0; i < StepUpFailureLimit; i++ {
+			if _, err := c.sessions.RecordStepUpAttempt(ctx, sid, StepUpFailureLimit, c.now); err != nil {
+				t.Fatalf("concurrent attempt %d: %v", i+1, err)
+			}
+		}
+	}
+	if _, err := c.svc.StepUpTOTP(ctx, tokens.AccessToken, c.code(t, secret)); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("the right code past the budget = %v, want ErrSessionRevoked without a check", err)
+	}
+	if session, _ := c.sessions.GetSessionByID(ctx, sid); session.RevokedAt == nil {
+		t.Fatal("the attempt past the budget did not revoke the session")
+	}
+}
+
+// TestReservedClaimSpellingsAreDeleted: a hook cannot get a reserved claim
+// past a case-insensitive decoder by spelling it differently. encoding/json
+// fills a field tagged "mfa_at" from "MFA_AT" when no exact member is present,
+// and a field tagged "sid" from a later "ſid" even when one is; mintToken
+// therefore deletes every spelling strings.EqualFold matches before it writes
+// the reserved claims, and the IdP pair strips the authentication context the
+// same way.
+func TestReservedClaimSpellingsAreDeleted(t *testing.T) {
+	ctx := context.Background()
+	spellings := map[string]any{
+		"MFA_AT":    float64(4102444800),
+		"Amr":       []any{"pwd", "otp", "mfa"},
+		"Auth_Time": float64(1),
+		"\u017fid":  "ses_forged", // ſid: folds to sid, and sorts after it
+		"TYP":       "refresh",
+		"Exp":       float64(4102444800),
+		"plan":      "pro",
+	}
+	c := newClockedService(t, func(cfg *Config) {
+		cfg.BuildTokenClaims = func(context.Context, User) (map[string]any, error) { return spellings, nil }
+	})
+	c.register(t, "spelling@example.com")
+	_, tokens, err := c.svc.Login(ctx, LoginInput{Email: "spelling@example.com", Password: "password1", TenantID: "t1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, token := range map[string]string{"access": tokens.AccessToken, "refresh": tokens.RefreshToken} {
+		claims := payloadOf(t, token)
+		for spelling := range spellings {
+			if _, ok := claims[spelling]; ok && spelling != "plan" {
+				t.Errorf("the %s token carries the hook's %q", name, spelling)
+			}
+		}
+		if claims["plan"] != "pro" {
+			t.Errorf("the %s token lost a non-reserved hook claim", name)
+		}
+	}
+
+	// What a struct decoder — the shape of golang-jwt's custom claims — reads
+	// off the access token: the session's own sid and no second factor.
+	var decoded struct {
+		Sid   string `json:"sid"`
+		Typ   string `json:"typ"`
+		MFAAt *int64 `json:"mfa_at"`
+	}
+	raw, err := json.Marshal(payloadOf(t, tokens.AccessToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.MFAAt != nil {
+		t.Errorf("a struct decoder reads mfa_at = %d off a password-only session", *decoded.MFAAt)
+	}
+	if decoded.Sid == "ses_forged" || decoded.Typ != "access" {
+		t.Errorf("a struct decoder reads sid %q, typ %q", decoded.Sid, decoded.Typ)
+	}
+	if _, err := c.svc.VerifyAccess(ctx, tokens.AccessToken); err != nil {
+		t.Fatalf("VerifyAccess: %v", err)
+	}
+	if _, err := c.svc.Refresh(ctx, tokens.RefreshToken); err != nil {
+		t.Fatalf("Refresh: %v", err)
 	}
 }

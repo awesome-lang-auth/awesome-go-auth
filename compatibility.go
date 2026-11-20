@@ -195,8 +195,14 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"for the current session, moves `mfa_at` to now, adds `otp` and `mfa` to `amr` and answers " +
 					"a fresh access token alone: the access cookie, or `accessToken` under " +
 					"`X-Auth-Strategy: bearer`; a session store without `SessionAuthenticationStore` answers " +
-					"`501`. The three names are reserved: `BuildTokenClaims`, and so a `ClaimsWebhook`, cannot " +
-					"set them on any token, and `UserFieldClaims` refuses to map onto them. The admin " +
+					"`501`. The step-up accepts only the factor the session is bound to — the TOTP secret its " +
+					"user held when it opened (`Session.TOTPBinding`) — and answers any other " +
+					"`403 REAUTHENTICATION_REQUIRED` before looking at the code, so a factor enrolled through " +
+					"the session's own access token never moves its `mfa_at`; and the wrong code that reaches " +
+					"`StepUpFailureLimit` revokes the session. The three names are reserved, like the session " +
+					"claims, in every spelling `encoding/json` folds onto them: `BuildTokenClaims`, and so a " +
+					"`ClaimsWebhook`, cannot set them on any token, and `UserFieldClaims` refuses to map onto " +
+					"them. The admin " +
 					"console's own login mints a token of another type that carries none of them. " +
 					"`VerifyAccess`, and so the adapters' middleware, exposes them as `User.AuthMethods`, " +
 					"`User.AuthTime` and `User.MFAAt`.",
@@ -225,12 +231,16 @@ func CompatibilityNotes() APICompatibilityNotes {
 					},
 					{
 						Label: "What a session store owes",
-						Text: "Persist `Session.AuthMethods` and `Session.MFAAt` with the rest of the row; a " +
-							"store that does not loses them on the first refresh, and the tokens then claim " +
-							"no method — which fails closed. Implement `SessionAuthenticationStore` for the " +
-							"step-up route: a write of those two fields alone that refuses a revoked session " +
-							"atomically, so a step-up can never revive a refresh token a rotation spent or a " +
-							"session a logout revoked. `MemorySessionStore` does both.",
+						Text: "Persist `Session.AuthMethods`, `Session.MFAAt`, `Session.TOTPBinding` and " +
+							"`Session.StepUpAttempts` with the rest of the row; a store that does not loses them " +
+							"on the first refresh, and the tokens then claim no method and the step-up answers " +
+							"`403` — which fails closed. Implement `SessionAuthenticationStore` for the step-up " +
+							"route: `RecordSecondFactor`, a write of those fields alone that refuses a revoked " +
+							"session atomically, so a step-up can never revive a refresh token a rotation spent " +
+							"or a session a logout revoked; and `RecordStepUpAttempt`, which counts an attempt " +
+							"before its code is checked and revokes the session past the limit in the same atomic " +
+							"step. " +
+							"`MemorySessionStore` does all of it.",
 					},
 				},
 			},

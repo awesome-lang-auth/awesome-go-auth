@@ -39,10 +39,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers `501`. `MemorySessionStore` implements it. The route is a credential
   route, so `HTTPConfig.ResourceServer` unmounts it with the others
   (`ResourceServerGatedRoutes` now lists twenty).
+- **A step-up accepts only the factor its session is bound to.** Every
+  session records `Session.TOTPBinding`, a fingerprint (keyed with
+  `Config.Secret`) of the TOTP secret its user had enrolled when it opened, and
+  `POST <prefix>/2fa/step-up` refuses any other factor with
+  `403 {"code":"REAUTHENTICATION_REQUIRED"}` (`ErrReauthenticationRequired`,
+  `HTTPErrReauthenticationRequired`, `CodeReauthenticationRequired`) before it
+  looks at the code. The voluntary `/2fa/setup` and `/2fa/verify-setup` need
+  only an access token, so without the binding whoever held a stolen access
+  token could enrol a factor of their own — a first one on a password session,
+  or one replacing the owner's — and step up with it to a fresh `mfa_at`. A
+  factor enrolled after a session opened now takes a fresh sign-in, whose
+  session is bound to it. A session `Service.IssueTokensForUser` opened records
+  no binding and never steps up, so no step-up claims `mfa` over an unknown
+  first factor.
+- **A failure budget on the step-up.** Each attempt counts against the
+  session (`Session.StepUpAttempts`) before its code is checked, an accepted
+  code resets the count, and the wrong code that reaches `StepUpFailureLimit`
+  (5) revokes the session: that request and every later one answer
+  `401 SESSION_REVOKED`, and the session's refresh token stops working.
+  Counting first means a burst of concurrent guesses gets five checks and no
+  more. Without the budget the route would be a TOTP oracle open to an access
+  token alone. The count and the revocation are one atomic store operation,
+  the new `SessionAuthenticationStore.RecordStepUpAttempt`;
+  `RecordSecondFactor` resets the count. `MemorySessionStore` implements both.
 - `SMSCodeVerifyInput.SecondFactor`: set by the adapters on the step-up branch
   of `/sms/verify`, it records the code as the second factor of a password
-  login rather than a login of its own.
+  login rather than a login of its own. It is the caller's assertion, made
+  after the caller verified the step-up token that named the user.
 - Registered as the deviation `access-tokens-carry-the-authentication-context`.
+
+### Security
+- The step-up binding closes the bypass in which a stolen access token alone
+  could raise a session's `mfa_at`. It does not stop that token from replacing
+  or removing the account's TOTP factor through the voluntary `/2fa/setup`,
+  `/2fa/verify-setup` and `/2fa/disable`, which need only an access token, as
+  in the reference: a deployment that also offers a one-factor login an
+  attacker may control (a magic link, an SMS code, an OAuth account) can see a
+  factor replaced through a stolen token become the one a later session of
+  that login steps up with. Requiring a recent second factor for those three
+  routes is a separate, breaking change and is not made here.
+- A code `/2fa/step-up` accepted is accepted again within its window, as on
+  `/2fa/verify`: there is no replay cache. The failure budget bounds guessing,
+  not replay.
 
 ### Changed
 - **BREAKING (configuration) — `amr`, `auth_time` and `mfa_at` are reserved
@@ -53,9 +92,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mapping onto `sid` or `exp` already was. The IdP's RS256 pair
   (`IssueIdPTokenPair`), which has no session, carries none of the three, so a
   hook value can no longer reach a resource server that way either.
-- A `SessionStore` should persist the two new `Session` fields. One that does
+- **BREAKING (configuration) — every spelling of a reserved claim is
+  reserved.** The ten names are now matched as `encoding/json` matches a struct
+  field, case-insensitively under Unicode folding (`strings.EqualFold`): a
+  hook's `MFA_AT`, `Amr`, `Exp` or `ſid` is deleted from every token before the
+  reserved claims are written, and `UserFieldClaims` refuses such a name. A
+  struct decoder — golang-jwt custom claims, a hand-written authorizer, this
+  library's own token parser — fills `mfa_at` from `MFA_AT` when no exact
+  member is present, and `sid` from a later `ſid` even when one is, so an exact
+  match let a hook or a compromised `ClaimsWebhook` set an `mfa_at` on a
+  password-only session, or rebind a token to another session id, for every
+  such reader. A name that only resembles one (`" typ"`, `mfaAt`) is unchanged.
+  The IdP pair deletes the spellings of the three authentication-context claims
+  and, as before, keeps a hook's `iss` when `IDPConfig.Issuer` is unset.
+- A `SessionStore` should persist the four new `Session` fields. One that does
   not keeps working and fails closed: its sessions' tokens carry `auth_time`
-  and no `amr` or `mfa_at` after the first refresh.
+  and no `amr` or `mfa_at` after the first refresh, and their step-up answers
+  `403 REAUTHENTICATION_REQUIRED`.
 
 ## [0.13.0] - 2026-11-20
 

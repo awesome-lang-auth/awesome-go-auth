@@ -526,6 +526,13 @@ func (s *Service) issueSession(ctx context.Context, user User, auth sessionAuth)
 		ExpiresAt:        refreshExp,
 	}
 	auth.apply(&session, now)
+	// The factor this session may step up with is the one its user holds as
+	// it opens (Session.TOTPBinding): a factor enrolled later, through this
+	// session's own access token or any other, is not. A session whose opener
+	// cannot say how its user was proved records none, so it never steps up.
+	if len(auth.methods) > 0 {
+		session.TOTPBinding = s.totpBinding(user)
+	}
 	accessToken, _, err := s.issueAccessToken(ctx, user, session)
 	if err != nil {
 		return AuthTokens{}, "", err

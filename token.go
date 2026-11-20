@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -45,16 +46,38 @@ type joseHeader struct {
 // neither put an mfa_at on a token nor keep one off.
 var reservedClaimNames = []string{"sid", "tid", "jti", "typ", "iss", "iat", "exp", ClaimAMR, ClaimAuthTime, ClaimMFAAt}
 
-// isReservedClaim reports whether name is one of reservedClaimNames. The
-// match is exact: claim names are case-sensitive, and "Exp" is a claim of the
-// hook's own that issueToken leaves alone.
+// isReservedClaim reports whether name is one of reservedClaimNames, matched
+// the way encoding/json matches an object member to a struct field: exactly,
+// or else case-insensitively under Unicode simple folding (strings.EqualFold).
+//
+// Claim names are case-sensitive in JWT, so "MFA_AT" is, to the letter of RFC
+// 7519, a claim of its own. But most consumers do not read a payload to the
+// letter: they decode it into a struct — golang-jwt's custom claims, a
+// hand-written authorizer, parseToken here — and encoding/json fills the field
+// tagged "mfa_at" from "MFA_AT" whenever no exact "mfa_at" member is present,
+// and from a later fold-equal member even when one is ("ſid" folds to "sid",
+// and sorts after it). A hook that could put such a name on a token would be
+// setting the reserved claim for every reader of that kind, so every
+// fold-equal spelling is reserved with the name.
 func isReservedClaim(name string) bool {
 	for _, reserved := range reservedClaimNames {
-		if name == reserved {
+		if strings.EqualFold(name, reserved) {
 			return true
 		}
 	}
 	return false
+}
+
+// deleteReservedClaims removes from claims every member isReservedClaim
+// matches. mintToken and the IdP's payloadClaims call it on the hook's result
+// before they write the reserved claims themselves, so that no spelling of a
+// reserved name survives beside the one they write.
+func deleteReservedClaims(claims map[string]any) {
+	for name := range claims {
+		if isReservedClaim(name) {
+			delete(claims, name)
+		}
+	}
 }
 
 // issueToken mints one token for user — a refresh token, the 2FA step-up token
@@ -114,6 +137,11 @@ func (s *Service) mintToken(ctx context.Context, user User, sessionID, tokenType
 			payloadClaims[key] = value
 		}
 	}
+	// Every spelling of a reserved name the hook returned goes first — see
+	// isReservedClaim — so that the assignments below are the only members of
+	// the payload any reader, exact or case-insensitive, takes a reserved claim
+	// from.
+	deleteReservedClaims(payloadClaims)
 
 	// The reserved claims are written after the merge so that nothing a hook
 	// returns survives under these names. Each is a fact parseToken or its
@@ -145,11 +173,9 @@ func (s *Service) mintToken(ctx context.Context, user User, sessionID, tokenType
 	// claims are not always present, so overwriting them is not enough — a
 	// hook value under one of them would survive on every token the session
 	// does not set it on, and an mfa_at the hook made up is exactly the claim a
-	// resource server must be able to trust. So all three are deleted, and
-	// written back from the session alone, on an access token alone.
-	delete(payloadClaims, ClaimAMR)
-	delete(payloadClaims, ClaimAuthTime)
-	delete(payloadClaims, ClaimMFAAt)
+	// resource server must be able to trust. So all three were deleted above,
+	// with every other spelling of them, and are written back from the session
+	// alone, on an access token alone.
 	for key, value := range authClaims {
 		payloadClaims[key] = value
 	}

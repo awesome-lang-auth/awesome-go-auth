@@ -70,13 +70,14 @@ func main() {
   `auth_time` and `mfa_at`, reserved so no claims hook can forge them, carried
   through refresh, and exposed on the middleware's principal — plus
   `POST <prefix>/2fa/step-up` to re-verify TOTP for a session before a
-  privileged action ([Authentication context](README_DETAILED.md#authentication-context--amr-auth_time-mfa_at-and-step-up)).
+  privileged action, accepting only the factor the session is bound to and
+  revoking the session after five wrong codes ([Authentication context](README_DETAILED.md#authentication-context--amr-auth_time-mfa_at-and-step-up)).
 - Email verification (`SendVerificationEmailToken`, `VerifyEmail`) and email change (`RequestEmailChange`, `ConfirmEmailChange`).
 - Session admin helpers (`ListSessions`, `RevokeSessionByID`, `CleanupExpiredSessions`).
 - User metadata store and service helpers.
 - Multi-tenant in-memory RBAC (`MemoryRolesPermissionsStore`) with roles and permissions.
 - In-memory tenant store (`MemoryTenantStore`) with user↔tenant membership.
-- Custom token claims via `Config.BuildTokenClaims`, written by hand or built from configuration with `StaticClaims`, `UserFieldClaims`, `ChainClaims` and the synchronous `ClaimsWebhook`; reflected under `customClaims` on `GET /me`. The hook may override the reference's six base claims (`sub`, `email`, `role`, `loginProvider`, `isEmailVerified`, `isTotpEnabled`); the session claims `sid`, `tid`, `jti`, `typ`, `iss`, `iat` and `exp`, and the authentication context `amr`, `auth_time` and `mfa_at`, are reserved. It runs at mint time and on `/me`, never in the adapters' middleware ([Custom Claims](README_DETAILED.md#custom-claims)).
+- Custom token claims via `Config.BuildTokenClaims`, written by hand or built from configuration with `StaticClaims`, `UserFieldClaims`, `ChainClaims` and the synchronous `ClaimsWebhook`; reflected under `customClaims` on `GET /me`. The hook may override the reference's six base claims (`sub`, `email`, `role`, `loginProvider`, `isEmailVerified`, `isTotpEnabled`); the session claims `sid`, `tid`, `jti`, `typ`, `iss`, `iat` and `exp`, and the authentication context `amr`, `auth_time` and `mfa_at`, are reserved, in every spelling a case-insensitive JSON decoder reads as one of them. It runs at mint time and on `/me`, never in the adapters' middleware ([Custom Claims](README_DETAILED.md#custom-claims)).
 - API key service and HTTP middleware (`APIKeyService`, `APIKeyMiddleware`).
 - In-process event bus (`EventBus`) for event-driven integrations.
 - Extended storage interfaces and thread-safe in-memory implementations for all the above flows.
@@ -208,12 +209,18 @@ revision the whole contract was extracted from.
   re-verifies TOTP for the current session, moves `mfa_at` to now, adds `otp`
   and `mfa` to `amr` and answers a fresh access token alone: the access cookie,
   or `accessToken` under `X-Auth-Strategy: bearer`; a session store without
-  `SessionAuthenticationStore` answers `501`. The three names are reserved:
-  `BuildTokenClaims`, and so a `ClaimsWebhook`, cannot set them on any token,
-  and `UserFieldClaims` refuses to map onto them. The admin console's own login
-  mints a token of another type that carries none of them. `VerifyAccess`, and
-  so the adapters' middleware, exposes them as `User.AuthMethods`,
-  `User.AuthTime` and `User.MFAAt`.
+  `SessionAuthenticationStore` answers `501`. The step-up accepts only the
+  factor the session is bound to — the TOTP secret its user held when it opened
+  (`Session.TOTPBinding`) — and answers any other
+  `403 REAUTHENTICATION_REQUIRED` before looking at the code, so a factor
+  enrolled through the session's own access token never moves its `mfa_at`; and
+  the wrong code that reaches `StepUpFailureLimit` revokes the session. The
+  three names are reserved, like the session claims, in every spelling
+  `encoding/json` folds onto them: `BuildTokenClaims`, and so a `ClaimsWebhook`,
+  cannot set them on any token, and `UserFieldClaims` refuses to map onto them.
+  The admin console's own login mints a token of another type that carries none
+  of them. `VerifyAccess`, and so the adapters' middleware, exposes them as
+  `User.AuthMethods`, `User.AuthTime` and `User.MFAAt`.
 - **The reference**: The payload is `buildPayload(user)` — the six base claims
   with `config.buildTokenPayload(user)` spread over them — plus `sid`, and
   nothing in it says how the session was obtained: a password login and a
@@ -236,13 +243,16 @@ revision the whole contract was extracted from.
   the reference's payload with three extra members. A host hook that set `amr`,
   `auth_time` or `mfa_at` must rename the claim; a `UserFieldClaims` mapping
   onto one now fails at startup.
-- **What a session store owes**: Persist `Session.AuthMethods` and
-  `Session.MFAAt` with the rest of the row; a store that does not loses them on
-  the first refresh, and the tokens then claim no method — which fails closed.
-  Implement `SessionAuthenticationStore` for the step-up route: a write of those
-  two fields alone that refuses a revoked session atomically, so a step-up can
-  never revive a refresh token a rotation spent or a session a logout revoked.
-  `MemorySessionStore` does both.
+- **What a session store owes**: Persist `Session.AuthMethods`, `Session.MFAAt`,
+  `Session.TOTPBinding` and `Session.StepUpAttempts` with the rest of the row; a
+  store that does not loses them on the first refresh, and the tokens then claim
+  no method and the step-up answers `403` — which fails closed. Implement
+  `SessionAuthenticationStore` for the step-up route: `RecordSecondFactor`, a
+  write of those fields alone that refuses a revoked session atomically, so a
+  step-up can never revive a refresh token a rotation spent or a session a
+  logout revoked; and `RecordStepUpAttempt`, which counts an attempt before its
+  code is checked and revokes the session past the limit in the same atomic
+  step. `MemorySessionStore` does all of it.
 
 ### The refresh-token secret is optional and may equal the access-token secret
 

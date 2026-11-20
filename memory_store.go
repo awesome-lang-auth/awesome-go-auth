@@ -503,11 +503,13 @@ func (s *MemorySessionStore) UpdateSession(_ context.Context, session Session) e
 	return nil
 }
 
-// RecordSecondFactor makes MemorySessionStore satisfy
-// SessionAuthenticationStore: under the store's lock it refuses a session that
-// is missing (ErrSessionNotFound) or revoked (ErrSessionRevoked), and writes
-// AuthMethods and MFAAt and nothing else, so a refresh-token rotation or a
+// RecordSecondFactor and RecordStepUpAttempt make MemorySessionStore satisfy
+// SessionAuthenticationStore. Each works under the store's lock: it refuses a
+// session that is missing (ErrSessionNotFound) or revoked (ErrSessionRevoked),
+// and writes its own fields and nothing else, so a refresh-token rotation or a
 // revocation that got there first is kept.
+//
+// RecordSecondFactor writes AuthMethods and MFAAt and resets StepUpAttempts.
 func (s *MemorySessionStore) RecordSecondFactor(_ context.Context, sessionID string, methods []string, at time.Time) (Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -521,6 +523,28 @@ func (s *MemorySessionStore) RecordSecondFactor(_ context.Context, sessionID str
 	session.AuthMethods = append([]string(nil), methods...)
 	mfaAt := at
 	session.MFAAt = &mfaAt
+	session.StepUpAttempts = 0
+	s.byID[sessionID] = session
+	return session, nil
+}
+
+// RecordStepUpAttempt increments StepUpAttempts and, when the count exceeds
+// limit, sets RevokedAt to at in the same step.
+func (s *MemorySessionStore) RecordStepUpAttempt(_ context.Context, sessionID string, limit int, at time.Time) (Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.byID[sessionID]
+	if !ok {
+		return Session{}, ErrSessionNotFound
+	}
+	if session.RevokedAt != nil {
+		return Session{}, ErrSessionRevoked
+	}
+	session.StepUpAttempts++
+	if session.StepUpAttempts > limit {
+		revokedAt := at
+		session.RevokedAt = &revokedAt
+	}
 	s.byID[sessionID] = session
 	return session, nil
 }

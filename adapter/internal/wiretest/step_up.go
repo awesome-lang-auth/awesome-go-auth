@@ -143,22 +143,42 @@ func testStepUp(t *testing.T, mount Mounter) {
 
 	// ── POST /2fa/step-up ──────────────────────────────────────────────────────
 
-	// stepUpSession is a password session whose user then enrolled TOTP
-	// voluntarily: the session has no second factor yet, so the step-up's
-	// effect is visible in a single second.
-	stepUpSession := func(t *testing.T, env *Env, email string) (*httptest.ResponseRecorder, string) {
+	// stepUpSession is a one-factor session — a magic-link login — of an
+	// account that already holds TOTP: the factor predates the session, so the
+	// session may step up with it, and having presented no second factor yet,
+	// the step-up's effect is visible in a single second. bearer selects the
+	// delivery; the returned access token is the one the session's response
+	// carried, cookie or body.
+	stepUpSession := func(t *testing.T, env *Env, email string, bearer bool) (*httptest.ResponseRecorder, string, string) {
 		t.Helper()
-		env.Seed(email)
-		login := env.Do(env.Request(http.MethodPost, "/login", credentials(email)))
+		_, seeded := env.Seed(email)
+		secret := enrolTOTP(t, env, seeded.AccessToken)
+		AssertStatus(t, env.Do(env.Request(http.MethodPost, "/magic-link/send", map[string]any{"email": email, "tenantId": testTenant})), http.StatusOK)
+		link := env.Delivered.MagicLinks[len(env.Delivered.MagicLinks)-1].Token
+		req := env.Request(http.MethodPost, "/magic-link/verify", map[string]any{"token": link})
+		if bearer {
+			req.Header.Set(auth.AuthStrategyHeader, auth.AuthStrategyBearer)
+		}
+		login := env.Do(req)
 		AssertStatus(t, login, http.StatusOK)
-		secret := enrolTOTP(t, env, Cookie(t, login, hostAccess).Value)
-		return login, secret
+		access, _ := Body(t, login)["accessToken"].(string)
+		if access == "" {
+			access = Cookie(t, login, hostAccess).Value
+		}
+		return login, secret, access
+	}
+	stepBearer := func(env *Env, token, code string) *httptest.ResponseRecorder {
+		req := env.Request(http.MethodPost, auth.StepUpRoute, map[string]any{"totpCode": code})
+		if token != "" {
+			req = passwordlessBearer(req, token)
+		}
+		return env.Do(req)
 	}
 
 	t.Run("step-up in cookie mode delivers the access cookie alone", func(t *testing.T) {
 		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
-		login, secret := stepUpSession(t, env, "stepcookie@example.com")
-		assertAuthContext(t, login, []string{auth.AMRPassword}, false)
+		login, secret, _ := stepUpSession(t, env, "stepcookie@example.com", false)
+		assertAuthContext(t, login, []string{auth.AMREmail}, false)
 
 		rec := env.Do(csrfMirror(env.Request(http.MethodPost, auth.StepUpRoute, map[string]any{
 			"totpCode": totpCode(t, secret, time.Now()),
@@ -168,7 +188,7 @@ func testStepUp(t *testing.T, mount Mounter) {
 		AssertCookieAttrs(t, Cookie(t, rec, hostAccess), accessCookieSpec())
 		// The refresh token is not rotated, so its cookie is not touched.
 		AssertNoCookie(t, rec, hostRefresh)
-		claims := assertAuthContext(t, rec, []string{auth.AMRPassword, auth.AMROTP, auth.AMRMFA}, true)
+		claims := assertAuthContext(t, rec, []string{auth.AMREmail, auth.AMROTP, auth.AMRMFA}, true)
 		if claims["sid"] != tokenClaims(t, Cookie(t, login, hostAccess).Value)["sid"] {
 			t.Error("the step-up token belongs to another session")
 		}
@@ -176,7 +196,7 @@ func testStepUp(t *testing.T, mount Mounter) {
 		// The next refresh carries the new mfa_at forward.
 		refreshed := env.Do(Replay(httptest.NewRequest(http.MethodPost, env.Config.Prefix()+"/refresh", nil), login))
 		AssertStatus(t, refreshed, http.StatusOK)
-		after := assertAuthContext(t, refreshed, []string{auth.AMRPassword, auth.AMROTP, auth.AMRMFA}, true)
+		after := assertAuthContext(t, refreshed, []string{auth.AMREmail, auth.AMROTP, auth.AMRMFA}, true)
 		if after[auth.ClaimMFAAt] != claims[auth.ClaimMFAAt] {
 			t.Errorf("mfa_at after refresh = %v, want the step-up's %v", after[auth.ClaimMFAAt], claims[auth.ClaimMFAAt])
 		}
@@ -184,21 +204,20 @@ func testStepUp(t *testing.T, mount Mounter) {
 
 	t.Run("step-up in bearer mode answers the access token in the body", func(t *testing.T) {
 		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
-		_, tokens := env.Seed("stepbearer@example.com")
-		secret := enrolTOTP(t, env, tokens.AccessToken)
+		_, secret, access := stepUpSession(t, env, "stepbearer@example.com", true)
 		rec := env.Do(passwordlessBearer(env.Request(http.MethodPost, auth.StepUpRoute, map[string]any{
 			"totpCode": totpCode(t, secret, time.Now()),
-		}), tokens.AccessToken))
+		}), access))
 		AssertStatus(t, rec, http.StatusOK)
 		AssertKeys(t, Body(t, rec), "success", "accessToken")
 		AssertNoCookie(t, rec, hostAccess)
 		AssertNoCookie(t, rec, hostRefresh)
-		assertAuthContext(t, rec, []string{auth.AMRPassword, auth.AMROTP, auth.AMRMFA}, true)
+		assertAuthContext(t, rec, []string{auth.AMREmail, auth.AMROTP, auth.AMRMFA}, true)
 	})
 
 	t.Run("a cookie step-up without the CSRF header is refused", func(t *testing.T) {
 		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
-		login, secret := stepUpSession(t, env, "stepcsrf@example.com")
+		login, secret, _ := stepUpSession(t, env, "stepcsrf@example.com", false)
 		rec := env.Do(Replay(env.Request(http.MethodPost, auth.StepUpRoute, map[string]any{
 			"totpCode": totpCode(t, secret, time.Now()),
 		}), login))
@@ -207,31 +226,66 @@ func testStepUp(t *testing.T, mount Mounter) {
 
 	t.Run("step-up refusals", func(t *testing.T) {
 		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
-		_, tokens := env.Seed("steprefuse@example.com")
-		secret := enrolTOTP(t, env, tokens.AccessToken)
+		login, secret, access := stepUpSession(t, env, "steprefuse@example.com", true)
+		refresh, _ := Body(t, login)["refreshToken"].(string)
 		_, plain := env.Seed("stepplain@example.com")
-		step := func(token, code string) *httptest.ResponseRecorder {
-			req := env.Request(http.MethodPost, auth.StepUpRoute, map[string]any{"totpCode": code})
-			if token != "" {
-				req = passwordlessBearer(req, token)
-			}
-			return env.Do(req)
-		}
 
-		AssertError(t, step("", "123456"), http.StatusForbidden, "No access token provided", "")
-		AssertError(t, step("not-a-token", "123456"), http.StatusForbidden, "Invalid or expired access token", "")
-		AssertError(t, step(tokens.AccessToken, stepUpWrongCode(t, secret)), http.StatusUnauthorized, "Invalid TOTP code", "")
-		AssertError(t, step(plain.AccessToken, "123456"), http.StatusBadRequest, "User not found or 2FA not set up", "")
+		AssertError(t, stepBearer(env, "", "123456"), http.StatusForbidden, "No access token provided", "")
+		AssertError(t, stepBearer(env, "not-a-token", "123456"), http.StatusForbidden, "Invalid or expired access token", "")
+		AssertError(t, stepBearer(env, access, stepUpWrongCode(t, secret)), http.StatusUnauthorized, "Invalid TOTP code", "")
+		AssertError(t, stepBearer(env, plain.AccessToken, "123456"), http.StatusBadRequest, "User not found or 2FA not set up", "")
 
 		// A logged-out session is refused even though the default session-check
 		// mode lets its access token through the gate: the route writes to the
 		// session, so it always checks it.
-		logout := env.Do(env.Request(http.MethodPost, "/logout", map[string]any{"refreshToken": tokens.RefreshToken}))
+		logout := env.Do(env.Request(http.MethodPost, "/logout", map[string]any{"refreshToken": refresh}))
 		AssertStatus(t, logout, http.StatusOK)
-		rec := step(tokens.AccessToken, totpCode(t, secret, time.Now()))
-		AssertStatus(t, rec, http.StatusUnauthorized)
-		if got := Body(t, rec)["code"]; got != auth.CodeSessionRevoked {
-			t.Errorf("code = %v, want %s", got, auth.CodeSessionRevoked)
+		AssertError(t, stepBearer(env, access, totpCode(t, secret, time.Now())), http.StatusUnauthorized,
+			auth.HTTPErrSessionRevoked.Message, auth.CodeSessionRevoked)
+	})
+
+	// ── a factor the session is not bound to ───────────────────────────────────
+
+	// Whoever holds a session's access token can enrol a factor through the
+	// voluntary /2fa/setup and /2fa/verify-setup. A code of that factor proves
+	// nothing the token did not, so it never moves the session's mfa_at.
+	t.Run("a factor enrolled after the session opened cannot step up", func(t *testing.T) {
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+		_, tokens := env.Seed("stepfirst@example.com") // a password session, no factor yet
+		secret := enrolTOTP(t, env, tokens.AccessToken)
+		AssertError(t, stepBearer(env, tokens.AccessToken, totpCode(t, secret, time.Now())), http.StatusForbidden,
+			auth.HTTPErrReauthenticationRequired.Message, auth.CodeReauthenticationRequired)
+	})
+
+	t.Run("a factor swapped in through the session cannot step up", func(t *testing.T) {
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+		_, original, access := stepUpSession(t, env, "stepswap@example.com", true)
+		swapped := enrolTOTP(t, env, access)
+		for name, secret := range map[string]string{"the swapped-in factor": swapped, "the replaced factor": original} {
+			rec := stepBearer(env, access, totpCode(t, secret, time.Now()))
+			if rec.Code != http.StatusForbidden || Body(t, rec)["code"] != auth.CodeReauthenticationRequired {
+				t.Errorf("%s: %d %s, want 403 %s", name, rec.Code, rec.Body.String(), auth.CodeReauthenticationRequired)
+			}
+		}
+	})
+
+	// ── the failure budget ─────────────────────────────────────────────────────
+
+	t.Run("the last wrong code of the budget ends the session", func(t *testing.T) {
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig())
+		login, secret, access := stepUpSession(t, env, "stepbudget@example.com", true)
+		refresh, _ := Body(t, login)["refreshToken"].(string)
+		wrong := stepUpWrongCode(t, secret)
+		for i := 1; i < auth.StepUpFailureLimit; i++ {
+			AssertError(t, stepBearer(env, access, wrong), http.StatusUnauthorized, "Invalid TOTP code", "")
+		}
+		AssertError(t, stepBearer(env, access, wrong), http.StatusUnauthorized, auth.HTTPErrSessionRevoked.Message, auth.CodeSessionRevoked)
+		// The right code no longer helps, and the session's refresh token is dead.
+		AssertError(t, stepBearer(env, access, totpCode(t, secret, time.Now())), http.StatusUnauthorized,
+			auth.HTTPErrSessionRevoked.Message, auth.CodeSessionRevoked)
+		rec := env.Do(env.Request(http.MethodPost, "/refresh", map[string]any{"refreshToken": refresh}))
+		if rec.Code == http.StatusOK {
+			t.Fatalf("refresh after the budget = %d %s, want a refusal", rec.Code, rec.Body.String())
 		}
 	})
 }
