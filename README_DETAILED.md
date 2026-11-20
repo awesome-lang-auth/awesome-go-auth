@@ -963,7 +963,11 @@ wires anything. The function it returns fills everything but `Provider`.
 ### `(*OAuthService).HandleCallback(ctx, authSvc, linkedAccounts, info, tenantID, linkToUserID) (User, AuthTokens, error)`
 
 Resolves or creates a user from OAuth user info under the default provisioning
-policy. It is `HandleCallbackWithPolicy` with `DefaultOAuthProvisioning()`.
+policy. It is `HandleCallbackWithPolicy` with `DefaultOAuthProvisioning()`, so an
+address another account already holds is answered with
+`*OAuthAccountConflictError`, not linked. Through 0.12.0 it linked the address
+and signed that account in; pass `OnEmailMatch: "link"` to
+`HandleCallbackWithPolicy` for that.
 
 ### `(*OAuthService).HandleCallbackWithPolicy(ctx, authSvc, linkedAccounts, info, tenantID, linkToUserID, policy) (User, AuthTokens, error)`
 
@@ -977,7 +981,7 @@ The same, under an explicit `OAuthProvisioning`:
    user. This is the only identification the reference's own store
    documentation considers safe (`user-store.interface.ts:105-119`).
 4. If an account already holds the profile address: `OnEmailMatch` decides —
-   link it (the default), raise an account conflict, or refuse.
+   raise an account conflict (the default), link it, or refuse.
 5. Otherwise: creates a new user, if `AutoCreate` allows it.
 
 ### `OAuthProvisioning`
@@ -996,11 +1000,20 @@ The declarative replacement for the abstract `findOrCreateUser(profile, state)`
 the reference makes every integrator write
 (`generic-oauth.strategy.ts:169-172`). Set it on `OAuthWiring.Provisioning`,
 which is a **pointer**: `nil` means `DefaultOAuthProvisioning()` —
-`AutoCreate: true`, `OnEmailMatch: "link"`, no domain list, no verification
-demand — which is what the callback did before the policy existed, so a
-deployment that sets nothing is unchanged. A policy given explicitly is taken as
-written, `AutoCreate: false` included; the one field whose empty value still
-means a default is `OnEmailMatch`.
+`AutoCreate: true`, `OnEmailMatch: "conflict"`, no domain list, no verification
+demand. That is the `findOrCreateUser` the reference documents for its
+integrators (its `README.detailed.md`, "OAuth Strategies"): an existing
+provider link signs in, an address another account holds is a conflict, and
+anything else is created. A policy given explicitly is taken as written,
+`AutoCreate: false` included; the one field whose empty value still means a
+default is `OnEmailMatch`, and `""` means `"conflict"`, never `"link"`.
+
+> **Changed after 0.12.0 (issue #36).** Through 0.12.0 the default was
+> `OnEmailMatch: "link"`, which signed a provider account into whatever account
+> held the address it asserted, whether or not the provider had verified it. A
+> deployment that relied on that sets `OnEmailMatch: "link"` explicitly, and
+> should add `RequireVerifiedEmail: true` unless every provider it trusts
+> verifies addresses.
 
 - **`AutoCreate`** — false answers `403 OAUTH_USER_NOT_PROVISIONED` instead of
   creating an account for an identity nothing here knows.
@@ -1013,10 +1026,13 @@ means a default is `OnEmailMatch`.
   provider positively asserted the address. Most providers assert nothing, so
   turning this on for one of them refuses every login through it.
 - **`OnEmailMatch`** — what happens when the provider account is unknown but
-  some account already holds the address. `"link"` links it and signs that
-  account in (the default, and the account-takeover shape the reference's store
-  interface warns about); `"conflict"` raises the reference's
-  `OAUTH_ACCOUNT_CONFLICT` and starts the account-conflict flow below;
+  some account already holds the address. `"conflict"` (the default, and what
+  `""` means) raises the reference's `OAUTH_ACCOUNT_CONFLICT` and starts the
+  account-conflict flow below; `"link"` links it and signs that account in —
+  the account-takeover shape the reference's store interface warns about, since
+  it applies no check of its own on whether the provider verified the address,
+  so pair it with `RequireVerifiedEmail` (which, unlike a check on this branch
+  alone, also refuses creation and existing links for an unasserted address);
   `"reject"` answers `403 OAUTH_USER_NOT_PROVISIONED`, the same refusal
   `AutoCreate: false` gives, because both mean the deployment will not
   provision this identity.
@@ -1046,11 +1062,11 @@ when the provider positively said so.
 
 ### The account-conflict flow
 
-With `OnEmailMatch: "conflict"`, a provider account asserting an address another
+Under the default `OnEmailMatch: "conflict"`, a provider account asserting an address another
 account holds produces `*OAuthAccountConflictError` (it unwraps to
 `ErrOAuthAccountConflict` and carries `Provider`, `Email` and
 `ProviderAccountID`, the reference's `AuthError` data). On the callback route
-that becomes the reference's answer (`auth.router.ts:1346-1355`):
+that becomes the reference's answer (`auth.router.ts:1988-2003` at 1.10.8):
 
 1. The pair is stashed through `PendingLinkStore.Save` under
    `pending-link:<email>|<provider>`, carrying the provider account id and the
@@ -1060,10 +1076,12 @@ that becomes the reference's answer (`auth.router.ts:1346-1355`):
 2. The browser gets a `302` to
    `HTTPConfig.AccountConflictLink(siteURL, provider, email)` —
    `<siteURL><prefix>/account-conflict?provider=<p>&code=OAUTH_ACCOUNT_CONFLICT[&email=<e>]`,
-   or `<siteURL><prefix>/ui/account-conflict?…` under `HTTPConfig.UIEnabled`.
-   `siteURL` is the origin the signed state resolved to, the same value a
-   successful login is redirected to. No session is issued and no link is
-   written.
+   or `<siteURL><prefix>/ui/account-conflict?…` under `HTTPConfig.UIEnabled`,
+   with `provider` and `email` escaped as JavaScript's `encodeURIComponent`
+   escapes them. `siteURL` is `OAuthCompleteResult.ConflictOrigin`: the origin
+   the signed state names when the allowlist admits it, the default site URL
+   otherwise, and — unlike the redirect a successful login gets — never the
+   state's return path. No session is issued and no link is written.
 3. The front-end reads `provider` and `email` off that query and posts them to
    `POST <prefix>/link-request`, which resolves the identity from the stash
    rather than from a credential, and mails a verification link.

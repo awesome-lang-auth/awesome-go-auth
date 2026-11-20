@@ -23,25 +23,43 @@ import (
 // and reaches the wire exactly as the reference sends it; the refusals are this
 // port's own and are registered in compatibility.go.
 //
-// The defaults reproduce what this port did before the policy existed: create
-// missing accounts, link an address a provider asserts to whatever account
-// already holds it. That last one is the account-takeover shape the reference's
-// own store interface warns about — two providers can assert the same address
+// The defaults are the findOrCreateUser the reference documents for its
+// integrators (README.detailed.md "OAuth Strategies", at 1.10.8): an existing
+// (provider, providerAccountId) link signs in, an address some other account
+// already holds raises OAUTH_ACCOUNT_CONFLICT, and anything else is created.
+// The reference's own words are that two accounts must never be linked just
+// because they share an address — two providers can assert the same address
 // without representing the same person (user-store.interface.ts:105-119) — so
-// OnEmailMatch is how a deployment turns it off, and the conflict flow is what
-// it turns into.
+// the conflict flow, where the link is made only once the address has been
+// proven by mail, is what a deployment that configures nothing gets. Linking by
+// address is still available, as OnEmailMatch link, for a host that chooses it.
+//
+// Through 0.12.0 the default was link, which signed a provider account into
+// whatever account held the address it asserted, verified or not (issue #36).
 
 // The three OnEmailMatch modes.
 const (
 	// OAuthEmailMatchLink links the provider account to the account that
-	// already holds the address and signs that account in. It is the default
-	// and what this port did before the policy existed.
+	// already holds the address and signs that account in. It is an explicit
+	// opt-in, and it trusts the provider's address as far as the rest of the
+	// policy does: on its own it links an address the provider never verified,
+	// which against a provider that lets a user type any address (GitHub's
+	// public profile email, many self-hosted OIDC servers) hands the existing
+	// account to whoever registered that address there. A host that wants it
+	// should pair it with RequireVerifiedEmail, which refuses every callback
+	// whose provider did not assert the address — creation and existing links
+	// included, not only this branch.
 	OAuthEmailMatchLink = "link"
 	// OAuthEmailMatchConflict refuses to link and raises the reference's
 	// OAUTH_ACCOUNT_CONFLICT: the callback stashes (email, provider,
 	// providerAccountId) and redirects the browser to /account-conflict, where
 	// the front-end drives /link-request and /link-verify so the link is made
-	// only after the address has been proven by mail.
+	// only after the address has been proven by mail. It is the default, and
+	// what an empty OnEmailMatch means.
+	//
+	// Without OAuthWiring.PendingLinks the redirect is still sent but nothing is
+	// stashed, exactly as the reference behaves without a pendingLinkStore, and
+	// an unauthenticated /link-request then has no identity to resolve.
 	OAuthEmailMatchConflict = "conflict"
 	// OAuthEmailMatchReject refuses outright, with no linking flow offered:
 	// 403 OAUTH_USER_NOT_PROVISIONED, the same answer AutoCreate false gives,
@@ -58,10 +76,11 @@ const (
 //
 // The zero value is not the default policy — DefaultOAuthProvisioning is, and
 // OAuthWiring.Provisioning is a pointer so that a deployment which sets nothing
-// keeps the behaviour it had before this type existed. A policy given
-// explicitly is taken as written: AutoCreate false means false. The one field
-// whose empty value still means a default is OnEmailMatch, which has no empty
-// mode.
+// gets it, account creation included. A policy given explicitly is taken as
+// written: AutoCreate false means false. The one field whose empty value still
+// means a default is OnEmailMatch, which has no empty mode: "" is
+// OAuthEmailMatchConflict, the safe answer, so a policy built field by field
+// that forgets OnEmailMatch never links by address.
 type OAuthProvisioning struct {
 	// AutoCreate allows the callback to create an account for a provider
 	// identity nothing here knows yet. With it false the callback answers
@@ -84,8 +103,9 @@ type OAuthProvisioning struct {
 	RequireVerifiedEmail bool
 	// OnEmailMatch decides what happens when the provider account is unknown
 	// but some account already holds the profile address:
-	// OAuthEmailMatchLink (the default), OAuthEmailMatchConflict or
-	// OAuthEmailMatchReject.
+	// OAuthEmailMatchConflict (the default, and what "" means),
+	// OAuthEmailMatchLink or OAuthEmailMatchReject. Link applies no check of its
+	// own on whether the provider verified the address; see OAuthEmailMatchLink.
 	OnEmailMatch string
 	// FieldMap fills further User fields from the raw provider profile when the
 	// callback creates an account. The keys are the fields it may write —
@@ -107,10 +127,13 @@ type OAuthProvisioning struct {
 }
 
 // DefaultOAuthProvisioning is the policy a wiring without one gets: create
-// missing accounts, link a matching address. It is what this port did before
-// OAuthProvisioning existed, so adding the type changed no deployment.
+// missing accounts, and answer an address another account already holds with
+// the reference's OAUTH_ACCOUNT_CONFLICT rather than linking it — the
+// findOrCreateUser the reference documents (README.detailed.md "OAuth
+// Strategies"). Through 0.12.0 it linked the address instead (issue #36); a
+// host that relied on that sets OnEmailMatch: OAuthEmailMatchLink explicitly.
 func DefaultOAuthProvisioning() OAuthProvisioning {
-	return OAuthProvisioning{AutoCreate: true, OnEmailMatch: OAuthEmailMatchLink}
+	return OAuthProvisioning{AutoCreate: true, OnEmailMatch: OAuthEmailMatchConflict}
 }
 
 // Validate reports what is wrong with a policy loaded from configuration: an
@@ -136,10 +159,11 @@ func (p OAuthProvisioning) Validate() error {
 }
 
 // normalized fills the defaults an empty field stands for. Only OnEmailMatch
-// has one: every other field means what it says.
+// has one, and it is the conflict, so that leaving the mode out can never
+// enable linking by address: every other field means what it says.
 func (p OAuthProvisioning) normalized() OAuthProvisioning {
 	if p.OnEmailMatch == "" {
-		p.OnEmailMatch = OAuthEmailMatchLink
+		p.OnEmailMatch = OAuthEmailMatchConflict
 	}
 	return p
 }
