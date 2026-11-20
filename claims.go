@@ -32,8 +32,9 @@ import (
 //
 // The result may override sub, email, role, loginProvider, isEmailVerified and
 // isTotpEnabled; the session claims sid, tid, jti, typ, iss, iat and exp are
-// reserved — written after the merge — and cannot be set from any builder (see
-// issueToken). A builder error fails the mint: the login, refresh or step-up
+// reserved — written after the merge — and so are amr, auth_time and mfa_at,
+// which come from the session alone; none can be set from any builder (see
+// mintToken). A builder error fails the mint: the login, refresh or step-up
 // that needed the token answers 500 rather than issuing a token carrying fewer
 // claims than the deployment configured.
 type TokenClaimsBuilder = func(ctx context.Context, user User) (map[string]any, error)
@@ -48,8 +49,8 @@ type TokenClaimsBuilder = func(ctx context.Context, user User) (map[string]any, 
 //
 // StaticClaims has no error to return, so it cannot refuse a reserved session
 // claim name the way UserFieldClaims does: an entry named sid, tid, jti, typ,
-// iss, iat or exp is discarded by issueToken on every mint, exactly as the
-// same name from a hand-written hook is. A deployment that decodes the
+// iss, iat, exp, amr, auth_time or mfa_at is discarded by mintToken on every
+// mint, exactly as the same name from a hand-written hook is. A deployment that decodes the
 // {const: ...} table should check the names before building.
 func StaticClaims(claims map[string]any) TokenClaimsBuilder {
 	frozen := copyClaims(claims)

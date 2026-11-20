@@ -31,14 +31,19 @@ type joseHeader struct {
 	Typ string `json:"typ"`
 }
 
-// reservedClaimNames are the session claims issueToken writes after the
-// Config.BuildTokenClaims merge, so that nothing a hook returns survives under
-// these names. The list exists so that a constructor which knows its claim
-// names in advance — UserFieldClaims — can refuse one of them at startup
-// instead of letting the mapping vanish silently on every mint; the seven
-// assignments in issueToken are the reservation itself, and
-// TestReservedClaimNames_MatchIssueToken pins that the two agree.
-var reservedClaimNames = []string{"sid", "tid", "jti", "typ", "iss", "iat", "exp"}
+// reservedClaimNames are the claims mintToken owns, so that nothing a
+// Config.BuildTokenClaims hook returns survives under these names. The list
+// exists so that a constructor which knows its claim names in advance —
+// UserFieldClaims — can refuse one of them at startup instead of letting the
+// mapping vanish silently on every mint; mintToken is the reservation itself,
+// and TestReservedClaimNames_MatchIssueToken pins that the two agree.
+//
+// The first seven are the session claims, written after the merge on every
+// token. The last three are the authentication context
+// (authentication_context.go): deleted after the merge on every token, and
+// written back on an access token only, from the session row — so a hook can
+// neither put an mfa_at on a token nor keep one off.
+var reservedClaimNames = []string{"sid", "tid", "jti", "typ", "iss", "iat", "exp", ClaimAMR, ClaimAuthTime, ClaimMFAAt}
 
 // isReservedClaim reports whether name is one of reservedClaimNames. The
 // match is exact: claim names are case-sensitive, and "Exp" is a claim of the
@@ -52,8 +57,10 @@ func isReservedClaim(name string) bool {
 	return false
 }
 
-// issueToken mints one token for user — an access token, a refresh token or the
-// 2FA step-up token, which differ only in typ, sid and lifetime.
+// issueToken mints one token for user — a refresh token, the 2FA step-up token
+// or the enrolment token, which differ only in typ, sid and lifetime. None of
+// them carries the authentication context; an access token is minted by
+// issueAccessToken, which adds it from the session.
 //
 // The payload is assembled in the reference's order: the base claims first,
 // the Config.BuildTokenClaims result spread over them, and the session claims
@@ -61,6 +68,23 @@ func isReservedClaim(name string) bool {
 // order is the guarantee: a hook can rename what the user is, not what the
 // token is.
 func (s *Service) issueToken(ctx context.Context, user User, sessionID, tokenType string, ttl time.Duration) (string, time.Time, error) {
+	return s.mintToken(ctx, user, sessionID, tokenType, ttl, nil)
+}
+
+// issueAccessToken mints the access token of session for user, carrying the
+// session's authentication context: auth_time, and amr and mfa_at when the
+// session recorded them (sessionAuthClaims). Every access token this library
+// mints for a session comes through here — the login, a refresh, the IdP's
+// code exchange and refresh grant, the step-up route — so the claims cannot be
+// present on one path and missing on another.
+func (s *Service) issueAccessToken(ctx context.Context, user User, session Session) (string, time.Time, error) {
+	return s.mintToken(ctx, user, session.ID, "access", s.cfg.AccessTokenTTL, sessionAuthClaims(session))
+}
+
+// mintToken is the one place a token is assembled. authClaims are written
+// last, after the reserved claims, and are the only way the authentication
+// context reaches a payload.
+func (s *Service) mintToken(ctx context.Context, user User, sessionID, tokenType string, ttl time.Duration, authClaims map[string]any) (string, time.Time, error) {
 	now := s.now()
 	expiresAt := now.Add(ttl)
 	jti, err := newID("jti")
@@ -116,6 +140,19 @@ func (s *Service) issueToken(ctx context.Context, user User, sessionID, tokenTyp
 	payloadClaims["iss"] = s.cfg.Issuer
 	payloadClaims["iat"] = now.Unix()
 	payloadClaims["exp"] = expiresAt.Unix()
+
+	// The authentication context is reserved the other way round: these
+	// claims are not always present, so overwriting them is not enough — a
+	// hook value under one of them would survive on every token the session
+	// does not set it on, and an mfa_at the hook made up is exactly the claim a
+	// resource server must be able to trust. So all three are deleted, and
+	// written back from the session alone, on an access token alone.
+	delete(payloadClaims, ClaimAMR)
+	delete(payloadClaims, ClaimAuthTime)
+	delete(payloadClaims, ClaimMFAAt)
+	for key, value := range authClaims {
+		payloadClaims[key] = value
+	}
 
 	// A refresh token is signed with Config.RefreshSecret when one is set, as
 	// the reference signs it with refreshTokenSecret (token.service.ts:25-29);

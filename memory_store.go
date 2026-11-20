@@ -503,6 +503,28 @@ func (s *MemorySessionStore) UpdateSession(_ context.Context, session Session) e
 	return nil
 }
 
+// RecordSecondFactor makes MemorySessionStore satisfy
+// SessionAuthenticationStore: under the store's lock it refuses a session that
+// is missing (ErrSessionNotFound) or revoked (ErrSessionRevoked), and writes
+// AuthMethods and MFAAt and nothing else, so a refresh-token rotation or a
+// revocation that got there first is kept.
+func (s *MemorySessionStore) RecordSecondFactor(_ context.Context, sessionID string, methods []string, at time.Time) (Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.byID[sessionID]
+	if !ok {
+		return Session{}, ErrSessionNotFound
+	}
+	if session.RevokedAt != nil {
+		return Session{}, ErrSessionRevoked
+	}
+	session.AuthMethods = append([]string(nil), methods...)
+	mfaAt := at
+	session.MFAAt = &mfaAt
+	s.byID[sessionID] = session
+	return session, nil
+}
+
 func (s *MemorySessionStore) ListSessionsForUser(_ context.Context, userID, tenantID string) ([]Session, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

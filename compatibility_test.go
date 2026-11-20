@@ -53,6 +53,7 @@ var updateREADME = flag.Bool("update", false,
 // deviation is added or retired, and it must be changed together with
 // CompatibilityNotes — after which README.md is regenerated, not edited.
 var wantDeviationIDs = []string{
+	"access-tokens-carry-the-authentication-context",
 	"admin-console-requires-an-explicit-policy",
 	"admin-cookie-secure-flag-is-configured-not-forwarded",
 	"admin-credential-listings-are-ordered",
@@ -105,6 +106,16 @@ var wantClaims = map[string][]string{
 		"Access-Control-Allow-Origin", "string | string[]", "corsOrigins === '*'",
 	},
 	"temp-token-is-typed-not-an-access-token": {"access token", "second factor"},
+	// The three claims and where each comes from, the carry-forward, the route
+	// that moves mfa_at and what it needs of the store, the reservation on
+	// both seams, the admin login that must never carry one, and the
+	// reference's mechanism. An entry that lost "reserved" would read as three
+	// convenience claims a hook could just as well have written.
+	"access-tokens-carry-the-authentication-context": {
+		"amr", "auth_time", "mfa_at", "RFC 8176", "POST <prefix>/2fa/step-up", "carries all three forward",
+		"SessionAuthenticationStore", "501", "reserved", "BuildTokenClaims", "ClaimsWebhook",
+		"UserFieldClaims", "admin", "buildPayload", "VerifyAccess",
+	},
 	"idp-mode-adds-an-oauth-authorization-server": {
 		"S256", "plain", "client_secret_basic", "client_secret_post", "refresh_token", "offline_access",
 		"invalid_grant", "§5.2", "JWKS", "family",

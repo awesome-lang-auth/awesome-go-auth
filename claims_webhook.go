@@ -45,10 +45,11 @@ import (
 //	{"claims": {<claim name>: <value>, ...}}
 //
 // The claims object becomes the builder's result and is merged as any hook's
-// is: it may override the six base claims and cannot set the reserved session
-// claims — issueToken writes sid, tid, jti, typ, iss, iat and exp after the
-// merge — so an endpoint that is compromised, or merely confused, cannot retype
-// a token or rebind its session. Anything else is an error: a non-2xx status,
+// is: it may override the six base claims and cannot set the reserved claims —
+// mintToken writes sid, tid, jti, typ, iss, iat and exp after the merge, and
+// deletes amr, auth_time and mfa_at, writing them back from the session alone —
+// so an endpoint that is compromised, or merely confused, cannot retype a
+// token, rebind its session or claim a second factor nobody presented. Anything else is an error: a non-2xx status,
 // a transport failure, the timeout, a body over 64 KiB, a body that is not
 // JSON, a missing or null "claims" member or one that is not an object. An
 // error fails the mint, and the route answers 500 exactly as it does for any

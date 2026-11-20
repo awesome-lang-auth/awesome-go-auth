@@ -591,6 +591,14 @@ func (idp *IDP) payloadClaims(ctx context.Context, user User) (map[string]any, e
 			claims[key] = value
 		}
 	}
+	// The IdP pair is minted for a user, not for a session, so it has no
+	// authentication context to carry — and a hook value under one of those
+	// reserved names would reach a resource server as if it were one, through
+	// UserFromRS256Claims. Deleted, as mintToken deletes them on the session
+	// pair.
+	delete(claims, ClaimAMR)
+	delete(claims, ClaimAuthTime)
+	delete(claims, ClaimMFAAt)
 	return claims, nil
 }
 

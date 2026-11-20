@@ -93,6 +93,7 @@ Low-level constructor. Use `New()` for most cases.
 | `SetupTOTP(ctx, userID, tenantID) (string, error)` | Generate TOTP secret |
 | `VerifyTOTPSetup(ctx, userID, tenantID, secret, code) error` | Enable TOTP |
 | `VerifyTOTP(ctx, userID, tenantID, code) (User, AuthTokens, error)` | TOTP second factor |
+| `StepUpTOTP(ctx, accessToken, code) (AuthTokens, error)` | Re-verify TOTP for the access token's session, move its `mfa_at` to now and mint a fresh access token — `POST /2fa/step-up`, see [Authentication context](#authentication-context--amr-auth_time-mfa_at-and-step-up) |
 | `DisableTOTP(ctx, userID, tenantID) error` | Disable TOTP |
 | `SendVerificationEmailToken(ctx, EmailVerificationInput) (string, error)` | Generate email verification token |
 | `VerifyEmail(ctx, VerifyEmailInput) error` | Mark email verified |
@@ -544,6 +545,9 @@ does.
 | `Tenants` | `[]Tenant` | Enriched by TenantStore |
 | `CustomClaims` | `map[string]any` | From the BuildTokenClaims hook; filled by `Me`, nil from `Authenticate` and `VerifyAccess` |
 | `CreatedAt`, `UpdatedAt` | `time.Time` | |
+| `AuthMethods` | `[]string` | The access token's `amr`; filled by `VerifyAccess` (the middleware) and `UserFromRS256Claims`, nil from a store — see [Authentication context](#authentication-context--amr-auth_time-mfa_at-and-step-up) |
+| `AuthTime` | `time.Time` | The access token's `auth_time`: when the session opened |
+| `MFAAt` | `time.Time` | The access token's `mfa_at`: the last second factor; zero when the session never presented one |
 
 ### `Session`
 
@@ -552,8 +556,15 @@ does.
 | `ID` | `string` | Session ID (format: `ses_<hex>`) |
 | `UserID`, `TenantID` | `string` | |
 | `RefreshTokenHash` | `string` | SHA-256 of refresh token |
+| `CreatedAt` | `time.Time` | When the session opened: its tokens' `auth_time` |
 | `ExpiresAt` | `time.Time` | |
 | `RevokedAt` | `*time.Time` | Non-nil = revoked |
+| `AuthMethods` | `[]string` | How the session was opened, RFC 8176 `amr` values; empty for a session opened before the field existed |
+| `MFAAt` | `*time.Time` | The last second factor; nil when none was presented |
+
+A `SessionStore` persists `AuthMethods` and `MFAAt` with the rest of the row.
+One that does not loses them on the first refresh, and the session's tokens then
+claim no method — which fails closed.
 
 ### `AuthTokens`
 
@@ -617,7 +628,8 @@ type SessionStore interface {
 | `RolesPermissionsStore` | `AddRoleToUser`, `RemoveRoleFromUser`, `GetRolesForUser`, `CreateRole`, `DeleteRole`, `AddPermissionToRole`, `RemovePermissionFromRole`, `GetPermissionsForRole`, `GetPermissionsForUser`, `UserHasPermission` | CreateRole, AssignRole, UserHasPermission |
 | `TenantStore` | `CreateTenant`, `GetTenantByID`, `GetAllTenants`, `UpdateTenant`, `DeleteTenant`, `AssociateUserWithTenant`, `DisassociateUserFromTenant`, `GetTenantsForUser`, `GetUsersForTenant` | CreateTenant, AddUserToTenant |
 | `UserAccountStore` | `UpdateProfile`, `DeleteUser` | UpdateProfile, DeleteAccount |
-| `SessionLookupStore` | `GetSessionByID` | SessionCheckOn=allcalls (`VerifyAccess`, `Authenticate`, `Me`) |
+| `SessionLookupStore` | `GetSessionByID` | SessionCheckOn=allcalls (`VerifyAccess`, `Authenticate`, `Me`), `StepUpTOTP` |
+| `SessionAuthenticationStore` | `RecordSecondFactor` | `StepUpTOTP` (`POST /2fa/step-up`); without it the route answers `501` |
 
 ---
 
@@ -628,7 +640,7 @@ All provided in the core package for development, testing, and embedded deployme
 | Type | Implements |
 |------|-----------|
 | `MemoryUserStore` | UserStore + UserPasswordStore + MagicLinkStore + SMSStore + TOTPStore + EmailVerificationStore + EmailChangeStore |
-| `MemorySessionStore` | SessionStore + SessionAdminStore |
+| `MemorySessionStore` | SessionStore + SessionAdminStore + SessionLookupStore + SessionAuthenticationStore |
 | `MemoryMetadataStore` | UserMetadataStore |
 | `MemoryRolesPermissionsStore` | RolesPermissionsStore |
 | `MemoryTenantStore` | TenantStore |
@@ -688,7 +700,9 @@ result is spread over the reference's six base claims (`sub`, `email`, `role`,
 the reference's `config.buildTokenPayload(user)` may (`auth.router.ts:378-384`). The
 session claims `sid`, `tid`, `jti`, `typ`, `iss`, `iat` and `exp` are reserved: they are
 written after the merge, so a builder value under one of those names is discarded
-rather than minted.
+rather than minted. So are `amr`, `auth_time` and `mfa_at`, the
+[authentication context](#authentication-context--amr-auth_time-mfa_at-and-step-up):
+deleted after the merge and written back on an access token from its session alone.
 
 ```go
 type TokenClaimsBuilder = func(ctx context.Context, user User) (map[string]any, error)
@@ -744,7 +758,8 @@ consumer's `security.jwt.extraClaims` table, `{claim: {fromUserField: <field>} |
 `loginProvider` (`"local"` when unset). Any other name — a credential column, a Go
 spelling, an enriched collection such as `roles` — is a constructor error, so a typo
 in configuration fails at startup and not on every login. So is a claim *name* that is
-one of the reserved session claims (`sid`, `tid`, `jti`, `typ`, `iss`, `iat`, `exp`):
+one of the reserved claims (`sid`, `tid`, `jti`, `typ`, `iss`, `iat`, `exp`, `amr`,
+`auth_time`, `mfa_at`):
 the mint would discard the mapping every time, and a mapping that can never reach a
 token is a configuration error, not a claim. Mapping over a base claim (`email`,
 `role`, ...) stays allowed. `StaticClaims` has no error to return, so a reserved name
@@ -821,8 +836,8 @@ The endpoint answers `2xx` with
 ```
 
 and the `claims` object is merged like any builder's result: it may override the six
-base claims and cannot set the reserved session claims, so a compromised endpoint
-cannot retype a token or rebind a session. **Anything else fails the mint** — the
+base claims and cannot set the reserved claims, so a compromised endpoint cannot
+retype a token, rebind a session or claim a second factor. **Anything else fails the mint** — the
 route answers the generic `500` any failing builder does, and `/me` logs and omits
 `customClaims`: a non-`2xx`, a transport error, the timeout (the caller's context
 deadline wins when shorter), a body over 64 KiB, a body that is not JSON, a missing
@@ -832,6 +847,92 @@ deliberate: a token minted without the claims the deployment configured would
 authorise less, or more, than the deployment decided.
 
 ---
+
+## Authentication context — `amr`, `auth_time`, `mfa_at` and step-up
+
+A session records how its user was proved, and every access token it mints
+carries that as three claims. A resource server can then decide on a recent
+second factor from the token alone, with no round trip:
+
+| Claim | Value |
+| --- | --- |
+| `amr` | RFC 8176 authentication methods, in the order presented; absent for a session that recorded none |
+| `auth_time` | when the session opened (`Session.CreatedAt`), a NumericDate |
+| `mfa_at` | when a second factor was last presented, a NumericDate; **absent** for a session that never presented one |
+
+What each way of opening a session records:
+
+| Opened by | `amr` | `mfa_at` |
+| --- | --- | --- |
+| `POST /login` (and a registration that opens a session, and the IdP's code exchange) | `["pwd"]` | — |
+| `POST /2fa/verify` | `["pwd","otp","mfa"]` | now |
+| `POST /sms/verify`, `mode: "2fa"` | `["pwd","sms","mfa"]` | now |
+| `POST /magic-link/verify`, `mode: "2fa"` | `["pwd","email","mfa"]` | now |
+| `POST /sms/verify`, a login of its own | `["sms"]` | — |
+| `POST /magic-link/verify`, a login of its own | `["email"]` | — |
+| the OAuth callback (which skips the second factor by design) | `["oauth"]` | — |
+| `POST /link-verify` with `loginAfterLinking` | `["email"]` | — |
+| `Service.IssueTokensForUser` (the proof is taken on trust) | — | — |
+
+`AMRPassword`, `AMROTP`, `AMRSMS`, `AMRMFA`, `AMREmail` and `AMROAuth` name the
+values, and `ClaimAMR`, `ClaimAuthTime` and `ClaimMFAAt` the claims. `pwd`,
+`otp`, `sms` and `mfa` are registered in RFC 8176. `email` and `oauth` are this
+library's names for the two methods the registry has no entry for.
+
+**They are reserved.** `Config.BuildTokenClaims`, and so a `ClaimsWebhook`,
+cannot set any of the three on any token: they are deleted after the hook
+merge and written back on an access token from its session alone. A
+`UserFieldClaims` mapping onto one fails at startup. A refresh token, the
+step-up token, the enrolment token and the IdP's RS256 pair carry none of them.
+The admin console's own login, which skips the second factor by design, mints a
+token of another type that carries none either.
+
+**They are carried forward.** `POST /refresh` and the IdP's `refresh_token`
+grant mint from the session row, so all three come through every rotation
+unchanged.
+
+**The principal exposes them.** `VerifyAccess`, and so every adapter's
+`Middleware`, fills `User.AuthMethods`, `User.AuthTime` and `User.MFAAt`, as
+`UserFromRS256Claims` does on the resource-server path. `MFAAt` is zero when
+there was no second factor, so a check reads:
+
+```go
+user, _ := nethttp.UserFromContext(r.Context())
+if user.MFAAt.IsZero() || time.Since(user.MFAAt) > 5*time.Minute {
+    // ask for a step-up
+}
+```
+
+### `POST <prefix>/2fa/step-up`
+
+The signed-in user presents a TOTP code again, for the session the access token
+belongs to:
+
+```
+POST /auth/2fa/step-up   {"totpCode":"123456"}   (access cookie + X-CSRF-Token, or Authorization: Bearer)
+  → 200 {"success":true}                 + a fresh access cookie, in cookie mode
+  → 200 {"success":true,"accessToken":…}  under X-Auth-Strategy: bearer
+```
+
+`mfa_at` moves to now, `amr` gains `otp` and `mfa`, and only the access token is
+re-minted. The refresh token is not rotated and its cookie is not touched; the
+next refresh carries the new `mfa_at` forward. The route sits behind the access
+middleware like the other protected routes, and it validates the session
+whatever `SessionCheckOn` says, because it writes to it. So a logged-out session
+is `401 SESSION_REVOKED` even under the default `refresh` check. Its other
+answers are `/2fa/verify`'s: `401 "Invalid TOTP code"`, and
+`400 "User not found or 2FA not set up"` for an account without TOTP. It raises
+no event. As on `/2fa/verify`, a code is not remembered, so the same code works
+again within its window. Resource-server mode unmounts it with the other
+credential routes.
+
+The write goes through `SessionAuthenticationStore.RecordSecondFactor`, not
+`UpdateSession`: it writes the two fields alone and refuses a revoked session in
+the same atomic step. A step-up therefore can never write back a refresh-token
+hash a concurrent refresh rotated out, or clear the revocation a concurrent
+logout set. A session store without it answers `501`. `MemorySessionStore`
+implements it. A DynamoDB store implements it as one `UpdateItem` conditioned on
+the item existing and carrying no revocation, with `ReturnValues: ALL_NEW`.
 
 ## OAuth 2.0 + Account Linking
 
@@ -2733,7 +2834,7 @@ cfg.ResourceServer = true
 nethttp.MountWithConfig(mux, a, cfg)
 ```
 
-The adapters then register **none** of the nineteen routes that mint, deliver or
+The adapters then register **none** of the twenty routes that mint, deliver or
 consume a credential, so each answers `404` from the router:
 
 ```
@@ -2745,13 +2846,13 @@ POST   /forgot-password            POST   /2fa/setup
 POST   /reset-password             POST   /2fa/verify-setup
 POST   /change-password            POST   /2fa/verify
 POST   /send-verification-email    POST   /2fa/disable
-GET    /verify-email
+GET    /verify-email               POST   /2fa/step-up
 POST   /change-email/request
 POST   /change-email/confirm
 ```
 
 `ResourceServerGatedRoutes()` returns that list (a fresh map each call).
-`OpenAPIInfo.ResourceServer` drops the same nineteen **operations** from
+`OpenAPIInfo.ResourceServer` drops the same twenty **operations** from
 `GenerateOpenAPISpec` — the method, not the whole path item, so a path that ever
 gains a second, ungated method keeps it — and the published spec and the mount
 then agree. Set the two together.
@@ -2782,7 +2883,8 @@ know about an IdP; `OIDCMount.ResourceServerGated` names them instead.
 > `/login`, `/logout`, `/refresh`, `/register`, `/forgot-password`,
 > `/reset-password` (`auth.router.ts:510`, `:541`, `:590`, `:622`, `:713`,
 > `:777`, `:802`) — and leaves the other thirteen mounted over a database it has
-> just declared absent. This port gates all nineteen; see
+> just declared absent. This port gates all twenty — the nineteen it shares
+> with the reference and its own `/2fa/step-up`; see
 > `resource-server-gates-all-credential-routes` in the README's deviations
 > section. To match the reference exactly, leave `ResourceServer` unset and use
 > the middleware alone.
@@ -2845,7 +2947,7 @@ envelope, the per-route error catalog entries, the `X-Auth-Strategy` and
 `X-CSRF-Token` headers, and both the bearer and cookie security schemes. Set
 `APIPrefix` to whatever you passed to `MountWithConfig`; a mismatch documents
 paths the server does not serve. Set `ResourceServer` to whatever you passed as
-`HTTPConfig.ResourceServer`: it drops the nineteen credential operations the adapters
+`HTTPConfig.ResourceServer`: it drops the twenty credential operations the adapters
 then leave unmounted (see [Resource server mode](#resource-server-mode)). Set
 `IDProvider` and `OIDC` when the `Auth` was built `WithIDP`: they add the JWKS
 route and the four OIDC endpoints the adapters then mount — `ResourceServer`

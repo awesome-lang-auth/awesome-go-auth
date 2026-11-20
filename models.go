@@ -73,6 +73,18 @@ type User struct {
 	CustomClaims                 map[string]any
 	CreatedAt                    time.Time
 	UpdatedAt                    time.Time
+	// AuthMethods, AuthTime and MFAAt describe how the session behind an access
+	// token was authenticated: its amr, auth_time and mfa_at claims. They are
+	// filled only on a principal built from a verified token — Auth.VerifyAccess,
+	// and so the adapters' Middleware, and UserFromRS256Claims — and are zero on
+	// a user read from a store, which records no authentication. MFAAt is zero
+	// when the session never presented a second factor, so a check such as
+	// time.Since(u.MFAAt) < 5*time.Minute refuses such a principal on its own.
+	// None of the three is persisted by a UserStore or projected onto
+	// PublicUser.
+	AuthMethods []string
+	AuthTime    time.Time
+	MFAAt       time.Time
 }
 
 // LoginProviderLocal is the loginProvider a user without a recorded provider is
@@ -182,9 +194,30 @@ type Session struct {
 	UserID           string
 	TenantID         string
 	RefreshTokenHash string
-	CreatedAt        time.Time
-	ExpiresAt        time.Time
-	RevokedAt        *time.Time
+	// CreatedAt is when the session was opened, which is when its user
+	// authenticated: the auth_time claim of every access token the session
+	// mints, refresh after refresh.
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	RevokedAt *time.Time
+	// AuthMethods are the authentication methods the session was opened with,
+	// as RFC 8176 amr values (AMRPassword, AMROTP, AMRSMS, AMREmail, AMROAuth,
+	// and AMRMFA when more than one factor was presented): the amr claim of
+	// every access token the session mints. POST <prefix>/2fa/step-up adds
+	// AMROTP and AMRMFA. Empty for a session opened before the field existed,
+	// or by a path that cannot say how its user was proved
+	// (Service.IssueTokensForUser), and then the tokens carry no amr at all
+	// rather than a guess.
+	//
+	// A SessionStore persists it with the rest of the row. One that does not
+	// loses it on the first refresh, which fails closed: the tokens stop
+	// claiming any method, so a check for a second factor refuses them.
+	AuthMethods []string
+	// MFAAt is when the session last presented a second factor — at the login
+	// that opened it, or at POST <prefix>/2fa/step-up since — and nil for a
+	// session that never presented one: the mfa_at claim, absent when nil. The
+	// same persistence rule applies.
+	MFAAt *time.Time
 }
 
 // AuthTokens are the issued access/refresh pair.
@@ -250,6 +283,13 @@ type SMSCodeVerifyInput struct {
 	Email    string
 	TenantID string
 	Code     string
+	// SecondFactor says the code is the second factor of a password login: the
+	// caller identified UserID from a verified step-up token, as the step-up
+	// branch of POST <prefix>/sms/verify does. The session then records it
+	// (amr ["pwd","sms","mfa"] and an mfa_at); without it the code is a login
+	// of its own (amr ["sms"]). Set it only after verifying that token — it is
+	// what tells a resource server a second factor was presented.
+	SecondFactor bool
 }
 
 type ChangePasswordInput struct {

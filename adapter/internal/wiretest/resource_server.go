@@ -17,7 +17,7 @@ import (
 // Resource-server mode has two halves and this file pins both for every
 // adapter.
 //
-// The first is subtractive: HTTPConfig.ResourceServer leaves the nineteen
+// The first is subtractive: HTTPConfig.ResourceServer leaves the twenty
 // credential routes unregistered, so each answers 404 while the rest of the
 // surface is untouched. That is testResourceServerGating, plus the
 // resourceServerRouteSet registered in conditionalRoutes, which additionally

@@ -159,7 +159,8 @@ func TestUserFieldClaims_RejectsEmptyClaimNames(t *testing.T) {
 }
 
 // TestUserFieldClaims_RejectsReservedClaimNames: a mapping onto sid, tid, jti,
-// typ, iss, iat or exp would be discarded by issueToken on every mint, so the
+// typ, iss, iat, exp, amr, auth_time or mfa_at would be discarded by mintToken
+// on every mint, so the
 // constructor refuses it — the silent-configuration failure the allowlist
 // exists to prevent, on the claim side rather than the field side. The base
 // claims are not reserved: mapping over email or role is the reference's own
@@ -197,11 +198,12 @@ func TestUserFieldClaims_RejectsReservedClaimNames(t *testing.T) {
 }
 
 // TestReservedClaimNames_MatchIssueToken ties the constructor's list to the
-// mint: every name UserFieldClaims refuses is one issueToken overwrites, and
-// the list is exactly the seven the docs and the CHANGELOG name — so neither
-// can drift from the other without a test noticing.
+// mint: every name UserFieldClaims refuses is one mintToken owns, and the list
+// is exactly the ten the docs and the CHANGELOG name — the seven session
+// claims and the three of the authentication context — so neither can drift
+// from the other without a test noticing.
 func TestReservedClaimNames_MatchIssueToken(t *testing.T) {
-	const documented = "sid,tid,jti,typ,iss,iat,exp"
+	const documented = "sid,tid,jti,typ,iss,iat,exp,amr,auth_time,mfa_at"
 	if got := strings.Join(reservedClaimNames, ","); got != documented {
 		t.Fatalf("reservedClaimNames = %s, want %s (update issueToken, the docs and this test together)", got, documented)
 	}

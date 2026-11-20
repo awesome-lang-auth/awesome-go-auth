@@ -169,7 +169,7 @@ func MountWithConfig(r chi.Router, a *auth.Auth, cfg auth.HTTPConfig) {
 	}
 }
 
-// mountCredentialRoutes registers the nineteen routes that create, prove,
+// mountCredentialRoutes registers the twenty routes that create, prove,
 // deliver or change a credential — auth.ResourceServerGatedRoutes, which is the
 // same list and carries the reasoning. HTTPConfig.ResourceServer is the switch
 // that skips this call.
@@ -188,6 +188,7 @@ func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(h
 	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+"/2fa/verify-setup", h.TwoFactorVerifySetup)
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/2fa/verify", h.TwoFactorVerify)
 	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+"/2fa/disable", h.TwoFactorDisable)
+	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+auth.StepUpRoute, h.TwoFactorStepUp)
 	// Password management and email verification (wire-contract §2).
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/forgot-password", h.ForgotPassword)
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/reset-password", h.ResetPassword)

@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The authentication context on every access token: `amr`, `auth_time` and
+  `mfa_at`.** A session now records how its user was proved —
+  `Session.AuthMethods` (RFC 8176 values) and `Session.MFAAt` (the last second
+  factor) — and every access token it mints carries them, with `auth_time`
+  from `Session.CreatedAt`. A password login is `["pwd"]`; `/2fa/verify` is
+  `["pwd","otp","mfa"]` with `mfa_at`; the SMS and magic-link step-up branches
+  are `["pwd","sms","mfa"]` and `["pwd","email","mfa"]` with `mfa_at`; the same
+  two routes as logins of their own are `["sms"]` and `["email"]`; the OAuth
+  callback is `["oauth"]`; `/link-verify` is `["email"]`; the IdP's code
+  exchange is `["pwd"]`. Only a verified second factor writes `mfa_at`, so the
+  OAuth callback and the admin console's login — both registered as skipping it
+  — never carry one. `POST <prefix>/refresh` and the IdP's `refresh_token` grant
+  carry all three forward unchanged. `Auth.VerifyAccess`, and so every adapter's
+  `Middleware`, exposes them on the principal as `User.AuthMethods`,
+  `User.AuthTime` and `User.MFAAt`, as `UserFromRS256Claims` does for a resource
+  server. New constants: `AMRPassword`, `AMROTP`, `AMRSMS`, `AMRMFA`,
+  `AMREmail`, `AMROAuth`, `ClaimAMR`, `ClaimAuthTime`, `ClaimMFAAt`.
+- **`POST <prefix>/2fa/step-up`** on all four adapters: an access token and
+  `{"totpCode"}` re-verify TOTP for that session, move its `mfa_at` to now, add
+  `otp` and `mfa` to its `amr`, and deliver a fresh access token alone — the
+  access cookie, or `accessToken` under `X-Auth-Strategy: bearer` (the new
+  `HTTPConfig.WriteAccessToken`); the refresh token is not rotated. The session
+  is validated whatever `SessionCheckOn` says. `Service.StepUpTOTP` (and the
+  `Auth` delegate), `StepUpRoute`, `StepUpRequest` and `StepUpHTTPError` are
+  the pieces. The write goes through the new optional
+  `SessionAuthenticationStore.RecordSecondFactor`, which writes those two
+  fields alone and refuses a revoked session atomically, so a step-up can never
+  revive a rotated-out refresh token or a revoked session; without it the route
+  answers `501`. `MemorySessionStore` implements it. The route is a credential
+  route, so `HTTPConfig.ResourceServer` unmounts it with the others
+  (`ResourceServerGatedRoutes` now lists twenty).
+- `SMSCodeVerifyInput.SecondFactor`: set by the adapters on the step-up branch
+  of `/sms/verify`, it records the code as the second factor of a password
+  login rather than a login of its own.
+- Registered as the deviation `access-tokens-carry-the-authentication-context`.
+
+### Changed
+- **BREAKING (configuration) — `amr`, `auth_time` and `mfa_at` are reserved
+  claims.** A `Config.BuildTokenClaims` hook, or a `ClaimsWebhook`, that
+  returned one of them no longer reaches any token: the three are deleted after
+  the merge and written back on an access token from its session. A
+  `UserFieldClaims` mapping onto one of them is now a constructor error, as a
+  mapping onto `sid` or `exp` already was. The IdP's RS256 pair
+  (`IssueIdPTokenPair`), which has no session, carries none of the three, so a
+  hook value can no longer reach a resource server that way either.
+- A `SessionStore` should persist the two new `Session` fields. One that does
+  not keeps working and fails closed: its sessions' tokens carry `auth_time`
+  and no `amr` or `mfa_at` after the first refresh.
+
 ## [0.13.0] - 2026-11-20
 
 Parity fixes from the audit against `@awesome-lang-auth/node` 1.10.8, a

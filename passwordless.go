@@ -147,7 +147,10 @@ func (s *Service) VerifyMagicLinkForUser(ctx context.Context, in MagicLinkVerify
 	if user.ID != userID {
 		return User{}, AuthTokens{}, ErrMagicLinkOwnerMismatch
 	}
-	tokens, err := s.CompleteMagicLinkLogin(ctx, user)
+	// The link is the second factor of a password login here, not a login of
+	// its own: the step-up token that named userID is only ever minted after
+	// the password verified.
+	tokens, err := s.completeMagicLinkLogin(ctx, user, authBySecondFactor(AMRPassword, AMREmail))
 	if err != nil {
 		return User{}, AuthTokens{}, err
 	}
