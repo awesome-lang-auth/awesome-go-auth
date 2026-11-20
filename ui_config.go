@@ -214,10 +214,13 @@ type UIConfigBranding struct {
 // actually perform the thing, which is why they are derived from the wiring
 // rather than configured.
 //
-//   - register is always true. The reference mounts POST /register only when
+//   - register follows HTTPConfig.ClosedRegistration: false when it is set,
+//     true otherwise. The reference mounts POST /register only when
 //     routerOptions.onRegister is supplied and reports that same condition here
-//     (auth.router.ts:712-715, ui.router.ts:115); this port always mounts the
-//     route, so the honest answer about the routes it serves is always true.
+//     (auth.router.ts:712-715, ui.router.ts:115); this port mounts the route
+//     unless the deployment closed registration, and reports that. It does not
+//     follow HTTPConfig.ResourceServer, which unmounts the route too — the
+//     reference's flag does not follow its resource-server mode either.
 //     Registered as the deviation register-route-is-always-mounted.
 //   - magicLink, sms, forgotPassword and verifyEmail follow the delivery seam:
 //     Config.SendMagicLink, Config.SendSMSCode, Config.SendPasswordReset and
@@ -327,7 +330,7 @@ func (a *Auth) uiConfig(ctx context.Context, r *http.Request, cfg HTTPConfig) (U
 	}
 	return UIConfig{
 		APIPrefix:    cfg.Prefix(),
-		Features:     a.uiFeatures(),
+		Features:     a.uiFeatures(cfg),
 		UI:           uiBranding(cfg.UI, settings),
 		Translations: translations,
 		Lang:         lang,
@@ -403,12 +406,14 @@ func (a *Auth) uiTranslations(ctx context.Context, lang string) (map[string]stri
 	return map[string]string{}, nil
 }
 
-// uiFeatures derives the features object from the wiring. See UIFeatures for
-// what each flag means and where the reference reads it.
-func (a *Auth) uiFeatures() UIFeatures {
+// uiFeatures derives the features object from the wiring: the service's
+// configuration, and the one wire flag that decides a feature —
+// HTTPConfig.ClosedRegistration. See UIFeatures for what each flag means and
+// where the reference reads it.
+func (a *Auth) uiFeatures(wire HTTPConfig) UIFeatures {
 	cfg := a.service.cfg
 	return UIFeatures{
-		Register:       true,
+		Register:       !wire.ClosedRegistration,
 		MagicLink:      cfg.SendMagicLink != nil,
 		SMS:            cfg.SendSMSCode != nil,
 		Google:         a.oauthProviderConfigured("google"),

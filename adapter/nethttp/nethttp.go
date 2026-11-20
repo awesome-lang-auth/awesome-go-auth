@@ -203,9 +203,12 @@ func (a *Adapter) Mount(mux *http.ServeMux) {
 // mountCredentialRoutes registers the nineteen routes that create, prove,
 // deliver or change a credential — auth.ResourceServerGatedRoutes, which is the
 // same list and carries the reasoning. HTTPConfig.ResourceServer is the switch
-// that skips this call.
+// that skips this call, and HTTPConfig.ClosedRegistration the one that skips
+// POST /register alone (auth.HTTPConfig.RegisterMounted).
 func (a *Adapter) mountCredentialRoutes(mux *http.ServeMux, prefix string) {
-	mux.Handle("POST "+prefix+"/register", a.guard(http.HandlerFunc(a.Register)))
+	if a.cfg.RegisterMounted() {
+		mux.Handle("POST "+prefix+auth.RegisterRoute, a.guard(http.HandlerFunc(a.Register)))
+	}
 	mux.Handle("POST "+prefix+"/login", a.guard(http.HandlerFunc(a.Login)))
 	mux.Handle("POST "+prefix+"/refresh", a.guard(http.HandlerFunc(a.Refresh)))
 	mux.Handle("POST "+prefix+"/logout", a.guard(http.HandlerFunc(a.Logout)))

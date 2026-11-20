@@ -89,6 +89,12 @@ type OpenAPIInfo struct {
 	// the adapters then leave unmounted are left out of the spec too. Set the
 	// two together, or the spec documents routes that answer 404.
 	ResourceServer bool
+	// ClosedRegistration mirrors HTTPConfig.ClosedRegistration: POST
+	// <prefix>/register, which the adapters then leave unmounted, is left out
+	// of the spec too. Set the two together, or the spec documents a sign-up
+	// route that answers 404. Under ResourceServer the route is already gone,
+	// so setting both is harmless.
+	ClosedRegistration bool
 	// UI mirrors HTTPConfig.UI.Enabled: it adds GET <prefix>/ui/config, the
 	// document the built-in UI reads its branding and feature flags from. The
 	// adapters mount that route only under that flag, so set the two together.
@@ -274,6 +280,12 @@ func openAPIPathsFor(info OpenAPIInfo) map[string]any {
 		for route, method := range ResourceServerGatedRoutes() {
 			removeOpenAPIOperation(paths, prefix+route, method)
 		}
+	}
+	// Closed registration takes away the one route the adapters skip under
+	// HTTPConfig.ClosedRegistration. Under ResourceServer it is already gone,
+	// and removing an operation that is not there is a no-op.
+	if info.ClosedRegistration {
+		removeOpenAPIOperation(paths, prefix+RegisterRoute, http.MethodPost)
 	}
 	// A JWKSPath colliding with a route this document still describes would
 	// otherwise replace it silently, dropping a real endpoint from the spec.

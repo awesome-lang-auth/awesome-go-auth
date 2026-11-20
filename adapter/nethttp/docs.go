@@ -22,16 +22,18 @@ import (
 // writes it to a file at build time, needs exactly this value. APIPrefix is the
 // documented base path: the mount prefix, unless DocsOptions.BasePath moves the
 // description somewhere else — which is what that option is for, so this one
-// field is allowed to differ from the mount and says so. IDProvider, JWKSPath
-// and ResourceServer are read off the mount itself and cannot disagree with it.
+// field is allowed to differ from the mount and says so. IDProvider, JWKSPath,
+// ResourceServer and ClosedRegistration are read off the mount itself and
+// cannot disagree with it.
 // Title, Description, Version and ServerURL are left at their defaults: they
 // name the host's API, not this library, so a caller that wants them fills them
 // in on the copy.
 func (a *Adapter) OpenAPIInfo() auth.OpenAPIInfo {
 	info := auth.OpenAPIInfo{
-		APIPrefix:      a.cfg.DocsBasePath(),
-		ResourceServer: a.cfg.ResourceServer,
-		Docs:           a.cfg.Docs.Enabled,
+		APIPrefix:          a.cfg.DocsBasePath(),
+		ResourceServer:     a.cfg.ResourceServer,
+		ClosedRegistration: a.cfg.ClosedRegistration,
+		Docs:               a.cfg.Docs.Enabled,
 	}
 	if idp := a.auth.IDP(); idp != nil {
 		info.IDProvider = true

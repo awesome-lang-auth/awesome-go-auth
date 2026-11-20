@@ -775,16 +775,22 @@ func CompatibilityNotes() APICompatibilityNotes {
 			},
 			{
 				ID:      "register-route-is-always-mounted",
-				Title:   "`POST <prefix>/register` is unconditional, and `ui/config` reports it as such",
-				Surface: "`POST <prefix>/register`, and the `features.register` flag of `GET <prefix>/ui/config`",
-				Behaviour: "Registration is part of the library rather than a hook the host supplies: " +
-					"every adapter mounts `POST <prefix>/register` on `Service.Register` on every " +
-					"deployment, and `GET <prefix>/ui/config` answers `features.register: true` to " +
-					"match. Resource-server mode is the one thing that unmounts the route, with " +
-					"the rest of the credential set — see " +
-					"`resource-server-gates-all-credential-routes` — and the flag does not follow " +
-					"it there, which is what the reference does too for a resource server that " +
-					"supplied the hook.",
+				Title:   "`POST <prefix>/register` is mounted unless registration is closed, and `ui/config` reports which",
+				Surface: "`POST <prefix>/register`, the `features.register` flag of `GET <prefix>/ui/config`, and `HTTPConfig.ClosedRegistration`",
+				Behaviour: "Registration is part of the library rather than a hook the host supplies, " +
+					"so the route's presence is a configuration flag rather than the presence of a " +
+					"function. By default every adapter mounts `POST <prefix>/register` on " +
+					"`Service.Register` and `GET <prefix>/ui/config` answers " +
+					"`features.register: true` to match. With `HTTPConfig.ClosedRegistration` set, " +
+					"no adapter mounts the route — it answers the router's `404` — " +
+					"`features.register` answers `false`, the built-in UI hides its sign-up link " +
+					"and the served OpenAPI document leaves the path out, which is the reference's " +
+					"hookless deployment on every surface. `Service.Register` stays callable by " +
+					"the host either way, for invitations and admin-created accounts. " +
+					"Resource-server mode also unmounts the route, with the rest of the credential " +
+					"set — see `resource-server-gates-all-credential-routes` — and the flag does " +
+					"not follow it there, which is what the reference does too for a resource " +
+					"server that supplied the hook.",
 				Reference: "Mounts `/register` only when `routerOptions.onRegister` is supplied, the " +
 					"host having written the account-creation function itself, and reports " +
 					"`!!routerOptions?.onRegister` in `features.register`. A deployment that " +
@@ -794,19 +800,30 @@ func CompatibilityNotes() APICompatibilityNotes {
 				Why: "This port ships registration instead of asking for it: `Service.Register` " +
 					"applies the password policy, hashes the password, applies the email " +
 					"verification mode and writes through `UserStore`. There is no hook that can " +
-					"be absent, so there is nothing for the route's presence to be conditional on, " +
-					"and the flag — derived from the wiring rather than configured — answers for " +
-					"the routes this port actually serves. The difference runs one way only: a " +
-					"client is offered sign-up against a deployment whose node-auth counterpart, " +
-					"having no `onRegister`, would have hidden it.",
-				Notes: []DeviationNote{{
-					Label: "Matching the reference exactly",
-					Text: "Not available from configuration. A host that wants no public sign-up " +
-						"mounts the adapter on its own mux and refuses `POST <prefix>/register` " +
-						"there, or runs in resource-server mode; `features.register` still answers " +
-						"`true` in the first case, so such a host hides the affordance in its own " +
-						"UI rather than reading the flag.",
-				}},
+					"be absent, so the hookless deployment is reached through a flag instead, and " +
+					"the default stays what every earlier release served: the route mounted and " +
+					"the flag `true`. The difference that remains runs one way only: a deployment " +
+					"that sets nothing offers sign-up where its node-auth counterpart, having no " +
+					"`onRegister`, would have hidden it.",
+				Notes: []DeviationNote{
+					{
+						Label: "Matching the reference exactly",
+						Text: "Set `HTTPConfig.ClosedRegistration` for the reference's deployment without " +
+							"`onRegister`: `404` on `POST <prefix>/register`, `features.register: false`, " +
+							"and no path item in the document `OpenAPIInfo.ClosedRegistration` " +
+							"generates. Leave it unset for the deployment that supplied the hook.",
+					},
+					{
+						Label: "What it does not close",
+						Text: "An OAuth callback creates an account for a provider identity nothing here " +
+							"knows yet whenever `OAuthProvisioning.AutoCreate` is on, which it is in " +
+							"`DefaultOAuthProvisioning` — a second self-registration path the flag does " +
+							"not touch. A deployment that wants accounts created only by its own hand " +
+							"sets `AutoCreate: false` too, or configures no provider. The built-in " +
+							"UI's `<prefix>/ui/register` page is still served, as the reference serves " +
+							"it without a hook; its form posts to the route that is gone.",
+					},
+				},
 			},
 			{
 				ID:    "docs-routes-are-opt-in",

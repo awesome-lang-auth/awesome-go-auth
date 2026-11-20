@@ -93,7 +93,7 @@ func MountWithConfig(r chi.Router, a *auth.Auth, cfg auth.HTTPConfig) {
 	}
 
 	if !resolved.ResourceServer {
-		mountCredentialRoutes(r, h, guard, prefix)
+		mountCredentialRoutes(r, h, guard, prefix, resolved.RegisterMounted())
 	}
 	// /me authenticates itself (nethttp's Me) rather than sitting behind the
 	// auth middleware, so the claims hook runs once and the token is verified once.
@@ -172,9 +172,12 @@ func MountWithConfig(r chi.Router, a *auth.Auth, cfg auth.HTTPConfig) {
 // mountCredentialRoutes registers the nineteen routes that create, prove,
 // deliver or change a credential — auth.ResourceServerGatedRoutes, which is the
 // same list and carries the reasoning. HTTPConfig.ResourceServer is the switch
-// that skips this call.
-func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(http.Handler) http.Handler, prefix string) {
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/register", h.Register)
+// that skips this call, and HTTPConfig.ClosedRegistration the one that skips
+// POST /register alone: register is auth.HTTPConfig.RegisterMounted.
+func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(http.Handler) http.Handler, prefix string, register bool) {
+	if register {
+		r.With(guard).MethodFunc(http.MethodPost, prefix+auth.RegisterRoute, h.Register)
+	}
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/login", h.Login)
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/refresh", h.Refresh)
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/logout", h.Logout)
