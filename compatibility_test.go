@@ -58,6 +58,7 @@ var wantDeviationIDs = []string{
 	"admin-credential-listings-are-ordered",
 	"admin-guard-accepts-only-typed-session-tokens",
 	"admin-listings-are-ordered-by-id",
+	"admin-machine-access-is-a-host-seam",
 	"admin-promote-route-comes-from-the-development-line",
 	"admin-unauthenticated-get-serves-only-the-login-form",
 	"admin-upload-base-url-is-derived-from-the-mount",
@@ -341,6 +342,20 @@ var wantClaims = map[string][]string{
 		"UserLookupStore", "FindUserByID", "MemoryUserStore", "GetUserByID(id, \"\")",
 		"404", "User not found", "findById", "tid", "501", "two tenants",
 		"<tenantID>#<id>", "DELETE <admin>/api/users/{id}", "method=flag",
+		// The two writes moved onto the seam, and the one answer that must not
+		// move with them: an unknown id still reaches the store in the empty
+		// tenant and gets its 500.
+		"the empty tenant when the store has no lookup", "500",
+	},
+	// The seam, the three outcomes of the function, what the machine path does
+	// not read, the audit event and its two caveats, and the reference's two
+	// arms — so that an entry reduced to "machines can call the admin API"
+	// would fail, as would one that lost the audit or the ordering.
+	"admin-machine-access-is-a-host-seam": {
+		"AdminOptions.MachineAccess", "before the session policy", "AdminMachinePrincipalFromContext",
+		"identity.admin.machine.access", "empty principal", "no cookie", "CSRF", "EventNames",
+		"no event bus", "adminSecret", "AdminMounted", "AdminPredicate",
+		"browser originated", "Sec-Fetch-Site", "Config.Logger",
 	},
 	// M9's guard, and the one entry of this milestone that declines a reference
 	// default outright. The claims keep the refusal, the three things a mount

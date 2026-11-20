@@ -352,6 +352,56 @@ type AdminOptions struct {
 	// admin-promote-route-comes-from-the-development-line deviation, which
 	// covers the route and this slot together.
 	RateLimiter func(http.Handler) http.Handler
+	// MachineAccess admits a machine caller — a back-office service, not a
+	// person — to the guarded admin routes on a credential the host verifies
+	// itself: an IAM-signed request behind an API gateway, a mutual-TLS peer, a
+	// scoped API key. It is called for every request that reaches the guard,
+	// before the session policy and before the legacy secret, and answers who
+	// is calling and whether to let it in.
+	//
+	//   - ok true with a non-empty principal grants the request. No token is
+	//     read, no cookie, no user store and no policy: the host's answer is the
+	//     whole decision. AdminMachinePrincipalFromContext reports the principal
+	//     to the handler, AdminUserFromContext reports no user, and
+	//     EventAdminMachineAccess is raised with the principal, the method and
+	//     the path — the audit trail of every machine-authenticated call.
+	//   - ok false falls through to the session policy exactly as if this field
+	//     were nil, so a person signed into the console is unaffected.
+	//   - ok true with an empty principal grants nothing and falls through too,
+	//     logged through Config.Logger: an audit record that names nobody is not
+	//     one, and the host's function is the thing to fix.
+	//
+	// The machine path reads no cookie, so a machine caller needs no CSRF
+	// pair; the admin router has no double-submit layer to exempt it from, and
+	// the function must not authenticate by a credential a browser presents on
+	// its own either, or it would turn an operator's browser into a machine
+	// caller that any web page can drive with a cross-site form post. A cookie
+	// is one such ambient credential; so are a client TLS certificate the
+	// browser holds and the network position of a browser on the internal
+	// network (an IP allow-list, "inside the VPC"). Whatever the function
+	// trusts — a header a gateway sets after verifying a signature, a value an
+	// outer middleware put on the request context — must be something neither
+	// an internet caller nor a browser can produce unasked, which is the
+	// host's guarantee and not this package's.
+	//
+	// As a backstop the function is not asked at all about a request a
+	// browser originated: one that carries an Origin header, or a
+	// Sec-Fetch-Site header other than "none". Browsers send them on every
+	// cross-site request, and machine clients do not; such a request is left
+	// to the session policy, as if this field were nil.
+	//
+	// A function that verifies a signature over the request body must leave
+	// r.Body readable for the handler: read it, then put back an equivalent
+	// reader (io.NopCloser(bytes.NewReader(body))).
+	//
+	// It does not mount the console on its own: AdminMounted still needs an
+	// AccessPolicy or a Secret. A deployment that wants machine access only
+	// configures a policy that admits no session, such as
+	// AdminPredicate(func(context.Context, User, RolesPermissionsStore) (bool, error) { return false, nil }).
+	//
+	// Nil, the default, is the reference's guard exactly. See the
+	// admin-machine-access-is-a-host-seam deviation.
+	MachineAccess func(*http.Request) (principal string, ok bool)
 }
 
 // AdminPath is AdminOptions.Path resolved: the configured value normalised the
@@ -557,6 +607,13 @@ func (g *AdminGuard) ProtectShell(next http.Handler) http.Handler {
 // has already been written.
 func (g *AdminGuard) authorise(w http.ResponseWriter, r *http.Request) (context.Context, adminOutcome) {
 	ctx := r.Context()
+
+	// The machine path, before either guard (admin_machine.go). A host
+	// function that admits the request is the whole decision; one that does
+	// not leaves the request to the guards below, untouched.
+	if granted, machineCtx := g.machineAccess(r); granted {
+		return machineCtx, adminGranted
+	}
 
 	// The legacy guard (adminAuth, admin.router.ts:252-266): a bearer token
 	// compared against the configured secret, 401 when absent and 403 when

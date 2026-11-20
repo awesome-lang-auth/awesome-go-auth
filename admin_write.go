@@ -306,20 +306,22 @@ func (a *Auth) serveAdminWrite(w http.ResponseWriter, r *http.Request, cfg HTTPC
 // satisfy it; that pairing is Service.DeleteAccount's already and is not
 // re-litigated on an admin route.
 //
-// The tenant is "", because the reference's deleteUser(id) carries none, and
-// UserStore reads "" as an ordinary tenant value rather than as a wildcard. So
-// in a deployment that stores users under a non-empty tenant this route deletes
-// nothing the listing above it shows. That is the gap GET /api/users/:id had,
-// and UserLookupStore is the seam that closed it there (adminFindUser). A write
-// that resolves its tenant through it first changes which row the write
-// reaches, which is this file's invariant, and this route does not do that yet.
+// The reference's deleteUser(id) carries no tenant, and UserStore's does: it
+// reads "" as an ordinary tenant value rather than as a wildcard. So the tenant
+// is resolved first, through UserLookupStore — the seam that made GET
+// /api/users/:id find a user the listing shows in any tenant — and the delete
+// goes to the row the lookup found (adminUserTenant). A store without the
+// capability, and an id no tenant holds, keep the empty tenant this route
+// always passed, so a single-tenant deployment and an unknown id answer
+// exactly as before. Only the tenant is looked up: the route still answers no
+// 404 of its own, and still deletes one row and nothing attached to it.
 func (a *Auth) adminDeleteUser(w http.ResponseWriter, r *http.Request, id string) {
 	store, ok := a.service.users.(UserAccountStore)
 	if !ok {
 		writeAdminError(w, http.StatusNotImplemented, "IUserStore.deleteUser is not implemented")
 		return
 	}
-	if err := store.DeleteUser(r.Context(), id, ""); err != nil {
+	if err := store.DeleteUser(r.Context(), id, a.adminUserTenant(r.Context(), id)); err != nil {
 		writeAdminError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
