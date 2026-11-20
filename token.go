@@ -117,7 +117,10 @@ func (s *Service) issueToken(ctx context.Context, user User, sessionID, tokenTyp
 	payloadClaims["iat"] = now.Unix()
 	payloadClaims["exp"] = expiresAt.Unix()
 
-	token, err := buildHS256JWT(payloadClaims, s.cfg.Secret)
+	// A refresh token is signed with Config.RefreshSecret when one is set, as
+	// the reference signs it with refreshTokenSecret (token.service.ts:25-29);
+	// every other type, and a refresh token without one, with Config.Secret.
+	token, err := buildHS256JWT(payloadClaims, s.cfg.secretFor(tokenType))
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -138,7 +141,10 @@ func (s *Service) parseToken(token, expectedType string) (tokenClaims, error) {
 	if alg, ok := headerAlg(rawHeader); !ok || alg != tokenAlg {
 		return claims, ErrInvalidToken
 	}
-	if !secureEqual(sign(header+"."+payload, s.cfg.Secret), sig) {
+	// The key is chosen by the type the caller expects, not by the typ the
+	// token claims, so a token signed with the other secret fails here, before
+	// its payload is read (token.service.ts:154 verifies with refreshTokenSecret).
+	if !secureEqual(sign(header+"."+payload, s.cfg.secretFor(expectedType)), sig) {
 		return claims, ErrInvalidToken
 	}
 

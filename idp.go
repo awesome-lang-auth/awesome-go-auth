@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -136,6 +137,25 @@ type IDPConfig struct {
 	// minted by a sibling process. See AuthCodeStore for the contract.
 	Codes AuthCodeStore
 
+	// RefreshTokens holds the refresh tokens of the /token endpoint's
+	// refresh_token grant: the opaque, single-use tokens /token issues when a code
+	// was granted the offline_access scope. Nil selects
+	// NewMemoryIDPRefreshTokenStore, which, like the Codes default, is correct
+	// only while every /token request reaches the same process. See
+	// IDPRefreshTokenStore for the contract. These are not the tokens
+	// RefreshTokenTTL above governs: that is the lifetime of the RS256 pair
+	// IssueIdPTokenPair mints, and the grant's family lives as long as the
+	// session the code opened, Config.RefreshTokenTTL.
+	RefreshTokens IDPRefreshTokenStore
+	// DisableRefreshTokenGrant turns the refresh_token grant off: /token then
+	// issues no refresh token whatever scope a code was granted, answers
+	// grant_type=refresh_token with unsupported_grant_type, and the discovery
+	// document advertises neither the grant nor offline_access. It is the switch
+	// for a deployment that cannot yet supply a shared RefreshTokens store and
+	// would rather serve no refresh grant than one that works only when a
+	// request happens to reach the process that issued the token.
+	DisableRefreshTokenGrant bool
+
 	// CodeTTL bounds how long a code issued by /authorize can be redeemed at
 	// /token. Zero (or negative) resolves to defaultAuthCodeTTL, five minutes.
 	CodeTTL time.Duration
@@ -190,6 +210,16 @@ type IDPConfig struct {
 }
 
 // IDPClient represents a registered OIDC client application.
+//
+// A client with a ClientSecret is confidential: it authenticates at /token by
+// client_secret_basic or client_secret_post with that secret. A client with an
+// empty ClientSecret is public — a browser or native app that cannot keep a
+// secret — and is held to what RFC 9700 asks of one: it authenticates by
+// client_id alone ("none", RFC 7591 §2) and is refused if it presents any
+// secret at all, including an empty one or an empty Basic password; every
+// authorization request it makes must carry an S256 PKCE challenge (§2.1.1);
+// and it may hold refresh tokens only because the refresh_token grant rotates
+// them and revokes the family on reuse (§4.14.2).
 type IDPClient struct {
 	ClientID     string
 	ClientSecret string
@@ -214,7 +244,12 @@ type IDP struct {
 	// code or its record after the handler returns, which is what lets
 	// /authorize and /token run on different processes.
 	codes AuthCodeStore
-	now   func() time.Time
+	// refreshTokens is cfg.RefreshTokens with the nil default resolved.
+	refreshTokens IDPRefreshTokenStore
+	// refreshStoreWarned records that the in-memory refresh store warning was
+	// logged, so that NewIDP and the WithIDP binding log it once between them.
+	refreshStoreWarned bool
+	now                func() time.Time
 }
 
 // NewIDP creates a new OIDC IDP backed by the given auth service.
@@ -256,13 +291,65 @@ func NewIDP(cfg IDPConfig, authSvc *Service, clients ...IDPClient) (*IDP, error)
 	idp.signerJWK = signerJWK
 	idp.clients = make(map[string]IDPClient, len(clients))
 	for _, c := range clients {
+		// An empty id cannot be told apart from a request that sent none, and a
+		// second registration under one id used to replace the first silently.
+		if strings.TrimSpace(c.ClientID) == "" {
+			return nil, errors.New("auth: idp: a client has an empty ClientID")
+		}
+		if _, dup := idp.clients[c.ClientID]; dup {
+			return nil, fmt.Errorf("auth: idp: client %q is registered twice", c.ClientID)
+		}
 		idp.clients[c.ClientID] = c
 	}
 	idp.codes = cfg.Codes
 	if idp.codes == nil {
 		idp.codes = NewMemoryAuthCodeStore()
 	}
+	idp.refreshTokens = cfg.RefreshTokens
+	if idp.refreshTokens == nil {
+		idp.refreshTokens = NewMemoryIDPRefreshTokenStore()
+	}
+	idp.warnInMemoryRefreshStore()
 	return idp, nil
+}
+
+// idpMemoryRefreshStoreWarning is what the IDP logs, once, when the
+// refresh_token grant is served from the in-process default store.
+const idpMemoryRefreshStoreWarning = "auth: IdP mode: the refresh_token grant is served from the in-memory store — refresh tokens are valid only on the process that issued them. Multi-instance deployments must set IDPConfig.RefreshTokens (or set IDPConfig.DisableRefreshTokenGrant)."
+
+// warnInMemoryRefreshStore logs idpMemoryRefreshStoreWarning once when the
+// grant is on and RefreshTokens was left nil. NewIDP calls it, and so does the
+// WithIDP binding, because an IDP built with neither a Logger nor a Service has
+// nowhere to log until the Service is bound.
+func (idp *IDP) warnInMemoryRefreshStore() {
+	if idp.refreshStoreWarned || idp.cfg.RefreshTokens != nil || idp.cfg.DisableRefreshTokenGrant {
+		return
+	}
+	if idp.cfg.Logger == nil && idp.authSvc == nil {
+		return
+	}
+	idp.refreshStoreWarned = true
+	idp.logf(idpMemoryRefreshStoreWarning)
+}
+
+// refreshGrantServable reports whether the refresh_token grant is offered: it
+// is not disabled, and the session store can look a session up, which every
+// refresh has to do. Discovery, the code exchange and the grant itself all ask
+// this one question, so the document never advertises a grant /token will not
+// serve.
+func (idp *IDP) refreshGrantServable() bool {
+	return !idp.cfg.DisableRefreshTokenGrant && idp.authSvc != nil && idp.authSvc.canLookupSessions()
+}
+
+// hasPublicClient reports whether any registered client has no secret, which
+// is when discovery advertises the "none" authentication method.
+func (idp *IDP) hasPublicClient() bool {
+	for _, c := range idp.clients {
+		if c.ClientSecret == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // logf writes through IDPConfig.Logger, else through the Service's logger.
@@ -656,6 +743,16 @@ func (idp *IDP) RegisterHandlers(mux *http.ServeMux, basePath string) {
 
 func (idp *IDP) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	base := strings.TrimSuffix(idp.cfg.Issuer, "/")
+	scopes := []string{"openid", "email", "profile"}
+	grants := []string{grantTypeAuthorizationCode}
+	if idp.refreshGrantServable() {
+		scopes = append(scopes, oidcScopeOfflineAccess)
+		grants = append(grants, grantTypeRefreshToken)
+	}
+	authMethods := []string{"client_secret_basic", "client_secret_post"}
+	if idp.hasPublicClient() {
+		authMethods = append(authMethods, "none")
+	}
 	doc := map[string]any{
 		"issuer":                                base,
 		"authorization_endpoint":                base + OIDCAuthorizePath,
@@ -665,8 +762,10 @@ func (idp *IDP) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"RS256"},
-		"scopes_supported":                      []string{"openid", "email", "profile"},
-		"token_endpoint_auth_methods_supported": []string{"client_secret_post"},
+		"scopes_supported":                      scopes,
+		"grant_types_supported":                 grants,
+		"token_endpoint_auth_methods_supported": authMethods,
+		"code_challenge_methods_supported":      []string{pkceMethodS256},
 		"claims_supported":                      []string{"sub", "email", "name", "iat", "exp", "iss", "aud", "nonce"},
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -692,6 +791,25 @@ func (idp *IDP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The PKCE parameters are checked before the form is served or the
+	// credentials are, since neither is worth doing for a request whose code
+	// could never be redeemed. The client and the redirect_uri are known good by
+	// now, so the refusal is the authorization error response of RFC 6749
+	// §4.1.2.1 — a redirect back to the client carrying error and state — which
+	// is what RFC 7636 §4.4.1 prescribes for a transformation the server does
+	// not support.
+	if description := pkceAuthorizeError(q.Get("code_challenge"), q.Get("code_challenge_method")); description != "" {
+		redirectAuthorizeError(w, r, canonicalRedirect, state, "invalid_request", description)
+		return
+	}
+	// RFC 9700 §2.1.1: a public client MUST use PKCE. Its code is the only
+	// thing between an intercepted redirect and a session, since it has no
+	// secret to present at /token.
+	if client.ClientSecret == "" && q.Get("code_challenge") == "" {
+		redirectAuthorizeError(w, r, canonicalRedirect, state, "invalid_request", "a public client must send an S256 code_challenge")
+		return
+	}
+
 	if r.Method == http.MethodPost {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -711,8 +829,9 @@ func (idp *IDP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// The client gets the random code; the store gets only its hash, so
-		// a leaked store dump cannot be redeemed at /token. The PKCE and
-		// scope parameters are recorded as data for a later PR to verify.
+		// a leaked store dump cannot be redeemed at /token. The PKCE pair is
+		// what /token verifies the code_verifier against, and the scope is
+		// what decides whether it issues a refresh token.
 		err = idp.codes.SaveCode(r.Context(), AuthCode{
 			CodeHash:            hashToken(code),
 			UserID:              user.ID,
@@ -754,76 +873,6 @@ func (idp *IDP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 <input name="tenant_id" placeholder="Tenant ID" value="">
 <button type="submit">Sign In</button>
 </form></body></html>`)
-}
-
-func (idp *IDP) handleToken(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	grantType := r.FormValue("grant_type")
-	if grantType != "authorization_code" {
-		http.Error(w, "unsupported_grant_type", http.StatusBadRequest)
-		return
-	}
-	code := r.FormValue("code")
-	clientID := r.FormValue("client_id")
-	clientSecret := r.FormValue("client_secret")
-
-	client, ok := idp.clients[clientID]
-	if !ok || client.ClientSecret != clientSecret {
-		http.Error(w, "invalid_client", http.StatusUnauthorized)
-		return
-	}
-
-	// ConsumeCode is destructive: whichever request reaches the store first
-	// gets the record and every later one, on any process, gets ErrInvalidCode.
-	// That is the whole single-use guarantee, so nothing is cached here. The
-	// expiry re-check is belt and braces against a store that does not honour
-	// the "expired is absent" clause of the AuthCodeStore contract.
-	meta, err := idp.codes.ConsumeCode(r.Context(), hashToken(code))
-	if err != nil || idp.now().After(meta.ExpiresAt) {
-		http.Error(w, "invalid_grant", http.StatusBadRequest)
-		return
-	}
-	// RFC 6749 §4.1.3: the code must have been issued to the client now
-	// redeeming it. The map never checked this; the record carries ClientID
-	// precisely so the store can be asked.
-	if meta.ClientID != clientID {
-		http.Error(w, "invalid_grant", http.StatusBadRequest)
-		return
-	}
-
-	user, err := idp.authSvc.users.GetUserByID(r.Context(), meta.UserID, meta.TenantID)
-	if err != nil {
-		http.Error(w, "server_error", http.StatusInternalServerError)
-		return
-	}
-	// The session pair, HS256. Which pair /token returns is decision D-15 of
-	// the upstream plan and is not settled here; IssueIdPTokenPair exists for
-	// a host that wants the RS256 pair now. expires_in below is this pair's
-	// access lifetime, Config.AccessTokenTTL: the lifetime of the token in the
-	// body, not IDPConfig.AccessTokenTTL, which governs only the IdP pair.
-	tokens, err := idp.authSvc.newSessionTokens(r.Context(), user)
-	if err != nil {
-		http.Error(w, "server_error", http.StatusInternalServerError)
-		return
-	}
-
-	idTok, err := idp.buildIDToken(user, clientID, meta.Nonce)
-	if err != nil {
-		http.Error(w, "server_error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-		"access_token":  tokens.AccessToken,
-		"refresh_token": tokens.RefreshToken,
-		"id_token":      idTok,
-		"token_type":    "Bearer",
-		"expires_in":    int(tokens.ExpiresIn.Seconds()),
-	})
 }
 
 func (idp *IDP) handleUserInfo(w http.ResponseWriter, r *http.Request) {
