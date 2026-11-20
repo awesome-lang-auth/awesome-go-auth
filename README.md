@@ -54,7 +54,10 @@ func main() {
 ## Features
 
 - Secure configuration with validation.
-- Register/login with password hashing (bcrypt).
+- Register/login with password hashing (bcrypt). Public sign-up can be closed
+  for an invite-only deployment with `HTTPConfig.ClosedRegistration`, which
+  unmounts `POST <prefix>/register` and leaves `Service.Register` to the host
+  ([Closing public registration](README_DETAILED.md#closing-public-registration--httpconfigclosedregistration)).
 - Signed access token + refresh token (HMAC-SHA256) with expiry.
 - Stateful sessions with refresh token rotation and revocation (logout).
 - Configurable session check policy (`allcalls` / `refresh` / `none`).
@@ -753,20 +756,26 @@ revision the whole contract was extracted from.
   for the same deployment. There is no way to reach `true` with the mode at
   `none`, because the legacy boolean that reaches it there does not exist here.
 
-### `POST <prefix>/register` is unconditional, and `ui/config` reports it as such
+### `POST <prefix>/register` is mounted unless registration is closed, and `ui/config` reports which
 
 `register-route-is-always-mounted`
 
-- **Surface**: `POST <prefix>/register`, and the `features.register` flag of
-  `GET <prefix>/ui/config`.
+- **Surface**: `POST <prefix>/register`, the `features.register` flag of
+  `GET <prefix>/ui/config`, and `HTTPConfig.ClosedRegistration`.
 - **This port**: Registration is part of the library rather than a hook the host
-  supplies: every adapter mounts `POST <prefix>/register` on `Service.Register`
-  on every deployment, and `GET <prefix>/ui/config` answers
-  `features.register: true` to match. Resource-server mode is the one thing that
-  unmounts the route, with the rest of the credential set — see
-  `resource-server-gates-all-credential-routes` — and the flag does not follow
-  it there, which is what the reference does too for a resource server that
-  supplied the hook.
+  supplies, so the route's presence is a configuration flag rather than the
+  presence of a function. By default every adapter mounts
+  `POST <prefix>/register` on `Service.Register` and `GET <prefix>/ui/config`
+  answers `features.register: true` to match. With
+  `HTTPConfig.ClosedRegistration` set, no adapter mounts the route — it answers
+  the router's `404` — `features.register` answers `false`, the built-in UI
+  hides its sign-up link and the served OpenAPI document leaves the path out,
+  which is the reference's hookless deployment on every surface.
+  `Service.Register` stays callable by the host either way, for invitations and
+  admin-created accounts. Resource-server mode also unmounts the route, with the
+  rest of the credential set — see `resource-server-gates-all-credential-routes`
+  — and the flag does not follow it there, which is what the reference does too
+  for a resource server that supplied the hook.
 - **The reference**: Mounts `/register` only when `routerOptions.onRegister` is
   supplied, the host having written the account-creation function itself, and
   reports `!!routerOptions?.onRegister` in `features.register`. A deployment
@@ -775,16 +784,24 @@ revision the whole contract was extracted from.
 - **Why**: This port ships registration instead of asking for it:
   `Service.Register` applies the password policy, hashes the password, applies
   the email verification mode and writes through `UserStore`. There is no hook
-  that can be absent, so there is nothing for the route's presence to be
-  conditional on, and the flag — derived from the wiring rather than configured
-  — answers for the routes this port actually serves. The difference runs one
-  way only: a client is offered sign-up against a deployment whose node-auth
-  counterpart, having no `onRegister`, would have hidden it.
-- **Matching the reference exactly**: Not available from configuration. A host
-  that wants no public sign-up mounts the adapter on its own mux and refuses
-  `POST <prefix>/register` there, or runs in resource-server mode;
-  `features.register` still answers `true` in the first case, so such a host
-  hides the affordance in its own UI rather than reading the flag.
+  that can be absent, so the hookless deployment is reached through a flag
+  instead, and the default stays what every earlier release served: the route
+  mounted and the flag `true`. The difference that remains runs one way only: a
+  deployment that sets nothing offers sign-up where its node-auth counterpart,
+  having no `onRegister`, would have hidden it.
+- **Matching the reference exactly**: Set `HTTPConfig.ClosedRegistration` for
+  the reference's deployment without `onRegister`: `404` on
+  `POST <prefix>/register`, `features.register: false`, and no path item in the
+  document `OpenAPIInfo.ClosedRegistration` generates. Leave it unset for the
+  deployment that supplied the hook.
+- **What it does not close**: An OAuth callback creates an account for a
+  provider identity nothing here knows yet whenever
+  `OAuthProvisioning.AutoCreate` is on, which it is in
+  `DefaultOAuthProvisioning` — a second self-registration path the flag does not
+  touch. A deployment that wants accounts created only by its own hand sets
+  `AutoCreate: false` too, or configures no provider. The built-in UI's
+  `<prefix>/ui/register` page is still served, as the reference serves it
+  without a hook; its form posts to the route that is gone.
 
 ### The documentation routes are off until asked for, and the document describes them
 
@@ -1889,7 +1906,7 @@ release that closes the gap.
 | Token management (cookie/bearer, access/refresh rotation, secure cookies) | ✅ Implemented | HS256 JWS, `X-Auth-Strategy: bearer`, rotation on refresh, `__Host-`/`__Secure-`/bare cookie policy. | — |
 | Stateful sessions | ✅ Implemented | Revocation, rotation, `Config.SessionCheckOn` (`allcalls`/`refresh`/`none`). | — |
 | CSRF protection | ✅ Implemented | `CSRFMiddleware`, double-submit cookie + header, exemption table pinned to the reference. | — |
-| Account management | ✅ Implemented | Register, `UpdateProfile`, `DeleteAccount`, password and email lifecycle. | — |
+| Account management | ✅ Implemented | Register (closable with `HTTPConfig.ClosedRegistration`, the reference's deployment without `onRegister`), `UpdateProfile`, `DeleteAccount`, password and email lifecycle. | — |
 | OAuth login + account linking | ✅ Implemented | Signed state, PKCE, single-use nonce; Google and GitHub presets, `AdditionalAuthParams` and declarative `ProfileMap`/`MapProfile` for generic providers; `OAuthProvisioning` replaces the reference's abstract `findOrCreateUser` (auto-create, domain allowlist, verified-address demand, `FieldMap`), and the account-conflict flow is complete — stash, the reference's `/account-conflict` redirect, then `/link-request` and `/link-verify`. | — |
 | Dynamic email templates + UI i18n fallback | ✅ Implemented | The reference's six template ids with its en/it built-ins, `TemplateStore` overrides rendered under its `{{T.key}}`/`{{key}}` rule, per-request site-URL links and the old-address notice on `/change-email/confirm`. The `welcome` template renders but `POST /register` does not mail it yet (the reference does, `auth.router.ts:719-724`); UI translations are stored and are read by `GET <prefix>/ui/config`, which serves the `config` page for the requested language with the reference's `en` fallback. | — |
 | Custom token claims | ✅ Implemented | `Config.BuildTokenClaims` hook, plus `StaticClaims`/`UserFieldClaims`/`ChainClaims` and the synchronous `ClaimsWebhook` (this port's extension); the hook runs at mint time and on `/me`, never in the middleware. | — |

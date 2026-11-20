@@ -85,6 +85,7 @@ func Run(t *testing.T, mount Mounter) {
 	t.Run("UIConfig", func(t *testing.T) { testUIConfig(t, mount) })
 	t.Run("UIPages", func(t *testing.T) { testUIPages(t, mount) })
 	t.Run("ResourceServerGating", func(t *testing.T) { testResourceServerGating(t, mount) })
+	t.Run("ClosedRegistration", func(t *testing.T) { testClosedRegistration(t, mount) })
 	t.Run("OpenAPI", func(t *testing.T) { testOpenAPI(t, mount) })
 	t.Run("RateLimit", func(t *testing.T) { testRateLimit(t, mount) })
 	t.Run("EventContext", func(t *testing.T) { testEventContext(t, mount) })
@@ -226,10 +227,13 @@ type conditionalRouteSet struct {
 // by OpenAPIInfo.Docs; see docs.go. Resource-server mode subtracts:
 // HTTPConfig.ResourceServer leaves the credential routes unregistered and
 // OpenAPIInfo.ResourceServer takes them out of the spec; see resource_server.go.
+// Closed registration subtracts one: HTTPConfig.ClosedRegistration leaves
+// POST /register unregistered and OpenAPIInfo.ClosedRegistration takes it out
+// of the spec; see closed_registration.go.
 // The admin and tools sets join the additive half as those routers land.
 // suite_test.go drives the mechanism itself with fake sets it passes in, so it
 // stays independent of what is registered here.
-var conditionalRoutes = []conditionalRouteSet{jwksRouteSet(), oidcRouteSet(), uiRouteSet(), docsRouteSet(), resourceServerRouteSet()}
+var conditionalRoutes = []conditionalRouteSet{jwksRouteSet(), oidcRouteSet(), uiRouteSet(), docsRouteSet(), resourceServerRouteSet(), closedRegistrationRouteSet()}
 
 // failureReporter is the slice of testing.T the OpenAPI checks report through.
 // It is an interface so suite_test.go can record failures instead of raising

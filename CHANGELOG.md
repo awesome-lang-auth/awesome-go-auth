@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Closed registration: `HTTPConfig.ClosedRegistration`.** Set, none of the
+  four adapters mounts `POST <prefix>/register`, which then answers the
+  router's `404` exactly as the reference does when the host supplies no
+  `onRegister` hook (`auth.router.ts:712-715`); `GET <prefix>/ui/config`
+  answers `features.register: false` (`ui.router.ts:115`), so the built-in
+  UI's login page hides its sign-up link; and the OpenAPI document an adapter
+  serves leaves the path out. `OpenAPIInfo.ClosedRegistration` is the matching
+  flag for a host that generates the document itself, and
+  `(*nethttp.Adapter).OpenAPIInfo()` reads it off the mount.
+  `HTTPConfig.RegisterMounted()` is the one condition the four adapters read —
+  neither `ResourceServer` nor `ClosedRegistration` set — and `RegisterRoute`
+  names the path. `Service.Register` and `Auth.Register` are untouched, so an
+  invite-only deployment still creates accounts through its own invitation or
+  admin flow. The flag closes one of two self-registration paths: an OAuth
+  callback still creates an account under `OAuthProvisioning.AutoCreate`, which
+  `DefaultOAuthProvisioning` turns on, so such a deployment sets
+  `AutoCreate: false` too. The `<prefix>/ui/register` page is still served, as
+  the reference serves it without a hook. Unset — the default — nothing
+  changes. The `register-route-is-always-mounted` deviation now describes the
+  flag, and its "not available from configuration" note is retired.
+
 ## [0.13.0] - 2026-11-20
 
 Parity fixes from the audit against `@awesome-lang-auth/node` 1.10.8, a
