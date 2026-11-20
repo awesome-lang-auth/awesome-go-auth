@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-21
+
+Closed registration, forced second-factor enrolment at login, the
+authentication context on every access token with a step-up route, and
+machine access to the admin API (#101, #102, #103, #104).
+
+**This release is breaking** for one kind of configuration, as a pre-1.0
+minor may be; each item is marked BREAKING below:
+
+- `amr`, `auth_time` and `mfa_at` are reserved claims (#103): a
+  `BuildTokenClaims` hook or a `ClaimsWebhook` can no longer set them, and a
+  `UserFieldClaims` mapping onto one is a constructor error.
+- Every spelling of a reserved claim is reserved (#103): the ten names are
+  matched case-insensitively, as `encoding/json` matches a struct field, so a
+  hook's `Exp`, `SID` or `MFA_AT` is deleted from every token and
+  `UserFieldClaims` refuses such a name.
+
+Everything else is opt-in or additive. Forced enrolment
+(`WithEnrolOnLogin(true)`) is trust on first use and off by default; read
+the Security entry before turning it on. A session store that offers the
+step-up route implements the new `SessionAuthenticationStore`, and persists
+the four new `Session` fields. `DELETE <admin>/api/users/{id}` and promote
+with `method=flag` now reach users in every tenant (Fixed).
+
 ### Added
 - **Closed registration: `HTTPConfig.ClosedRegistration`.** Set, none of the
   four adapters mounts `POST <prefix>/register`, which then answers the

@@ -2134,6 +2134,7 @@ What is left, and where each row of the table above closes:
 | v0.11.0 | the event plane, the reference's outbound-webhook wire format, the `SseManager` protocol and the tools router |
 | v0.12.0 | `UserLookupStore`, so the admin user detail finds a user in any tenant; `MCPServer` deprecated |
 | v0.13.0 | the 1.10.8 parity fixes (empty bodies, the magic-link split, the linked-account upsert, register without a session, the token-trusting auth gate, the OAuth conflict default), `RefreshSecret`, and the IdP token endpoint's PKCE, `client_secret_basic` and `refresh_token` grant |
+| v0.14.0 | closed registration, forced second-factor enrolment at login (opt-in), the authentication context (`amr`, `auth_time`, `mfa_at`) with `POST /2fa/step-up`, and machine access to the admin API |
 | v1.0.0 | removal of the shims those releases deprecate, the unauthenticated `MCPServer`, the refusal of a `RefreshSecret` equal to `Secret`, and a final documentation truth pass |
 
 v0.11.0 carries the breaking removals (`SseHub`, `WebhookDispatcher`, the
