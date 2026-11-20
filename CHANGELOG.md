@@ -7,6 +7,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-20
+
+Parity fixes from the audit against `@awesome-lang-auth/node` 1.10.8, a
+signing key of its own for refresh tokens, and a token endpoint for IdP mode
+that verifies PKCE, accepts `client_secret_basic` and serves the
+`refresh_token` grant (#96, #97, #98, #99).
+
+**This release is breaking**, as a pre-1.0 minor may be. Five changes alter
+what a deployment or its clients see without any change to their
+configuration; each is marked BREAKING below:
+
+- OAuth: an address another account already holds is answered with the
+  account-conflict flow and is no longer linked (#99, #36). The default
+  `OAuthProvisioning` is now `{AutoCreate: true, OnEmailMatch: "conflict"}`.
+  A host that relied on linking sets `OnEmailMatch: "link"` explicitly, and
+  should pair it with `RequireVerifiedEmail`.
+- `POST <prefix>/register` no longer opens a session: it answers
+  `201 {"success": true, "userId": "…"}` and the client logs in afterwards
+  (#98, #21). `WithIssueSessionOnRegister(true)` restores the session.
+- The adapters' auth gate trusts the access token and reads no user store
+  (#98, #31). A deleted user's token passes it until it expires, unless
+  `SessionCheckOn` is `allcalls` and the session was revoked, and the routes
+  that look the user up answer `404 {"error": "User not found"}`. A
+  `UserStore` must return `ErrUserNotFound` for a missing row, and
+  `PasswordHash` from `GetUserByID`.
+- `POST <prefix>/login` without an email or a password answers
+  `400 {"error": "Email and password are required"}` with no code, where it
+  answered `401 INVALID_CREDENTIALS` (#96, #34).
+- IdP `POST <prefix>/token` refuses with RFC 6749 §5.2 JSON bodies, issues a
+  `refresh_token` only for `offline_access`, enforces S256 PKCE on a code
+  issued with a challenge, and requires PKCE of public clients (#97, #14).
+
+### Added
+- **Verify a magic link without opening a session (#32):
+  `Service.ConsumeMagicLink` and `Service.CompleteMagicLinkLogin`**, with
+  `Auth` delegates. `ConsumeMagicLink` verifies the link, burns it and answers
+  its owner — no session, no token, no event, no change to the email-verified
+  flag — so a caller can refuse on a predicate of its own (tenant membership, a
+  device binding, a risk score) before anything is in the store.
+  `CompleteMagicLinkLogin` then opens the session and raises
+  `identity.auth.login.success` with `method: "magic-link"`. This is the
+  reference's order: the strategy verifies and clears the link, and the router
+  decides before it reaches `issueTokens` (`magic-link.strategy.ts:36-52`,
+  `auth.router.ts:1741-1747` at v1.10.8). `VerifyMagicLink` and
+  `VerifyMagicLinkForUser` are now built on the two and answer exactly as
+  before, on every route. The email-verified side effect lives in
+  `VerifyMagicLink`, the login wrapper, and is no longer inferred from whether
+  an owner id was passed, which also settles #33.
+- **Registration may open a session, chosen by the instance admin (#21):
+  `Config.IssueSessionOnRegister` and `WithIssueSessionOnRegister(bool)`.**
+  The family option of the same name (the family spec "register may open a
+  session"), **off by default**, as in the reference and in the spec: see the
+  `BREAKING (wire)` entry under Changed. On, a successful
+  `POST <prefix>/register` also delivers a session exactly as a successful
+  `POST /login` does — the access and refresh cookies in cookie mode,
+  `accessToken` and `refreshToken` in the body in bearer mode, a session row,
+  and `identity.auth.login.success` raised after `identity.user.created`.
+  Even on, the login's gates win: under `EmailVerificationModeStrict` the new,
+  unverified account gets the plain `201` and no session, and under
+  `Require2FA` the registration does not skip the second factor either. The
+  service logs once at startup when the option and strict are configured
+  together. A refused registration never issues anything. Adapters write the
+  answer through the new `HTTPConfig.WriteRegistration`. The compatibility
+  note `register-issues-a-session` now describes the option as an opt-in
+  addition: with it off, the port answers what the reference answers.
+- **`Config.RefreshSecret` and `WithRefreshSecret` — a signing key of its own
+  for refresh tokens** (#25). It is the reference's `refreshTokenSecret`
+  (`auth-config.model.ts:148`, `token.service.ts:25-29`): set, it signs and
+  verifies every refresh token, while access tokens and the 2FA step-up token
+  stay on `Config.Secret`. A component holding the access secret can then no
+  longer mint refresh tokens, and rotating the refresh secret alone signs every
+  session out while access tokens already issued run to their expiry. Empty
+  means `Config.Secret`, which is how refresh tokens were signed until now, so
+  a deployment that does not set it sees no change. Setting it on a running
+  deployment invalidates every outstanding refresh token once. Recorded as the
+  `refresh-secret-falls-back-to-secret` deviation.
+
+  **Planned for v1.0.0:** node 1.10.3 refuses to construct its router when
+  `refreshTokenSecret === accessTokenSecret` and a session store is configured
+  (`auth.router.ts:843-844` at 1.10.8). This release does not, because every
+  deployment that predates `RefreshSecret` has the two equal; v1.0.0 will refuse
+  it, so a deployment should set `WithRefreshSecret` to a distinct value before
+  upgrading to it.
+- **The IdP token endpoint verifies PKCE, accepts `client_secret_basic` and
+  public clients, and implements the `refresh_token` grant** (#14). None of
+  it has a counterpart in the reference, whose IdP mode is the JWKS route
+  alone. The rules come from the specifications, and the surface is recorded
+  as the `idp-mode-adds-an-oauth-authorization-server` deviation.
+  - **PKCE.** A code issued with an `S256` `code_challenge` is redeemed only
+    with the matching `code_verifier` (RFC 7636 §4.6). A missing or wrong
+    verifier is `400 invalid_grant` and burns the code. Discovery advertises
+    `code_challenge_methods_supported: ["S256"]`.
+  - **`client_secret_basic`** beside `client_secret_post` (RFC 6749 §2.3.1),
+    both advertised in `token_endpoint_auth_methods_supported`. A request
+    using both is `400 invalid_request`. A failed Basic attempt is
+    `401 invalid_client` with `WWW-Authenticate: Basic`. Client secrets are now
+    compared in constant time.
+  - **Public clients.** An `IDPClient` with no `ClientSecret` authenticates by
+    `client_id` alone, and discovery then advertises `none`. Any secret it
+    presents is refused. It must use `S256` PKCE at `/authorize`
+    (RFC 9700 §2.1.1). It may hold refresh tokens because they rotate
+    (RFC 9700 §4.14.2).
+  - **The `refresh_token` grant.** A refresh token is issued only when the code
+    was granted `offline_access` (OIDC Core §11, now in `scopes_supported`).
+    - The token is opaque and single use. Each refresh returns a new one with
+      a new access token for the same session.
+    - A token is `400 invalid_grant`, and every token of that grant is revoked
+      (RFC 9700 §4.14.2), when it is presented again, presented by another
+      client, or presented after its session ended, or after its user was
+      deleted: a `UserStore` answering `ErrUserNotFound` (#31). A code redeemed
+      after its user was deleted is `400 invalid_grant` too.
+    - Any other store error is a `500 server_error` and revokes nothing.
+    - `scope` narrows and never widens (`400 invalid_scope`).
+    - A grant lasts as long as its session, `Config.RefreshTokenTTL`.
+    - The state lives in the new `IDPRefreshTokenStore` interface, set as
+      `IDPConfig.RefreshTokens`. Its doc comment is the implementor's
+      contract, including the DynamoDB transaction a consume needs.
+      `MemoryIDPRefreshTokenStore` is the in-process default, and the IdP
+      logs once when it is serving from it.
+    - `IDPConfig.DisableRefreshTokenGrant` turns the grant off.
+    - Discovery advertises `grant_types_supported`, and lists
+      `refresh_token` only while the grant is served.
+  - **A replayed authorization code revokes the session and the refresh
+    tokens it produced** (RFC 6749 §4.1.2). This needs a code store that
+    implements the new optional `AuthCodeReplayStore`, which
+    `MemoryAuthCodeStore` does. With any other store a replay is refused as
+    before and nothing else happens.
+
 ### Changed
 - **BREAKING (behaviour) — the default OAuth provisioning policy answers an
   address another account holds with the account conflict, not a link**
@@ -43,63 +171,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays bare and a space is `%20`. The `identity.auth.oauth.conflict` event
   cuts `email` to 320 UTF-16 code units, as the reference's
   `oauthConflictEventData` does.
-
-### Fixed
-- **`README_DETAILED.md` §HTTP Adapters now documents the adapters that exist
-  (#16).** The section showed `chi.New(svc)`, `gin.New(svc)`, `echo.New(svc)`
-  and `adapt.RequireAuth`, and claimed a list of per-route handlers that every
-  adapter provides. None of these exist. It now documents what the code has:
-  - `nethttp`, `gin` and `echo` take an `*auth.Auth` through
-    `New`/`NewWithConfig`. `chi` has only package functions.
-  - Routes are mounted as a whole by `Mount`/`MountWithConfig`.
-  - The middleware and the context reader each adapter exposes.
-  - Only `nethttp.Adapter` exports individual handlers, and `Mount` is the
-    supported way to serve them.
-
-  Every sample compiles against this release. The admin note under
-  `HTTPConfig.RateLimiter` said no admin router existed. It now describes
-  `AdminOptions.RateLimiter`, which covers the promote route only. The `Config`
-  listing had three wrong defaults. They now match `DefaultConfig`:
-  `RefreshTokenTTL` is 30d, not 7d. `ClockSkew` is 30s, not 5s.
-  `EmailChangeTTL` is 1h, not 24h. The listing also gains `Issuer`'s default
-  and the `TempTokenTTL`, `Uploads` and `Events` fields it was missing.
-  Documentation only; no code changes.
-
-### Added
-- **Verify a magic link without opening a session (#32):
-  `Service.ConsumeMagicLink` and `Service.CompleteMagicLinkLogin`**, with
-  `Auth` delegates. `ConsumeMagicLink` verifies the link, burns it and answers
-  its owner — no session, no token, no event, no change to the email-verified
-  flag — so a caller can refuse on a predicate of its own (tenant membership, a
-  device binding, a risk score) before anything is in the store.
-  `CompleteMagicLinkLogin` then opens the session and raises
-  `identity.auth.login.success` with `method: "magic-link"`. This is the
-  reference's order: the strategy verifies and clears the link, and the router
-  decides before it reaches `issueTokens` (`magic-link.strategy.ts:36-52`,
-  `auth.router.ts:1741-1747` at v1.10.8). `VerifyMagicLink` and
-  `VerifyMagicLinkForUser` are now built on the two and answer exactly as
-  before, on every route. The email-verified side effect lives in
-  `VerifyMagicLink`, the login wrapper, and is no longer inferred from whether
-  an owner id was passed, which also settles #33.
-- **Registration may open a session, chosen by the instance admin (#21):
-  `Config.IssueSessionOnRegister` and `WithIssueSessionOnRegister(bool)`.**
-  The family option of the same name (the family spec "register may open a
-  session"), **off by default**, as in the reference and in the spec: see the
-  `BREAKING (wire)` entry under Changed. On, a successful
-  `POST <prefix>/register` also delivers a session exactly as a successful
-  `POST /login` does — the access and refresh cookies in cookie mode,
-  `accessToken` and `refreshToken` in the body in bearer mode, a session row,
-  and `identity.auth.login.success` raised after `identity.user.created`.
-  Even on, the login's gates win: under `EmailVerificationModeStrict` the new,
-  unverified account gets the plain `201` and no session, and under
-  `Require2FA` the registration does not skip the second factor either. The
-  service logs once at startup when the option and strict are configured
-  together. A refused registration never issues anything. Adapters write the
-  answer through the new `HTTPConfig.WriteRegistration`. The compatibility
-  note `register-issues-a-session` now describes the option as an opt-in
-  addition: with it off, the port answers what the reference answers.
-
-### Changed
 - **BREAKING (wire) — `POST <prefix>/register` no longer logs the new account in
   by default (#21).** The port used to open a session on every successful
   registration: cookies in cookie mode, `accessToken` and `refreshToken` in the
@@ -220,125 +291,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `409` and the `404` as in the reference, where it used to run first; an
   address in use is therefore `409` even for an account with no password.
   `Service.RequestEmailChange` itself does not make that check, as before.
-
-### Deprecated
-- **`ChangeEmailInlineError` (#31).** `Auth.RequestEmailChange` makes the
-  check itself now, against the stored row and in the reference's order; the
-  user in context carries no password hash, so the helper would refuse every
-  account. The adapters no longer call it.
-- **`ChangePasswordInlineError` (#30).** `Service.ChangePassword` makes the
-  check itself now, for every account and in the reference's order, and the
-  adapters no longer call it.
-
-### Fixed
-- **An empty request body is no longer `400 INVALID_BODY` on `/register`,
-  `/login`, `/link-request` and `/link-verify` (#34).** The reference reads
-  `req.body ?? {}` on every route since v1.10.5, so a bodyless request reaches
-  each route's own per-field check. The port now does the same on all four
-  adapters: `/register` answers `400 INVALID_INPUT`, `/link-request`
-  `400 EMAIL_REQUIRED`, `/link-verify` `400 TOKEN_REQUIRED`. The adapters used
-  to disagree, since echo's binder tolerated a zero-length body and the other
-  three did not. Every body-reading auth route now decodes through the one
-  shared `auth.DecodeOptionalJSON`, and the per-adapter step-up helpers are
-  gone. Malformed JSON is still `400 INVALID_BODY` everywhere.
-
-  `/login` also gains the reference's presence check. A body with no email or
-  no password, an empty body included, now answers
-  `400 {"error":"Email and password are required"}` with no code, where it
-  used to answer `401 INVALID_CREDENTIALS` (`auth.router.ts:996-1000` at
-  v1.10.8). The check runs in the route before the service, so it raises no
-  `identity.auth.login.failed` event, as in the reference. `Service.Login`
-  itself is unchanged.
-- **`MemoryLinkedAccounts.Save` no longer leaves a stale link behind when it
-  re-points a binding (#37).** Saving a `(provider, providerID)` pair that
-  another user held, under a new id, overwrote the pair's lookup but left the
-  old owner's `ListForUser` entry in place, where no id could reach or delete
-  it. `Save` is now an upsert on the pair: whatever it supersedes — the link
-  that held the pair, or the previous version of the same id — is gone from
-  `FindByProvider`, `ListForUser` and `Delete` alike. It still does not refuse
-  the re-point, because the reference's `linkAccount` is an idempotent upsert
-  that raises no conflict of its own (`linked-accounts-store.interface.ts:58-63`
-  at v1.10.8). The contract is now written on `LinkedAccountStore`, so a host
-  store knows it keys on the pair.
-- **Profile names and the phone number are stored as sent (#35).**
-  `Service.UpdateProfile` trimmed `firstName` and `lastName`, and
-  `Service.UpdatePhoneNumber` trimmed the number, so `PATCH /profile` and
-  `POST /add-phone` stored something other than what the client sent. The
-  reference passes both to its store untouched (`auth.router.ts:1214-1215` and
-  `:1229-1234` at v1.10.8), and now so does the port. One consequence is
-  visible: a phone number of only whitespace used to be trimmed to the empty
-  string and so cleared the number; it is now stored as sent, as in the
-  reference, where only `null` clears. A store that wants normalised values
-  normalises them itself. `POST /sms/send` and the login challenge's
-  `available2faMethods` now test the stored number untrimmed too, as the
-  reference does (`auth.router.ts:1830`, `:1015`) and as `Service.SendSMSCode`
-  already did, so a number of only spaces is a number there as well.
-
-### Added
-- **`Config.RefreshSecret` and `WithRefreshSecret` — a signing key of its own
-  for refresh tokens** (#25). It is the reference's `refreshTokenSecret`
-  (`auth-config.model.ts:148`, `token.service.ts:25-29`): set, it signs and
-  verifies every refresh token, while access tokens and the 2FA step-up token
-  stay on `Config.Secret`. A component holding the access secret can then no
-  longer mint refresh tokens, and rotating the refresh secret alone signs every
-  session out while access tokens already issued run to their expiry. Empty
-  means `Config.Secret`, which is how refresh tokens were signed until now, so
-  a deployment that does not set it sees no change. Setting it on a running
-  deployment invalidates every outstanding refresh token once. Recorded as the
-  `refresh-secret-falls-back-to-secret` deviation.
-
-  **Planned for v1.0.0:** node 1.10.3 refuses to construct its router when
-  `refreshTokenSecret === accessTokenSecret` and a session store is configured
-  (`auth.router.ts:843-844` at 1.10.8). This release does not, because every
-  deployment that predates `RefreshSecret` has the two equal; v1.0.0 will refuse
-  it, so a deployment should set `WithRefreshSecret` to a distinct value before
-  upgrading to it.
-- **The IdP token endpoint verifies PKCE, accepts `client_secret_basic` and
-  public clients, and implements the `refresh_token` grant** (#14). None of
-  it has a counterpart in the reference, whose IdP mode is the JWKS route
-  alone. The rules come from the specifications, and the surface is recorded
-  as the `idp-mode-adds-an-oauth-authorization-server` deviation.
-  - **PKCE.** A code issued with an `S256` `code_challenge` is redeemed only
-    with the matching `code_verifier` (RFC 7636 §4.6). A missing or wrong
-    verifier is `400 invalid_grant` and burns the code. Discovery advertises
-    `code_challenge_methods_supported: ["S256"]`.
-  - **`client_secret_basic`** beside `client_secret_post` (RFC 6749 §2.3.1),
-    both advertised in `token_endpoint_auth_methods_supported`. A request
-    using both is `400 invalid_request`. A failed Basic attempt is
-    `401 invalid_client` with `WWW-Authenticate: Basic`. Client secrets are now
-    compared in constant time.
-  - **Public clients.** An `IDPClient` with no `ClientSecret` authenticates by
-    `client_id` alone, and discovery then advertises `none`. Any secret it
-    presents is refused. It must use `S256` PKCE at `/authorize`
-    (RFC 9700 §2.1.1). It may hold refresh tokens because they rotate
-    (RFC 9700 §4.14.2).
-  - **The `refresh_token` grant.** A refresh token is issued only when the code
-    was granted `offline_access` (OIDC Core §11, now in `scopes_supported`).
-    - The token is opaque and single use. Each refresh returns a new one with
-      a new access token for the same session.
-    - A token is `400 invalid_grant`, and every token of that grant is revoked
-      (RFC 9700 §4.14.2), when it is presented again, presented by another
-      client, or presented after its session ended, or after its user was
-      deleted: a `UserStore` answering `ErrUserNotFound` (#31). A code redeemed
-      after its user was deleted is `400 invalid_grant` too.
-    - Any other store error is a `500 server_error` and revokes nothing.
-    - `scope` narrows and never widens (`400 invalid_scope`).
-    - A grant lasts as long as its session, `Config.RefreshTokenTTL`.
-    - The state lives in the new `IDPRefreshTokenStore` interface, set as
-      `IDPConfig.RefreshTokens`. Its doc comment is the implementor's
-      contract, including the DynamoDB transaction a consume needs.
-      `MemoryIDPRefreshTokenStore` is the in-process default, and the IdP
-      logs once when it is serving from it.
-    - `IDPConfig.DisableRefreshTokenGrant` turns the grant off.
-    - Discovery advertises `grant_types_supported`, and lists
-      `refresh_token` only while the grant is served.
-  - **A replayed authorization code revokes the session and the refresh
-    tokens it produced** (RFC 6749 §4.1.2). This needs a code store that
-    implements the new optional `AuthCodeReplayStore`, which
-    `MemoryAuthCodeStore` does. With any other store a replay is refused as
-    before and nothing else happens.
-
-### Changed
 - **BREAKING (wire) — IdP `POST <prefix>/token` no longer returns the
   session refresh token** (#14). The response used to always carry the
   session's own HS256 refresh token, which worked at `POST <prefix>/refresh`
@@ -389,6 +341,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     one. It is now a public client: see Added.
   - `NewIDP` refuses an empty or duplicate `ClientID`. A duplicate used to
     replace the earlier registration silently.
+
+### Deprecated
+- **`ChangeEmailInlineError` (#31).** `Auth.RequestEmailChange` makes the
+  check itself now, against the stored row and in the reference's order; the
+  user in context carries no password hash, so the helper would refuse every
+  account. The adapters no longer call it.
+- **`ChangePasswordInlineError` (#30).** `Service.ChangePassword` makes the
+  check itself now, for every account and in the reference's order, and the
+  adapters no longer call it.
+
+### Fixed
+- **`README_DETAILED.md` §HTTP Adapters now documents the adapters that exist
+  (#16).** The section showed `chi.New(svc)`, `gin.New(svc)`, `echo.New(svc)`
+  and `adapt.RequireAuth`, and claimed a list of per-route handlers that every
+  adapter provides. None of these exist. It now documents what the code has:
+  - `nethttp`, `gin` and `echo` take an `*auth.Auth` through
+    `New`/`NewWithConfig`. `chi` has only package functions.
+  - Routes are mounted as a whole by `Mount`/`MountWithConfig`.
+  - The middleware and the context reader each adapter exposes.
+  - Only `nethttp.Adapter` exports individual handlers, and `Mount` is the
+    supported way to serve them.
+
+  Every sample compiles against this release. The admin note under
+  `HTTPConfig.RateLimiter` said no admin router existed. It now describes
+  `AdminOptions.RateLimiter`, which covers the promote route only. The `Config`
+  listing had three wrong defaults. They now match `DefaultConfig`:
+  `RefreshTokenTTL` is 30d, not 7d. `ClockSkew` is 30s, not 5s.
+  `EmailChangeTTL` is 1h, not 24h. The listing also gains `Issuer`'s default
+  and the `TempTokenTTL`, `Uploads` and `Events` fields it was missing.
+  Documentation only; no code changes.
+- **An empty request body is no longer `400 INVALID_BODY` on `/register`,
+  `/login`, `/link-request` and `/link-verify` (#34).** The reference reads
+  `req.body ?? {}` on every route since v1.10.5, so a bodyless request reaches
+  each route's own per-field check. The port now does the same on all four
+  adapters: `/register` answers `400 INVALID_INPUT`, `/link-request`
+  `400 EMAIL_REQUIRED`, `/link-verify` `400 TOKEN_REQUIRED`. The adapters used
+  to disagree, since echo's binder tolerated a zero-length body and the other
+  three did not. Every body-reading auth route now decodes through the one
+  shared `auth.DecodeOptionalJSON`, and the per-adapter step-up helpers are
+  gone. Malformed JSON is still `400 INVALID_BODY` everywhere.
+
+  `/login` also gains the reference's presence check. A body with no email or
+  no password, an empty body included, now answers
+  `400 {"error":"Email and password are required"}` with no code, where it
+  used to answer `401 INVALID_CREDENTIALS` (`auth.router.ts:996-1000` at
+  v1.10.8). The check runs in the route before the service, so it raises no
+  `identity.auth.login.failed` event, as in the reference. `Service.Login`
+  itself is unchanged.
+- **`MemoryLinkedAccounts.Save` no longer leaves a stale link behind when it
+  re-points a binding (#37).** Saving a `(provider, providerID)` pair that
+  another user held, under a new id, overwrote the pair's lookup but left the
+  old owner's `ListForUser` entry in place, where no id could reach or delete
+  it. `Save` is now an upsert on the pair: whatever it supersedes — the link
+  that held the pair, or the previous version of the same id — is gone from
+  `FindByProvider`, `ListForUser` and `Delete` alike. It still does not refuse
+  the re-point, because the reference's `linkAccount` is an idempotent upsert
+  that raises no conflict of its own (`linked-accounts-store.interface.ts:58-63`
+  at v1.10.8). The contract is now written on `LinkedAccountStore`, so a host
+  store knows it keys on the pair.
+- **Profile names and the phone number are stored as sent (#35).**
+  `Service.UpdateProfile` trimmed `firstName` and `lastName`, and
+  `Service.UpdatePhoneNumber` trimmed the number, so `PATCH /profile` and
+  `POST /add-phone` stored something other than what the client sent. The
+  reference passes both to its store untouched (`auth.router.ts:1214-1215` and
+  `:1229-1234` at v1.10.8), and now so does the port. One consequence is
+  visible: a phone number of only whitespace used to be trimmed to the empty
+  string and so cleared the number; it is now stored as sent, as in the
+  reference, where only `null` clears. A store that wants normalised values
+  normalises them itself. `POST /sms/send` and the login challenge's
+  `available2faMethods` now test the stored number untrimmed too, as the
+  reference does (`auth.router.ts:1830`, `:1015`) and as `Service.SendSMSCode`
+  already did, so a number of only spaces is a number there as well.
 
 ## [0.12.0] - 2026-09-30
 
