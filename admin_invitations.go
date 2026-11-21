@@ -148,7 +148,9 @@ func adminInvitationContext(r *http.Request, cfg HTTPConfig) context.Context {
 //     account's (ErrInvitationMismatch). A re-invitation reuses the account as
 //     it is; to change either, revoke the invitation and invite again.
 //   - 502 "Invitation could not be delivered": the sender failed. The call has
-//     been undone, so repeating it is safe.
+//     been undone, so repeating it is safe — unless the invitee accepted in
+//     between (a sender that delivered, then reported a failure), in which case
+//     the account is kept and a repeat answers 409.
 //
 // Success is 201 when an account was created and 200 when a pending one was
 // invited again, both {"success": true, "invitationId", "userId", "email",
