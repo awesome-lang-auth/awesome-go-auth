@@ -907,12 +907,15 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"`POST <prefix>/invitations/accept` `{token, password}` is public, mounted under " +
 					"`HTTPConfig.ClosedRegistration` too and never under `ResourceServer`, CSRF-exempt and behind " +
 					"the rate-limiter slot. It spends the token, sets the password and marks the address " +
-					"verified, then answers what the login would: its second-factor challenge when one is " +
+					"verified — a password bcrypt could not hash, over 72 bytes, is refused like a short one before " +
+					"the token is touched, and a failure after the spend hands the token back — then answers what " +
+					"the login would: its second-factor challenge when one is " +
 					"demanded — `403 2FA_SETUP_REQUIRED` with an enrolment token under `Config.EnrolOnLogin` — " +
 					"and otherwise the registration's `201 {\"success\": true, \"userId\": …}`, with a session " +
 					"only when `Config.IssueSessionOnRegister` allows one. Every refusal of the token — unknown, " +
 					"expired, revoked, replayed, or naming an account already active — is one " +
-					"`401 INVALID_INVITATION`. Revoking deletes the account if nobody has used it. Three " +
+					"`401 INVALID_INVITATION`. Revoking deletes the account if nobody has used it. Under " +
+					"`AdminFirstUser` the admin route refuses to invite (`501`). Three " +
 					"events outside `EventNames` record the flow: `identity.user.invited`, " +
 					"`identity.user.invitation.accepted` and `identity.user.invitation.revoked`.",
 				Reference: "Ships the mail and nothing around it. `MailerService.sendInvitation(to, link, data, " +
@@ -932,15 +935,28 @@ func CompatibilityNotes() APICompatibilityNotes {
 				Notes: []DeviationNote{
 					{
 						Label: "The pending account is a real account",
-						Text: "Until it is accepted it is an ordinary row with no password, so `/forgot-password` " +
-							"and magic-link login reach it as they reach any account, for whoever reads the " +
-							"invited mailbox — the trust the invitation itself rests on, and the way in a " +
-							"deployment that accepts invitations by magic link relies on. Revoking the invitation " +
-							"deletes the account only if nobody has used it — no password, no factor, the address " +
-							"still unverified, no session ever opened, no linked provider — which closes those " +
-							"doors on an account nobody claimed. An account the invitee signed in to is kept, and " +
+						Text: "Until it is accepted it is an ordinary row with no password, so magic-link login " +
+							"reaches it as it reaches any account, for whoever reads the invited mailbox — the " +
+							"trust the invitation itself rests on, and the way in a deployment that accepts " +
+							"invitations by magic link relies on. `/forgot-password` does not: while an " +
+							"invitation still reserves the account — no password, no factor, the address " +
+							"unverified — it answers as for an unknown address and sends nothing, and " +
+							"`/reset-password` refuses a token for it, because a reset would leave a password on " +
+							"an unverified address, which the login refuses outside lazy mode, on an account the " +
+							"invitation can no longer activate. Revoking the invitation deletes the account only " +
+							"if nobody has used it — no password, no factor, the address still unverified, no " +
+							"session ever opened, no linked provider — which closes the remaining door on an " +
+							"account nobody claimed. An account the invitee signed in to is kept, and " +
 							"`accountRemoved` says so; removing it is an explicit `DELETE <admin>/api/users/{id}`. " +
-							"An expired invitation stays listed, as expired, until it is revoked.",
+							"An expired invitation stays listed, as expired, until it is revoked, and so does its " +
+							"account: the window bounds the token, not the account.",
+					},
+					{
+						Label: "Not under the first-user policy",
+						Text: "`AdminFirstUser` names the console's user by user-id order, and an invitation " +
+							"creates its account, with an id minted at random, the moment it is sent, so the " +
+							"invited account could become the user that policy names. " +
+							"`POST <admin>/api/users/invitations` answers `501` under that policy, whoever calls it.",
 					},
 					{
 						Label: "Enrolling at acceptance is still opt-in",

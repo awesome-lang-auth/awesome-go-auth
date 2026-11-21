@@ -586,10 +586,28 @@ func (s *Service) sessionIDOf(tokens AuthTokens) string {
 	return claims.Sid
 }
 
+// ForgotPassword mints a password-reset token for the account that holds an
+// address, stores its hash and delivers it through Config.SendPasswordReset.
+// An address no account holds is silence: an empty token and no error, so
+// that the route answers it as it answers a known one.
+//
+// An account an invitation still reserves (reservedByInvitation) is answered
+// the same way, and nothing is stored or sent: the invitation is how it gets
+// its password. A reset would set one and leave the address unverified, which
+// the login refuses outside lazy mode, and the invitation cannot activate an
+// account that has a password, so the invitee would be locked out of both.
+// See invitation.go.
 func (s *Service) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (string, error) {
 	in.Email = normalizeEmail(in.Email)
 	user, err := s.users.GetUserByEmail(ctx, in.Email, in.TenantID)
 	if err != nil {
+		return "", nil
+	}
+	reserved, err := s.reservedByInvitation(ctx, user)
+	if err != nil {
+		return "", err
+	}
+	if reserved {
 		return "", nil
 	}
 	ps, ok := s.users.(UserPasswordStore)
@@ -614,6 +632,15 @@ func (s *Service) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (s
 	return resetToken, nil
 }
 
+// ResetPassword sets a new password with a token ForgotPassword minted, and
+// clears the token.
+//
+// A token for an account an invitation still reserves is refused as an invalid
+// one, whatever minted it. ForgotPassword mints none for such an account, but
+// one minted while the account's only invitation was being accepted — consumed,
+// and then handed back because the acceptance failed — would otherwise set a
+// password the invitation can no longer replace on an address still
+// unverified. See reservedByInvitation.
 func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) error {
 	if len(in.NewPassword) < s.cfg.MinPasswordLen {
 		return ErrWeakPassword
@@ -624,6 +651,13 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 	}
 	user, err := ps.GetUserByResetTokenHash(ctx, hashToken(in.Token))
 	if err != nil || user.ResetTokenExpiresAt == nil || s.now().After(user.ResetTokenExpiresAt.Add(s.cfg.ClockSkew)) {
+		return ErrInvalidToken
+	}
+	reserved, err := s.reservedByInvitation(ctx, user)
+	if err != nil {
+		return err
+	}
+	if reserved {
 		return ErrInvalidToken
 	}
 	pwHash, err := hashPassword(in.NewPassword, s.cfg.BcryptCost)

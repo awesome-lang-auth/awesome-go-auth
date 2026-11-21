@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -113,14 +114,28 @@ func adminInvitationContext(r *http.Request, cfg HTTPConfig) context.Context {
 
 // adminCreateInvitation is POST <admin>/api/users/invitations.
 //
-// The body is {email, role?, tenantId?, metadata?, emailLang?}. tenantId is
-// the spelling every body in this package uses for a tenant. A body that will
-// not decode leaves every field zero, the rule admin_write.go settled, and so
-// answers the missing address.
+// The body is {email, role?, tenantId?, metadata?, emailLang?}, and it must be
+// sent as application/json. tenantId is the spelling every body in this
+// package uses for a tenant. A JSON body that will not decode leaves every
+// field zero, the rule admin_write.go settled, and so answers the missing
+// address.
 //
 // The refusals, in order:
 //
-//   - 400 "Email is required".
+//   - 415 "Content-Type must be application/json". The admin router has no
+//     CSRF layer and its guard reads the session cookie, so a cross-site form
+//     — which can send text/plain, never application/json without a CORS
+//     preflight — would otherwise be able to invite an address of its
+//     choosing with a signed-in administrator's cookie. This route is the one
+//     that turns such a request into an account, so it is the one that
+//     refuses every other content type; a machine caller sends JSON anyway.
+//   - 400 "Email is required", and 400 "Email is not a valid address" for one
+//     that is not a single plain mailbox (ErrInvalidInvitationEmail).
+//   - 501 "Invitations are not available under the first-user access
+//     policy": AdminFirstUser names the console's user by user-id order, and
+//     an invitation creates its account, with a random id, at once, so any
+//     invitation — whoever sends it — could make the invitee that user.
+//     Nothing is created.
 //   - 501 "Invitation delivery is not configured": no Config.SendInvitation,
 //     and AdminOptions.RevealInvitationToken not set. Nothing is created — an
 //     invitation nobody can deliver would only reserve the address.
@@ -128,6 +143,10 @@ func adminInvitationContext(r *http.Request, cfg HTTPConfig) context.Context {
 //     needs (Service.InviteUser).
 //   - 409 "User already exists": the address has an account, and it is not a
 //     pending one Config.InvitationReinvite lets this call invite again.
+//   - 409 "Pending invitation has a different role or tenant": a
+//     re-invitation that names a role or a tenant other than the pending
+//     account's (ErrInvitationMismatch). A re-invitation reuses the account as
+//     it is; to change either, revoke the invitation and invite again.
 //   - 502 "Invitation could not be delivered": the sender failed. The call has
 //     been undone, so repeating it is safe.
 //
@@ -139,6 +158,10 @@ func adminInvitationContext(r *http.Request, cfg HTTPConfig) context.Context {
 // always wins over the option, so a deployment that has one never hands a
 // token to an HTTP caller.
 func (a *Auth) adminCreateInvitation(w http.ResponseWriter, r *http.Request, cfg HTTPConfig) {
+	if !jsonContentType(r) {
+		writeAdminError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return
+	}
 	var body struct {
 		Email     string         `json:"email"`
 		Role      string         `json:"role"`
@@ -149,6 +172,10 @@ func (a *Auth) adminCreateInvitation(w http.ResponseWriter, r *http.Request, cfg
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if strings.TrimSpace(body.Email) == "" {
 		writeAdminError(w, http.StatusBadRequest, "Email is required")
+		return
+	}
+	if firstUserPolicy(cfg.Admin.AccessPolicy) {
+		writeAdminError(w, http.StatusNotImplemented, "Invitations are not available under the first-user access policy")
 		return
 	}
 	hasSender := a.service.cfg.SendInvitation != nil
@@ -178,8 +205,14 @@ func (a *Auth) adminCreateInvitation(w http.ResponseWriter, r *http.Request, cfg
 	case errors.Is(err, ErrInvalidInput):
 		writeAdminError(w, http.StatusBadRequest, "Email is required")
 		return
+	case errors.Is(err, ErrInvalidInvitationEmail):
+		writeAdminError(w, http.StatusBadRequest, "Email is not a valid address")
+		return
 	case errors.Is(err, ErrUserExists):
 		writeAdminError(w, http.StatusConflict, "User already exists")
+		return
+	case errors.Is(err, ErrInvitationMismatch):
+		writeAdminError(w, http.StatusConflict, "Pending invitation has a different role or tenant")
 		return
 	case errors.Is(err, ErrDeliveryFailed):
 		writeAdminError(w, http.StatusBadGateway, "Invitation could not be delivered")
@@ -212,6 +245,20 @@ func (a *Auth) adminCreateInvitation(w http.ResponseWriter, r *http.Request, cfg
 		status = http.StatusOK
 	}
 	WriteJSON(w, status, answer)
+}
+
+// jsonContentType reports whether the request declares an application/json
+// body, parameters such as charset allowed.
+func jsonContentType(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mediaType == "application/json"
+}
+
+// firstUserPolicy reports whether the console is guarded by AdminFirstUser,
+// the one policy an invitation can subvert: it names its user by user-id
+// order, and an invitation writes an account with a random id at once.
+func firstUserPolicy(policy *AdminAccessPolicy) bool {
+	return policy != nil && policy.Predicate == nil && policy.Kind == AdminPolicyFirstUser
 }
 
 // adminInvitationRow is one invitation in the listing. It carries neither the

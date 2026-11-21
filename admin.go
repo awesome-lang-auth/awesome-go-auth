@@ -123,6 +123,13 @@ const (
 	// (admin.router.ts:372-374). AdminUserStore's doc comment carries why that
 	// ordering is a contract here and a promise the reference's own stores do
 	// not keep.
+	//
+	// Under this policy POST <admin>/api/users/invitations refuses to invite
+	// (501). An invitation creates its account, with an id minted at random,
+	// the moment it is sent, and the user this policy names is chosen by id
+	// order, so the invited account could become that user. A host must not
+	// call Auth.InviteUser directly under this policy either; an invite-only
+	// deployment uses AdminIsAdminFlag or AdminPredicate.
 	AdminPolicyFirstUser AdminPolicyKind = "first-user"
 	// AdminPolicyIsAdminFlag grants a user whose IsAdmin is set, and reads
 	// nothing else — not Role, not RBAC (admin.router.ts:370). See User.IsAdmin.

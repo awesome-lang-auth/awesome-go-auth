@@ -166,6 +166,10 @@ func testInvitations(t *testing.T, mount Mounter) {
 		result := invite(t, env, "invitee@example.com")
 		AssertError(t, env.Do(acceptRequest(env, result.Token, "short")),
 			http.StatusBadRequest, "Password is too weak", auth.CodeWeakPassword)
+		// Longer than the 72 bytes bcrypt hashes: refused like a short one,
+		// before the consume, rather than a 500 after it.
+		AssertError(t, env.Do(acceptRequest(env, result.Token, strings.Repeat("p", 73))),
+			http.StatusBadRequest, "Password is too weak", auth.CodeWeakPassword)
 		AssertError(t, env.Do(acceptRequest(env, result.Token, "")),
 			http.StatusBadRequest, "Token and password are required", auth.CodeInvalidInput)
 		AssertError(t, env.Do(env.Request(http.MethodPost, auth.InvitationAcceptRoute, nil)),
@@ -175,6 +179,33 @@ func testInvitations(t *testing.T, mount Mounter) {
 		AssertError(t, env.Do(req), http.StatusBadRequest, auth.HTTPErrInvalidBody.Message, auth.CodeInvalidBody)
 		// None of that cost the invitee the invitation.
 		AssertStatus(t, env.Do(acceptRequest(env, result.Token, "a-new-password")), http.StatusCreated)
+	})
+
+	t.Run("/forgot-password answers an invited address as an unknown one, and sends nothing", func(t *testing.T) {
+		var resets []auth.PasswordResetDelivery
+		env, _ := invitationEnv(t, mount, auth.DefaultHTTPConfig(),
+			auth.WithPasswordResetSender(func(_ context.Context, d auth.PasswordResetDelivery) error {
+				resets = append(resets, d)
+				return nil
+			}))
+		result := invite(t, env, "invitee@example.com")
+		forgot := func(email string) *httptest.ResponseRecorder {
+			return env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{"email": email, "tenantId": testTenant}))
+		}
+		unknown := forgot("nobody@example.com")
+		invited := forgot("invitee@example.com")
+		AssertStatus(t, invited, unknown.Code)
+		if invited.Body.String() != unknown.Body.String() {
+			t.Fatalf("invited = %q, unknown = %q: the answer tells a reserved account from no account", invited.Body.String(), unknown.Body.String())
+		}
+		if len(resets) != 0 {
+			t.Fatalf("resets = %+v, want none for an account an invitation reserves", resets)
+		}
+		// The invitation is the way in, and the login then works.
+		AssertStatus(t, env.Do(acceptRequest(env, result.Token, "a-new-password")), http.StatusCreated)
+		AssertStatus(t, env.Do(env.Request(http.MethodPost, "/login", map[string]string{
+			"email": "invitee@example.com", "password": "a-new-password", "tenantId": testTenant,
+		})), http.StatusOK)
 	})
 
 	t.Run("Require2FA: 2FA_SETUP_REQUIRED, and enrolling opens the session", func(t *testing.T) {

@@ -206,14 +206,22 @@ type Config struct {
 	// DefaultInvitationTTL, 72 hours, so a Config built by hand before this
 	// field existed is still valid; a negative value is refused.
 	// WithInvitationTTL sets it.
+	//
+	// It bounds the token, not the account. The pending account an expired
+	// invitation reserved stays — listed with its invitation as expired, and
+	// signed in to by a magic link to its address, with the invited role —
+	// until an administrator revokes the invitation, which removes the account
+	// if nobody has used it. An offer meant to lapse is revoked.
 	InvitationTTL time.Duration
 	// InvitationReinvite decides what inviting an address that already has an
 	// account does when that account is still pending — created by an
 	// invitation that has not been accepted. False, the default, refuses it
 	// like any other existing address (409); true makes the call idempotent:
-	// the same account is invited again, a fresh token is delivered, and the
-	// tokens it replaces stop working. An active account is refused either
-	// way. WithInvitationReinvite sets it.
+	// the same account is invited again as it is, a fresh token is delivered,
+	// and the tokens it replaces stop working. A re-invitation that names a
+	// role or a tenant other than the account's is refused
+	// (ErrInvitationMismatch) rather than answered as if it had been applied.
+	// An active account is refused either way. WithInvitationReinvite sets it.
 	InvitationReinvite bool
 	// SendInvitation delivers an invitation's token — the reference's
 	// mailer.sendInvitation (mailer.service.ts:210-227) as a seam, like the

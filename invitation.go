@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/mail"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // This file is the invitation flow: how an account comes to exist in a
@@ -44,15 +46,34 @@ import (
 //     GET <admin>/api/users/invitations lists the outstanding ones.
 //
 // What the pending account is. It is an ordinary row in the UserStore with no
-// password, so the routes that act on an address act on it too:
-// /forgot-password and /magic-link/send mail its owner a credential, which is
-// as good as the invitation for whoever reads that mailbox. The invitation is
-// the convenient door, not the only one, and the trust is the same: control of
-// the invited address. What the invitation adds is the window and the
-// revocation. A revoked invitation takes the account with it when nobody has
-// used that account — no route then answers for the address — and leaves an
-// account somebody has signed in to; an expired one stays listed, and
-// revocable, until an administrator revokes it or deletes the user.
+// password and an unverified address, written when the invitation is, so that
+// its id is known at once. Two routes that act on an address treat it
+// differently:
+//
+//   - /magic-link/send mails its owner a sign-in link, as it does for any
+//     account. Following it signs the account in and marks the address
+//     verified. That is the way in of a deployment that accepts invitations by
+//     magic link, and the trust is the invitation's own: control of the
+//     invited address.
+//   - /forgot-password does not reach it. While an invitation still reserves
+//     the account — no password, no factor, the address unverified, an
+//     invitation outstanding, expired or not — the route answers as it answers
+//     an address it does not have and sends nothing, and POST /reset-password
+//     refuses a token for it the same way (reservedByInvitation). A reset
+//     would set a password and leave the address unverified, which the login
+//     refuses outside lazy mode, while the invitation could no longer activate
+//     an account that has a password: the invitee would be locked out of both.
+//     The invitation, or a re-invitation once it has expired, is how such an
+//     account gets its password.
+//
+// What the invitation adds is the window and the revocation. A revoked
+// invitation takes the account with it when nobody has used that account — no
+// route then answers for the address — and leaves an account somebody has
+// signed in to. The window bounds the token, not the account: an expired
+// invitation stays listed, and revocable, and its account stays too — a magic
+// link still signs it in, with the role it was invited with — until an
+// administrator revokes the invitation or deletes the user. An offer that is
+// meant to lapse is revoked, not left to expire.
 
 // InvitationAcceptRoute is the public route an invitee redeems an invitation
 // at, relative to the mount prefix. It is also the path InvitationURL builds
@@ -123,6 +144,20 @@ var (
 	// together with the record, for an invitation that was already accepted or
 	// revoked.
 	ErrInvitationNotPending = errors.New("auth: invitation is no longer pending")
+	// ErrInvalidInvitationEmail is InviteUser's refusal of an address that is
+	// not one plain mailbox: a list ("a@x.com, b@y.com"), a display-name form
+	// ("Name <a@x.com>"), or one carrying whitespace or a control character
+	// such as CR or LF. Accepting an invitation marks the address verified on
+	// the strength of the token having reached exactly one mailbox, so an
+	// address that a mail gateway could fan out to several is refused before
+	// anything is written.
+	ErrInvalidInvitationEmail = errors.New("auth: the invitation address is not a single plain mailbox")
+	// ErrInvitationMismatch is a re-invitation (Config.InvitationReinvite)
+	// whose role or tenant differs from the pending account's. A re-invitation
+	// reuses the account as it is, so the call is refused rather than answered
+	// as if the new role or tenant had been applied; the administrator revokes
+	// the pending invitation and invites again to change them.
+	ErrInvitationMismatch = errors.New("auth: the pending account was invited with a different role or tenant")
 )
 
 // HTTPErrInvalidInvitation is POST <prefix>/invitations/accept's refusal of a
@@ -218,6 +253,18 @@ func (inv Invitation) Expired(now time.Time) bool { return !now.Before(inv.Expir
 //     returned with a nil error. An accepted or already revoked one is
 //     returned unchanged with ErrInvitationNotPending. An unknown id is
 //     ErrInvitationNotFound.
+//   - ReleaseInvitation hands back a consume whose acceptance could not be
+//     completed — a store write that failed after the token was spent — so
+//     that the invitee's retry finds the invitation as it was. It is atomic
+//     against ConsumeInvitation and RevokeInvitation, and it undoes only the
+//     consume it names: while record id is accepted at acceptedAt — the
+//     AcceptedAt that ConsumeInvitation returned — and not revoked, AcceptedAt
+//     is cleared, the record is pending again (listed, revocable, its token
+//     honoured until ExpiresAt), and the error is nil. Anything else — an
+//     unknown id, a pending or revoked record, one accepted at another
+//     instant — is ErrInvitationNotFound and changes nothing. The acceptedAt
+//     condition is what keeps a release that arrives twice, or late, from
+//     undoing an acceptance that came after it.
 //   - ListPendingInvitations pages the records that are neither accepted nor
 //     revoked, expired ones included, in ID order (ascending, Go string
 //     comparison), under the paging rules AdminUserStore states: limit <= 0 is
@@ -227,10 +274,11 @@ func (inv Invitation) Expired(now time.Time) bool { return !now.Before(inv.Expir
 //     create, consume and revoke that returned before it was called. It is how
 //     a re-invitation tells an account an invitation reserved from one some
 //     other route left passwordless — a stale empty answer makes a legitimate
-//     re-invitation a 409 — and how a revocation tells whether another
-//     invitation still holds the account — a stale answer that misses a newer
-//     invitation lets the revocation delete the account that invitation is
-//     about to activate.
+//     re-invitation a 409 — how a revocation tells whether another invitation
+//     still holds the account — a stale answer that misses a newer invitation
+//     lets the revocation delete the account that invitation is about to
+//     activate — and how /forgot-password tells an account an invitation
+//     still reserves, which it does not reset (reservedByInvitation).
 //   - Records, and the Metadata map in them, belong to the caller once
 //     returned: the store keeps its own copy.
 //   - Errors other than the two sentinels are answered as the generic 500 and
@@ -264,6 +312,12 @@ func (inv Invitation) Expired(now time.Time) bool { return !now.Before(inv.Expir
 //     setting revokedAt; on a cancellation read the item (a consistent
 //     GetItem, or ReturnValuesOnConditionCheckFailure ALL_OLD) to tell
 //     ErrInvitationNotPending from ErrInvitationNotFound.
+//   - ReleaseInvitation: the consume's transaction run backwards — an Update
+//     of the invitation conditioned on acceptedAt = :acceptedAt AND
+//     attribute_not_exists(revokedAt), REMOVEing acceptedAt and SETting the
+//     sparse index key again, and a Put of the membership item — with
+//     :acceptedAt encoded exactly as the consume wrote it. A cancelled
+//     transaction is ErrInvitationNotFound.
 //   - PendingInvitationsForUser: a Query of PK "INVUSER#<userId>" with
 //     ConsistentRead, then a consistent BatchGetItem of the invitations it
 //     names. The membership item leaves the partition in the very transaction
@@ -278,6 +332,7 @@ type InvitationStore interface {
 	CreateInvitation(ctx context.Context, invitation Invitation) error
 	ConsumeInvitation(ctx context.Context, tokenHash string, now time.Time) (Invitation, error)
 	RevokeInvitation(ctx context.Context, id string, now time.Time) (Invitation, error)
+	ReleaseInvitation(ctx context.Context, id string, acceptedAt time.Time) error
 	ListPendingInvitations(ctx context.Context, limit, offset int) ([]Invitation, error)
 	PendingInvitationsForUser(ctx context.Context, userID string) ([]Invitation, error)
 }
@@ -285,16 +340,22 @@ type InvitationStore interface {
 // InviteUserInput is what Service.InviteUser takes.
 type InviteUserInput struct {
 	// Email is the address to invite. It is normalised as Register normalises
-	// it, and required.
+	// it — trimmed and lowercased — and required, and it must then be one
+	// plain mailbox (ErrInvalidInvitationEmail).
 	Email string
-	// TenantID is the tenant the account is created in.
+	// TenantID is the tenant the account is created in. A re-invitation that
+	// names a tenant other than the pending account's is ErrInvitationMismatch.
 	TenantID string
 	// Role is written to User.Role on the account the call creates. Optional.
-	// A re-invitation reuses the pending account as it is, role included.
+	// A re-invitation reuses the pending account as it is: an empty Role keeps
+	// the account's, and a different one is ErrInvitationMismatch rather than
+	// a role silently left unapplied.
 	Role string
 	// Metadata is stored on the invitation and handed to the sender, and is
 	// written through the UserMetadataStore, when one is configured, for an
-	// account the call creates. Optional.
+	// account the call creates. Optional. A re-invitation's metadata rides on
+	// the new invitation and its delivery only: the account keeps the metadata
+	// the invitation that created it wrote.
 	Metadata map[string]any
 	// InvitedBy and InvitedByKind are recorded on the invitation and the
 	// identity.user.invited event: the audit of who invited. The admin route
@@ -405,6 +466,60 @@ func pendingAccount(user User) bool {
 	return user.PasswordHash == "" && !hasTOTP
 }
 
+// reservedByInvitation reports whether user is an account an invitation still
+// holds for its invitee: invitations are configured, the account has no
+// password, no factor and an unverified address, and an invitation for it is
+// outstanding, expired or not. Such an account gets its password through the
+// invitation and nothing else: Service.ForgotPassword answers for it as for an
+// unknown address, and Service.ResetPassword refuses a token for it. See the
+// file comment for why.
+//
+// An invitee who signed in by magic link has a verified address, so the
+// account is no longer reserved and resets as any account does: the reset
+// then leaves it with a password and a verified address, which the login
+// accepts.
+func (s *Service) reservedByInvitation(ctx context.Context, user User) (bool, error) {
+	if s.cfg.Invitations == nil || !pendingAccount(user) || user.IsEmailVerified {
+		return false, nil
+	}
+	pending, err := s.cfg.Invitations.PendingInvitationsForUser(ctx, user.ID)
+	if err != nil {
+		return false, fmt.Errorf("auth: read the account's invitations: %w", err)
+	}
+	return len(pending) > 0, nil
+}
+
+// plainMailbox reports whether address, already normalised, is one bare
+// addr-spec: no whitespace or control character anywhere in it, and net/mail
+// parses it as exactly one address with no display name that is the input
+// itself. A list, a display-name form, a comment and an address carrying CR or
+// LF are all refused.
+func plainMailbox(address string) bool {
+	for _, r := range address {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	parsed, err := mail.ParseAddress(address)
+	return err == nil && parsed.Name == "" && parsed.Address == address
+}
+
+// checkNewPassword is every refusal of a password AcceptInvitation makes before
+// it spends the token: shorter than Config.MinPasswordLen, or longer than the
+// bcryptMaxPasswordBytes that hashPassword can hash. Both are ErrWeakPassword,
+// the policy's one 400 (WEAK_PASSWORD), so that a password the account could
+// never be given is refused while the invitation is still pending rather than
+// after it has been spent.
+func (s *Service) checkNewPassword(password string) error {
+	if len(password) < s.cfg.MinPasswordLen {
+		return ErrWeakPassword
+	}
+	if len(password) > bcryptMaxPasswordBytes {
+		return fmt.Errorf("%w: longer than %d bytes", ErrWeakPassword, bcryptMaxPasswordBytes)
+	}
+	return nil
+}
+
 // InviteUser creates a pending account for an address and an invitation to
 // activate it, and delivers the invitation through Config.SendInvitation.
 //
@@ -412,26 +527,47 @@ func pendingAccount(user User) bool {
 //
 //  1. Config.Invitations unset, or a user store without UserPasswordStore,
 //     EmailVerificationStore or UserAccountStore, is ErrFeatureNotSupported,
-//     before anything is read. An empty address is ErrInvalidInput.
+//     before anything is read. An empty address is ErrInvalidInput, and one
+//     that is not a single plain mailbox ErrInvalidInvitationEmail.
 //  2. An account that already holds the address is ErrUserExists — unless
 //     Config.InvitationReinvite is on and that account is still pending: no
 //     password, no factor, and an invitation outstanding for it. Then the
-//     account is reused and AccountCreated is false. Otherwise a new account
-//     is created in in.TenantID with no password, an unverified address and
-//     in.Role, and in.Metadata is written through the UserMetadataStore when
-//     one is configured.
+//     account is reused as it is and AccountCreated is false; a role or a
+//     tenant other than the account's is ErrInvitationMismatch. Otherwise a
+//     new account is created in in.TenantID with no password, an unverified
+//     address and in.Role, and in.Metadata is written through the
+//     UserMetadataStore when one is configured.
 //  3. A token of 256 random bits is minted and the invitation stored under its
 //     hash, valid Config.InvitationTTL.
 //  4. With a sender configured the invitation is delivered. A failed send
 //     undoes the call: the invitation is revoked and an account this call
 //     created is deleted, so the same call can simply be repeated. The error
-//     joins ErrDeliveryFailed and the sender's.
-//  5. On a re-invitation, the invitations it replaces are revoked, so the
-//     account has one live token.
+//     joins ErrDeliveryFailed and the sender's. When the revocation itself
+//     fails — the invitee accepted in between, which a sender that delivers
+//     and then reports a failure allows, or the store failed — the account is
+//     kept, since it may be in use, and the failure is logged.
+//  5. On a re-invitation, the invitations read at step 2 are revoked, so the
+//     account has one live token. Two re-invitations of one account that race
+//     each other can each leave their own token live: both reach the same
+//     mailbox, and the first one accepted activates the account, after which
+//     the other is refused like any token for an active account.
 //  6. identity.user.invited is raised.
 //
 // The plaintext token is in the result whatever the configuration: a direct
 // caller with no sender delivers it itself. It is never logged.
+//
+// An invitation creates its account at once, with a random id, and the admin
+// console's first-user access policy (AdminFirstUser) names its user by
+// user-id order, so the invited account could become that user: the admin
+// route refuses to invite under that policy, and a host calling this directly
+// must not call it there either.
+//
+// The account appears and goes without the reference's identity.user.created
+// and identity.user.deleted: those are raised where the reference raises them
+// (POST /register and DELETE /account), as the admin console's own user
+// deletion raises nothing. identity.user.invited (accountCreated) and
+// identity.user.invitation.revoked (accountRemoved) are this flow's record of
+// both.
 func (s *Service) InviteUser(ctx context.Context, in InviteUserInput) (InvitationResult, error) {
 	store := s.cfg.Invitations
 	if store == nil {
@@ -443,6 +579,9 @@ func (s *Service) InviteUser(ctx context.Context, in InviteUserInput) (Invitatio
 	email := normalizeEmail(in.Email)
 	if email == "" {
 		return InvitationResult{}, ErrInvalidInput
+	}
+	if !plainMailbox(email) {
+		return InvitationResult{}, ErrInvalidInvitationEmail
 	}
 
 	now := s.now()
@@ -466,6 +605,9 @@ func (s *Service) InviteUser(ctx context.Context, in InviteUserInput) (Invitatio
 			// invitation reserved. Re-inviting it would hand a password to an
 			// account nobody invited.
 			return InvitationResult{}, ErrUserExists
+		}
+		if (in.Role != "" && in.Role != existing.Role) || in.TenantID != existing.TenantID {
+			return InvitationResult{}, ErrInvitationMismatch
 		}
 		user = existing
 	} else {
@@ -508,11 +650,20 @@ func (s *Service) InviteUser(ctx context.Context, in InviteUserInput) (Invitatio
 		// Undo, so that a retry of the same call finds nothing in its way: in
 		// conflict mode the account would otherwise answer 409 to the retry.
 		// The undo is best effort and its own failures are logged — the send
-		// failure is what the caller is told about.
-		if _, revokeErr := store.RevokeInvitation(ctx, invitation.ID, s.now()); revokeErr != nil {
-			s.logf("auth: invite: revoking the undelivered invitation %s failed: %v", invitation.ID, revokeErr)
+		// failure is what the caller is told about — and it runs on a context
+		// the caller's cancellation does not reach, so that a client that went
+		// away does not leave half of it done.
+		//
+		// The account goes only once the invitation is dead. A revocation
+		// that fails means the token may still be honoured, or — a sender that
+		// delivered and then reported a failure — that the invitee has already
+		// accepted it, and deleting the account would delete theirs.
+		undo := context.WithoutCancel(ctx)
+		if _, revokeErr := store.RevokeInvitation(undo, invitation.ID, s.now()); revokeErr != nil {
+			s.logf("auth: invite: revoking the undelivered invitation %s failed, so its account %s is kept: %v", invitation.ID, user.ID, revokeErr)
+		} else {
+			s.discardPendingAccount(undo, user, created)
 		}
-		s.discardPendingAccount(ctx, user, created)
 		return InvitationResult{}, err
 	}
 
@@ -627,9 +778,11 @@ func (s *Service) deliverInvitation(ctx context.Context, invitation Invitation, 
 // In order:
 //
 //  1. Config.Invitations unset is ErrFeatureNotSupported. An empty token or
-//     password is ErrInvalidInput; a password shorter than
-//     Config.MinPasswordLen is ErrWeakPassword. Neither touches the token, so
-//     a rejected password does not cost the invitee the invitation.
+//     password is ErrInvalidInput, and a password the account could never be
+//     given is ErrWeakPassword: shorter than Config.MinPasswordLen, or longer
+//     than the 72 bytes bcrypt hashes (checkNewPassword). None of them
+//     touches the token, so a rejected password does not cost the invitee the
+//     invitation.
 //  2. The token is consumed: InvitationStore.ConsumeInvitation by its hash,
 //     atomically and once, then the stored hash compared with the presented
 //     one in constant time. An unknown, expired, revoked or already accepted
@@ -639,24 +792,38 @@ func (s *Service) deliverInvitation(ctx context.Context, invitation Invitation, 
 //     ErrInvalidInvitation too — the token is spent either way. Every refusal
 //     from here and from step 2 is the same sentinel, so the route answers
 //     every one of them alike.
-//  4. The password is stored and the address marked verified: the token is
+//  4. Everything that can fail without writing is done before anything is
+//     written: the password is hashed, and when a second factor is demanded
+//     of the account (Config.Require2FA, the user's own flag) the login's own
+//     challenge is minted for the account as it is about to be
+//     (twoFactorChallenge). With no factor to present that challenge is
+//     2FA_SETUP_REQUIRED, whose tempToken is an enrolment token under
+//     Config.EnrolOnLogin — so the invitee enrols TOTP through POST
+//     <prefix>/2fa/setup and POST <prefix>/2fa/verify-setup before any
+//     session exists — and a token no route completes without it, exactly as
+//     the login answers.
+//  5. The address is marked verified, then the password stored: the token is
 //     proof that the invitee reads the mailbox it was sent to. A host that
 //     reveals the token (AdminOptions.RevealInvitationToken) and hands it over
 //     some other channel takes that guarantee on itself.
-//  5. identity.user.invitation.accepted is raised.
-//  6. What the login would do next with this account and this password. When
-//     a second factor is demanded of it (Config.Require2FA, the user's own
-//     flag) the result carries the login's own challenge (twoFactorChallenge):
-//     with no factor to present that is 2FA_SETUP_REQUIRED, whose tempToken is
-//     an enrolment token under Config.EnrolOnLogin — so the invitee enrols
-//     TOTP through POST <prefix>/2fa/setup and POST <prefix>/2fa/verify-setup
-//     before any session exists — and a token no route completes without it,
-//     exactly as the login answers. Otherwise it is the registration's
-//     answer: a session only when Config.IssueSessionOnRegister allows one
-//     (registerIssuesSession), raising identity.auth.login.success with method
-//     "local", and none by default — the invitee then logs in.
+//  6. identity.user.invitation.accepted is raised.
+//  7. The challenge of step 4 is the answer when there is one. Otherwise it is
+//     the registration's: a session only when Config.IssueSessionOnRegister
+//     allows one (registerIssuesSession), raising identity.auth.login.success
+//     with method "local", and none by default — the invitee then logs in.
 //
-// A failure after step 2 leaves the token spent; the invitee is re-invited.
+// A failure of the acceptance's own after step 2 — an account that cannot be
+// read, a hash or a challenge that cannot be minted, a store write that fails
+// — does not cost the invitee the invitation. The address is marked unverified
+// again if step 5 had marked it, the invitation is handed back
+// (InvitationStore.ReleaseInvitation), and the error is returned, so that the
+// same request, retried, finds the invitation and the account as they were.
+// Only when the hand-back fails as well is the account left pending with no
+// invitation; that is logged with both ids, and DELETE <admin>/api/users/{id}
+// followed by a new invitation is the way out. A session that cannot be opened
+// at step 7 does not undo the acceptance: the account is active by then, so the
+// answer is the registration's without a session, the failure is logged, and
+// the invitee logs in.
 func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput) (InvitationAcceptance, error) {
 	store := s.cfg.Invitations
 	if store == nil {
@@ -665,8 +832,8 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 	if in.Token == "" || in.Password == "" {
 		return InvitationAcceptance{}, ErrInvalidInput
 	}
-	if len(in.Password) < s.cfg.MinPasswordLen {
-		return InvitationAcceptance{}, ErrWeakPassword
+	if err := s.checkNewPassword(in.Password); err != nil {
+		return InvitationAcceptance{}, err
 	}
 	// Checked before the token is spent, for the same reason as the password:
 	// a deployment fault must not cost the invitee the invitation. InviteUser
@@ -681,7 +848,8 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 	}
 
 	presented := hashToken(in.Token)
-	invitation, err := store.ConsumeInvitation(ctx, presented, s.now())
+	consumedAt := s.now()
+	invitation, err := store.ConsumeInvitation(ctx, presented, consumedAt)
 	switch {
 	case errors.Is(err, ErrInvitationNotFound):
 		return InvitationAcceptance{}, ErrInvalidInvitation
@@ -695,13 +863,20 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 	if !secureEqual(invitation.TokenHash, presented) {
 		return InvitationAcceptance{}, ErrInvalidInvitation
 	}
+	if invitation.AcceptedAt == nil {
+		// The contract says the record comes back as updated; a store that
+		// leaves the field out is handed back the instant it was given.
+		invitation.AcceptedAt = &consumedAt
+	}
 
+	// From here the token is spent. A refusal leaves it spent; any other
+	// failure hands it back (abandonAcceptance).
 	user, err := s.users.GetUserByID(ctx, invitation.UserID, invitation.TenantID)
 	switch {
 	case errors.Is(err, ErrUserNotFound):
 		return InvitationAcceptance{}, ErrInvalidInvitation
 	case err != nil:
-		return InvitationAcceptance{}, fmt.Errorf("auth: accept invitation: read user: %w", err)
+		return s.abandonAcceptance(ctx, invitation, fmt.Errorf("auth: accept invitation: read user: %w", err))
 	}
 	if !pendingAccount(user) || normalizeEmail(user.Email) != invitation.Email {
 		return InvitationAcceptance{}, ErrInvalidInvitation
@@ -709,48 +884,90 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 
 	pwHash, err := hashPassword(in.Password, s.cfg.BcryptCost)
 	if err != nil {
-		return InvitationAcceptance{}, err
+		return s.abandonAcceptance(ctx, invitation, err)
 	}
-	if err := passwords.UpdatePassword(ctx, user.ID, user.TenantID, pwHash); err != nil {
-		return InvitationAcceptance{}, fmt.Errorf("auth: accept invitation: set password: %w", err)
-	}
-	if !user.IsEmailVerified {
-		if err := verification.MarkEmailVerified(ctx, user.ID, user.TenantID, true); err != nil {
-			return InvitationAcceptance{}, fmt.Errorf("auth: accept invitation: verify address: %w", err)
+	// The row as it is about to be. The enrolment token a challenge carries
+	// is bound to the stored password hash (its cred claim), so it is minted
+	// from the hash about to be written, not from the passwordless row read
+	// above; minting it before the writes is what lets a failure to mint hand
+	// the invitation back with nothing to undo.
+	activated := user
+	activated.PasswordHash = pwHash
+	activated.IsEmailVerified = true
+	var challenge *TwoFactorChallenge
+	if s.requiresTwoFactor(activated) {
+		if challenge, err = s.twoFactorChallenge(ctx, activated); err != nil {
+			return s.abandonAcceptance(ctx, invitation, err)
 		}
 	}
-	// The row as it now is. The enrolment token a challenge carries is bound
-	// to the stored password hash (its cred claim), so it has to be minted
-	// from the hash just written, not from the passwordless row read above.
-	user.PasswordHash = pwHash
-	user.IsEmailVerified = true
+
+	// The address first, then the password. Until the password is written
+	// the account is still pending, so a failure at either step leaves an
+	// account the handed-back invitation can activate — even when undoing the
+	// flag fails too, since a verified address does not stop an acceptance.
+	// The other order would leave a password on an unverified address, which
+	// neither the login nor the invitation accepts.
+	if !user.IsEmailVerified {
+		if err := verification.MarkEmailVerified(ctx, user.ID, user.TenantID, true); err != nil {
+			return s.abandonAcceptance(ctx, invitation, fmt.Errorf("auth: accept invitation: verify address: %w", err))
+		}
+	}
+	if err := passwords.UpdatePassword(ctx, user.ID, user.TenantID, pwHash); err != nil {
+		if !user.IsEmailVerified {
+			if undoErr := verification.MarkEmailVerified(context.WithoutCancel(ctx), user.ID, user.TenantID, false); undoErr != nil {
+				s.logf("auth: accept invitation %s: marking the address of account %s unverified again failed: %v", invitation.ID, user.ID, undoErr)
+			}
+		}
+		return s.abandonAcceptance(ctx, invitation, fmt.Errorf("auth: accept invitation: set password: %w", err))
+	}
 
 	s.publish(ctx, func() Event {
 		return Event{
 			Name:     EventUserInvitationAccepted,
-			UserID:   user.ID,
-			TenantID: user.TenantID,
+			UserID:   activated.ID,
+			TenantID: activated.TenantID,
 			Data:     map[string]any{"invitationId": invitation.ID},
 		}
 	})
 
-	result := InvitationAcceptance{User: user, Invitation: invitation}
-	if s.requiresTwoFactor(user) {
-		challenge, err := s.twoFactorChallenge(ctx, user)
-		if err != nil {
-			return InvitationAcceptance{}, err
-		}
-		result.Challenge = challenge
+	result := InvitationAcceptance{User: activated, Invitation: invitation, Challenge: challenge}
+	if challenge != nil {
 		return result, nil
 	}
-	if s.registerIssuesSession(user) {
-		tokens, err := s.completeLocalLogin(ctx, user)
+	if s.registerIssuesSession(activated) {
+		tokens, err := s.completeLocalLogin(ctx, activated)
 		if err != nil {
-			return InvitationAcceptance{}, err
+			// The account is active and its password set: answering an error
+			// now would send the invitee back to a token that is spent. The
+			// registration's answer without a session sends them to the login.
+			s.logf("auth: accept invitation %s: account %s is active, but its session could not be opened; the invitee logs in: %v", invitation.ID, activated.ID, err)
+			return result, nil
 		}
 		result.Tokens = tokens
 	}
 	return result, nil
+}
+
+// abandonAcceptance is how AcceptInvitation fails after the consume for a
+// reason of its own rather than a refusal of the token: it hands the invitation
+// back (InvitationStore.ReleaseInvitation) and returns err, so that the
+// invitee's retry finds the invitation pending and its token honoured. The
+// release runs on a context the caller's cancellation does not reach: a client
+// that went away mid-request is the likeliest cause of the failure, and must
+// not also strand the account.
+//
+// A release that fails leaves the account pending with no invitation, which no
+// invitation route can recover; it is logged with the invitation's and the
+// account's ids — never the token or its hash — and the way out is
+// DELETE <admin>/api/users/{id} followed by a new invitation. The error that
+// caused it is what the caller is told about.
+func (s *Service) abandonAcceptance(ctx context.Context, invitation Invitation, err error) (InvitationAcceptance, error) {
+	if releaseErr := s.cfg.Invitations.ReleaseInvitation(context.WithoutCancel(ctx), invitation.ID, *invitation.AcceptedAt); releaseErr != nil {
+		s.logf("auth: accept invitation %s: the acceptance failed and the invitation could not be handed back, "+
+			"so account %s is pending with no invitation; DELETE <admin>/api/users/{id} and a new invitation free it: %v",
+			invitation.ID, invitation.UserID, releaseErr)
+	}
+	return InvitationAcceptance{}, err
 }
 
 // RevokeInvitation revokes a pending invitation — expired or not — and deletes
@@ -759,8 +976,12 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 // address still unverified, no phone and no login provider on the row, no
 // session ever opened for it, and no other invitation outstanding. An account
 // somebody has signed in to — a magic link to the invited mailbox, a password
-// reset, a linked provider — is kept, and AccountRemoved says so; deleting it
-// is then an administrator's explicit DELETE <admin>/api/users/{id}.
+// set some other way, a linked provider — is kept, and AccountRemoved says so;
+// deleting it is then an administrator's explicit DELETE
+// <admin>/api/users/{id}. An account that goes takes with it what
+// Service.DeleteAccount clears for one: its role assignments, its tenant
+// memberships and its metadata — anything a host attached to the pending
+// account between the invitation and its revocation.
 //
 // An unknown id is ErrInvitationNotFound; an invitation already accepted or
 // revoked is ErrInvitationNotPending, with the record. revokedBy and
@@ -837,12 +1058,44 @@ func (s *Service) removeReservedAccount(ctx context.Context, invitation Invitati
 		s.logf("auth: revoke invitation %s: removing the pending account %s failed: %v", invitation.ID, user.ID, err)
 		return false
 	}
-	if s.metadata != nil {
-		if err := s.metadata.ClearMetadata(ctx, user.ID); err != nil {
-			s.logf("auth: revoke invitation %s: clearing the metadata of %s failed: %v", invitation.ID, user.ID, err)
+	s.clearAccountData(ctx, invitation.ID, user)
+	return true
+}
+
+// clearAccountData removes what Service.DeleteAccount removes beside the row —
+// role assignments, tenant memberships, metadata — for an account a revocation
+// has just deleted. It runs after the row is gone, so that a delete that fails
+// leaves the account whole; an untouched account has no session to revoke. Each
+// failure is logged and the rest still runs: the account is gone either way,
+// and what is left is an orphan the log names.
+func (s *Service) clearAccountData(ctx context.Context, invitationID string, user User) {
+	if s.rbac != nil {
+		roles, err := s.rbac.GetRolesForUser(ctx, user.ID, user.TenantID)
+		if err != nil {
+			s.logf("auth: revoke invitation %s: reading the roles of %s failed: %v", invitationID, user.ID, err)
+		}
+		for _, role := range roles {
+			if err := s.rbac.RemoveRoleFromUser(ctx, user.ID, role, user.TenantID); err != nil {
+				s.logf("auth: revoke invitation %s: removing role %q from %s failed: %v", invitationID, role, user.ID, err)
+			}
 		}
 	}
-	return true
+	if s.tenants != nil {
+		tenants, err := s.tenants.GetTenantsForUser(ctx, user.ID)
+		if err != nil {
+			s.logf("auth: revoke invitation %s: reading the tenants of %s failed: %v", invitationID, user.ID, err)
+		}
+		for _, tenant := range tenants {
+			if err := s.tenants.DisassociateUserFromTenant(ctx, user.ID, tenant.ID); err != nil {
+				s.logf("auth: revoke invitation %s: removing %s from tenant %s failed: %v", invitationID, user.ID, tenant.ID, err)
+			}
+		}
+	}
+	if s.metadata != nil {
+		if err := s.metadata.ClearMetadata(ctx, user.ID); err != nil {
+			s.logf("auth: revoke invitation %s: clearing the metadata of %s failed: %v", invitationID, user.ID, err)
+		}
+	}
 }
 
 // untouchedAccount reports whether user is still the account an invitation
@@ -918,9 +1171,10 @@ func copyMetadata(metadata map[string]any) map[string]any {
 
 // InvitationAcceptHTTPError maps a Service.AcceptInvitation failure. Every
 // refusal of the token is HTTPErrInvalidInvitation; a missing field is
-// HTTPErrInvitationInputRequired and a short password the WEAK_PASSWORD every
-// other route answers; a store without the capability the flow needs, and
-// every other failure, the generic 500.
+// HTTPErrInvitationInputRequired, and a password too short for
+// Config.MinPasswordLen or too long for bcrypt the WEAK_PASSWORD every other
+// route answers; a store without the capability the flow needs, and every
+// other failure, the generic 500.
 func InvitationAcceptHTTPError(err error) HTTPError {
 	switch {
 	case errors.Is(err, ErrInvalidInvitation):

@@ -227,14 +227,21 @@ cfg.Admin = auth.AdminOptions{Enabled: true, AccessPolicy: policy, MachineAccess
 
 | Route | Guard | Answers |
 | --- | --- | --- |
-| `POST <admin>/api/users/invitations` `{email, role?, tenantId?, metadata?, emailLang?}` | the admin guard — `MachineAccess`, the session policy | `201 {success, invitationId, userId, email, expiresAt}`; `200` when `InvitationReinvite` invited a pending account again; `400` no address; `409 User already exists`; `501` no sender and no `RevealInvitationToken`, or a store without `UserPasswordStore`, `EmailVerificationStore` or `UserAccountStore`; `502` the send failed (and was undone) |
+| `POST <admin>/api/users/invitations` `{email, role?, tenantId?, metadata?, emailLang?}` as `application/json` | the admin guard — `MachineAccess`, the session policy | `201 {success, invitationId, userId, email, expiresAt}`; `200` when `InvitationReinvite` invited a pending account again; `415` a body that is not `application/json`; `400` no address, or one that is not a single plain mailbox; `409 User already exists`; `409` a re-invitation naming another role or tenant; `501` under the `AdminFirstUser` policy, with no sender and no `RevealInvitationToken`, or with a store without `UserPasswordStore`, `EmailVerificationStore` or `UserAccountStore`; `502` the send failed (and was undone) |
 | `GET <admin>/api/users/invitations?limit=&offset=` | the admin guard | `{invitations: [{id, userId, email, tenantId, role, metadata, invitedBy, invitedByKind, createdAt, expiresAt, status}], total}` — the invitations neither accepted nor revoked, `status` `pending` or `expired`; never a token or its hash |
 | `DELETE <admin>/api/users/invitations/{id}` | the admin guard | `200 {success, accountRemoved}` — the account goes too only if nobody has used it; `404` unknown; `409` already accepted or revoked |
 | `POST <prefix>/invitations/accept` `{token, password}` | none: public, CSRF-exempt, behind `HTTPConfig.RateLimiter` | see below |
 
-**Inviting.** The account is created at once — no password, no factor,
-unverified, `role` on `User.Role`, `metadata` through the `UserMetadataStore`
-when there is one — so its id is known before the invitee answers. The token is
+**Inviting.** The address is trimmed and lowercased, and must then be one plain
+mailbox — no list, no display name, no whitespace or control character
+(`ErrInvalidInvitationEmail`, `400`) — because accepting marks it verified on
+the strength of the token having reached exactly one mailbox. The route reads
+only `application/json` (`415` otherwise): the admin router has no CSRF layer and
+its guard reads the session cookie, so a cross-site `text/plain` form could
+otherwise invite an address of its choosing. The account is created at once — no
+password, no factor, unverified, `role` on `User.Role`, `metadata` through the
+`UserMetadataStore` when there is one — so its id is known before the invitee
+answers. The token is
 256 random bits; the store keeps its SHA-256 and the expiry,
 `Config.InvitationTTL` (72 hours by default) after creation. It is delivered
 through `Config.SendInvitation` with an `InvitationDelivery` (`invitationId`,
@@ -248,25 +255,48 @@ reference's template with `{link}` alone; the link is
 it — the front end that owns the accept form serves `GET` on that path and posts
 to the route, as the reference's emailed `/reset-password` link assumes. A send
 that fails undoes the call — the invitation revoked, an account it created
-deleted — so it can simply be repeated. `DeliveryWebhook.SendInvitation` posts
-the delivery as kind `invitation`.
+deleted — so it can simply be repeated; when the revocation itself fails (the
+invitee accepted in between, which a sender that delivers and then reports a
+failure allows, or the store failed) the account is kept and the failure logged.
+`DeliveryWebhook.SendInvitation` posts the delivery as kind `invitation`.
+
+**Not under `AdminFirstUser`.** That policy names the console's user by user-id
+order, and an invitation creates its account, with an id minted at random, the
+moment it is sent, so the invited account could become the user it names. The
+route answers `501` under that policy, whoever calls it, and a host must not
+call `Auth.InviteUser` there either; an invite-only deployment uses
+`AdminIsAdminFlag` or `AdminPredicate`.
 
 **Accepting.** In order: a missing field is `400 {"error":"Token and password are
-required","code":"INVALID_INPUT"}` and a short password `400 WEAK_PASSWORD`,
-neither of which spends the token; then the token is consumed — atomically, once
-— and every refusal of it is one answer, `401 {"error":"Invalid or expired
-invitation","code":"INVALID_INVITATION"}`: unknown, expired, revoked, replayed,
-naming an account that is gone, that already has a password or a factor, or
-whose address moved. Then the password is stored and the address marked verified
-(the token proves the mailbox — a host that reveals tokens and hands them over
-some other channel takes that on itself), `identity.user.invitation.accepted` is
-raised, and the answer is what the login would give next:
+required","code":"INVALID_INPUT"}`, and a password shorter than
+`Config.MinPasswordLen` or longer than the 72 bytes bcrypt hashes is
+`400 WEAK_PASSWORD` — none of which spends the token; then the token is consumed
+— atomically, once — and every refusal of it is one answer, `401
+{"error":"Invalid or expired invitation","code":"INVALID_INVITATION"}`: unknown,
+expired, revoked, replayed, naming an account that is gone, that already has a
+password or a factor, or whose address moved. Then the password is hashed and any
+second-factor challenge minted, before anything is written; the address is
+marked verified and the password stored (the token proves the mailbox — a host
+that reveals tokens and hands them over some other channel takes that on
+itself); `identity.user.invitation.accepted` is raised; and the answer is what
+the login would give next:
 
 | The account | Answer |
 | --- | --- |
 | a second factor is demanded (`Require2FA`, the user's flag) and it has none | `403 {"requires2FASetup":true,"tempToken":…,"code":"2FA_SETUP_REQUIRED"}` — under `Config.EnrolOnLogin` an enrolment token for `/2fa/setup` and `/2fa/verify-setup`, which open the session once TOTP is enrolled; without it a token no route completes, and the account is enrolled out of band |
 | a second factor is demanded and the deployment can deliver one | the login's `200 {"requiresTwoFactor":true,…}` challenge |
 | otherwise | the registration's `201 {"success":true,"userId":…}`, and the session too — cookies, or `accessToken`/`refreshToken` under `X-Auth-Strategy: bearer` — only when `Config.IssueSessionOnRegister` allows it, raising `identity.auth.login.success` with `method: "local"` |
+
+A failure of the acceptance's own once the token is spent — the account that
+cannot be read, a hash or a challenge that cannot be minted, a store write that
+fails, a client that went away — does not cost the invitee the invitation: the
+address flag is undone if it was set, the invitation is handed back
+(`InvitationStore.ReleaseInvitation`), and the `500` can simply be retried with
+the same link. Only if the hand-back fails as well is the account left pending
+with no invitation; that is logged with both ids, and
+`DELETE <admin>/api/users/{id}` followed by a new invitation is the way out. A
+session that cannot be opened after the password is stored does not undo the
+acceptance: the answer is the `201` without a session, and the invitee logs in.
 
 The route is mounted under `HTTPConfig.ClosedRegistration`, never under
 `HTTPConfig.ResourceServer`, and described by the served OpenAPI document
@@ -277,16 +307,33 @@ the account it reserved **only if nobody has used it**: no password, no factor,
 the address still unverified, no phone or login provider on the row, no session
 ever opened for it (when the session store can list them), no linked OAuth
 identity, and no other invitation outstanding. That matters because until it is
-accepted the pending account is an ordinary passwordless row: `/forgot-password`
-and magic-link login reach it as they reach any account, for whoever reads the
-mailbox — a deployment may well accept invitations by magic link. Revoking an
-untouched account closes those doors; an account the invitee has signed in to is
-kept (`accountRemoved: false`), and removing it is an explicit
-`DELETE <admin>/api/users/{id}`. An expired invitation stays listed, as
-`expired`, and revocable. With `Config.InvitationReinvite`, an
-address whose account is still pending is invited again instead of answering
-`409`: same account, a fresh token, and the earlier tokens retired once the new
-one is delivered. An active account is `409` either way.
+accepted the pending account is an ordinary passwordless row, and magic-link
+login reaches it as it reaches any account, for whoever reads the mailbox — a
+deployment may well accept invitations by magic link. `/forgot-password` does
+not: while an invitation still reserves the account (no password, no factor, the
+address unverified, an invitation outstanding, expired or not) it answers as for
+an unknown address and sends nothing, and `/reset-password` refuses a token for
+it, because a reset would set a password on an unverified address — which the
+login refuses outside lazy mode — and leave an account the invitation can no
+longer activate. An invitee who signed in by magic link has a verified address
+and resets as anyone does. Revoking an untouched account closes the remaining
+door and clears what a host attached to it — role assignments, tenant
+memberships, metadata; an account the invitee has signed in to is kept
+(`accountRemoved: false`), and removing it is an explicit
+`DELETE <admin>/api/users/{id}`.
+
+The window bounds the token, not the account: an expired invitation stays
+listed, as `expired`, and revocable, and its account stays — a magic link still
+signs it in, with the invited role — until the invitation is revoked. Revoke an
+offer that should lapse. With `Config.InvitationReinvite`, an address whose
+account is still pending is invited again instead of answering `409`: same
+account as it is, a fresh token, and the earlier tokens retired once the new one
+is delivered. The re-invitation's `role` and `tenantId` must be the account's or
+absent (`409` otherwise: revoke and invite again to change them), and its
+`metadata` rides on the new invitation and its delivery only. Two re-invitations
+racing each other can each leave their own token live; both reach the same
+mailbox, and the first accepted activates the account. An active account is
+`409` either way.
 
 **Audit.** Each invitation records who created it: `InvitedBy` is the
 `MachineAccess` principal (`InvitedByKind` `machine`) or the signed-in user's id
@@ -297,14 +344,21 @@ leaves the guard's own `identity.admin.machine.access`. The three events —
 (`invitationId`), `identity.user.invitation.revoked` (`invitationId`,
 `revokedBy`, `revokedByKind`, `accountRemoved`) — name the account's user and
 tenant, carry the request's provenance, never carry the token or its hash, and
-are outside `EventNames()`: subscribe by name or with the wildcard.
+are outside `EventNames()`: subscribe by name or with the wildcard. The account
+appears and goes without the reference's `identity.user.created` and
+`identity.user.deleted`, which are raised where the reference raises them — as
+the console's own user deletion raises nothing — so `accountCreated` and
+`accountRemoved` are the record of both.
 
-**The store.** `InvitationStore` has five methods, and its doc comment is the
+**The store.** `InvitationStore` has six methods, and its doc comment is the
 implementor's contract: `CreateInvitation`; `ConsumeInvitation(tokenHash, now)`,
 atomic and single use, `ErrInvitationNotFound` for every refusal alike;
 `RevokeInvitation(id, now)`, atomic against the consume,
 `ErrInvitationNotPending` for an accepted or revoked one;
-`ListPendingInvitations(limit, offset)` and `PendingInvitationsForUser(userID)`,
+`ReleaseInvitation(id, acceptedAt)`, which hands back the consume of an
+acceptance that failed — only while the record is still accepted at that
+instant and not revoked; `ListPendingInvitations(limit, offset)` and
+`PendingInvitationsForUser(userID)`,
 in id order — the second a consistent read, since a re-invitation and a
 revocation decide on it. The `Invitation` fields are `ID` (`inv_…`), `TokenHash`, `UserID`,
 `TenantID`, `Email`, `Role`, `Metadata`, `InvitedBy`, `InvitedByKind`,
@@ -312,9 +366,11 @@ revocation decide on it. The `Invitation` fields are `ID` (`inv_…`), `TokenHas
 DynamoDB single-table design that keeps the atomicity: an item per invitation,
 a token-hash pointer and a membership item in the user's partition written in
 the same transaction, a consume and a revoke that are each one conditional
-transaction, a consistent `Query` of that partition for the per-user lookup, and
-a sparse index for the console's listing.
-`MemoryInvitationStore` is correct in one process only.
+transaction (the release the consume's transaction run backwards), a consistent
+`Query` of that partition for the per-user lookup, and a sparse index for the
+console's listing. `MemoryInvitationStore` is correct in one process only; it
+keeps an accepted or revoked record for a day, so that a second revocation still
+answers `409`, and forgets it after that.
 
 The service methods are `InviteUser`, `AcceptInvitation`, `RevokeInvitation`
 and `ListPendingInvitations`, with `Auth` delegates; the token is in

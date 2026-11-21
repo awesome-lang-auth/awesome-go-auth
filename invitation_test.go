@@ -356,15 +356,23 @@ func TestAcceptInvitationRefusesEveryReasonAlike(t *testing.T) {
 			}
 			return result.Token
 		},
-		"account activated through a password reset": func(f *invitationFixture, result InvitationResult) string {
-			if _, err := f.auth.Service().ForgotPassword(ctx, ForgotPasswordInput{Email: invitedEmail, TenantID: "t1"}); err != nil {
-				t.Fatalf("forgot: %v", err)
+		// The side door a pending account still has: a magic link to the
+		// invited mailbox, then a first password through /change-password.
+		"account activated through a magic link and a first password": func(f *invitationFixture, result InvitationResult) string {
+			var links []MagicLinkDelivery
+			f.svc().cfg.SendMagicLink = func(_ context.Context, d MagicLinkDelivery) error {
+				links = append(links, d)
+				return nil
 			}
-			if len(f.resets) != 1 {
-				t.Fatalf("resets = %d: the pending account is reachable by a reset, as documented", len(f.resets))
+			if _, err := f.svc().SendMagicLink(ctx, MagicLinkSendInput{Email: invitedEmail, TenantID: "t1"}); err != nil || len(links) != 1 {
+				t.Fatalf("magic link send = %v, %d links", err, len(links))
 			}
-			if err := f.auth.Service().ResetPassword(ctx, ResetPasswordInput{Token: f.resets[0].Token, NewPassword: "reset-password"}); err != nil {
-				t.Fatalf("reset: %v", err)
+			user, _, err := f.svc().VerifyMagicLink(ctx, MagicLinkVerifyInput{Token: links[0].Token})
+			if err != nil {
+				t.Fatalf("magic link login: %v", err)
+			}
+			if err := f.auth.ChangePassword(ctx, ChangePasswordInput{UserID: user.ID, TenantID: "t1", NewPassword: "first-password"}); err != nil {
+				t.Fatalf("first password: %v", err)
 			}
 			return result.Token
 		},
@@ -730,14 +738,23 @@ func TestRevokeInvitation(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("removes the pending account and closes the side doors", func(t *testing.T) {
-		f := newInvitationFixture(t)
+		var links []MagicLinkDelivery
+		f := newInvitationFixture(t, WithMagicLinkSender(func(_ context.Context, d MagicLinkDelivery) error {
+			links = append(links, d)
+			return nil
+		}))
 		result := f.invite(invitedEmail)
-		// Before the revocation the pending account answers a reset, as any
-		// passwordless account does: the documented side door.
-		if _, err := f.svc().ForgotPassword(ctx, ForgotPasswordInput{Email: invitedEmail, TenantID: "t1"}); err != nil || len(f.resets) != 1 {
-			t.Fatalf("forgot before revoke = %v, %d resets", err, len(f.resets))
+		// Before the revocation the pending account answers a magic link, as
+		// any account does: the documented side door. It answers no reset —
+		// the invitation still reserves it.
+		if _, err := f.svc().SendMagicLink(ctx, MagicLinkSendInput{Email: invitedEmail, TenantID: "t1"}); err != nil || len(links) != 1 {
+			t.Fatalf("magic link before revoke = %v, %d links", err, len(links))
+		}
+		if _, err := f.svc().ForgotPassword(ctx, ForgotPasswordInput{Email: invitedEmail, TenantID: "t1"}); err != nil || len(f.resets) != 0 {
+			t.Fatalf("forgot before revoke = %v, %d resets, want none for a reserved account", err, len(f.resets))
 		}
 		f.reset()
+		links = nil
 
 		revocation, err := f.auth.RevokeInvitation(ctx, result.Invitation.ID, "usr_admin", InvitedByUser)
 		if err != nil || !revocation.AccountRemoved || revocation.Invitation.RevokedAt == nil {
@@ -749,8 +766,11 @@ func TestRevokeInvitation(t *testing.T) {
 		if metadata, _ := f.metadata.GetMetadata(ctx, result.User.ID); len(metadata) != 0 {
 			t.Errorf("metadata = %v, want it cleared with the account", metadata)
 		}
+		if _, err := f.svc().SendMagicLink(ctx, MagicLinkSendInput{Email: invitedEmail, TenantID: "t1"}); err != nil || len(links) != 0 {
+			t.Fatalf("magic link after revoke = %v, %d links: the side door is still open", err, len(links))
+		}
 		if _, err := f.svc().ForgotPassword(ctx, ForgotPasswordInput{Email: invitedEmail, TenantID: "t1"}); err != nil || len(f.resets) != 0 {
-			t.Fatalf("forgot after revoke = %v, %d resets: the side door is still open", err, len(f.resets))
+			t.Fatalf("forgot after revoke = %v, %d resets", err, len(f.resets))
 		}
 		if _, err := f.accept(result.Token, "a-new-password"); !errors.Is(err, ErrInvalidInvitation) {
 			t.Fatalf("accept after revoke = %v", err)

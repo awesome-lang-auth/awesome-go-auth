@@ -224,6 +224,7 @@ var wantClaims = map[string][]string{
 		"2FA_SETUP_REQUIRED", "Config.EnrolOnLogin", "201", "Config.IssueSessionOnRegister",
 		"401 INVALID_INVITATION", "identity.user.invited", "EventNames", "sendInvitation",
 		"{...data, link}", "onRegister", "/forgot-password", "deletes the account",
+		"72 bytes", "hands the token back", "AdminFirstUser", "unknown address",
 	},
 	"register-route-is-always-mounted": {
 		"features.register", "onRegister", "404", "Service.Register",
