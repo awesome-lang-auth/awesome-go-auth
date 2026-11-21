@@ -68,6 +68,12 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 	if cfg.IssueSessionOnRegister && svc.emailVerificationMode() == EmailVerificationModeStrict {
 		svc.logf("auth: IssueSessionOnRegister is on, but EmailVerificationMode is strict: POST /register issues no session for an unverified account; it logs in after verifying the address")
 	}
+	// An invitation nobody can deliver is refused by the admin route rather
+	// than created, which reads as a broken route unless the operator is told
+	// why once.
+	if cfg.Invitations != nil && cfg.SendInvitation == nil {
+		svc.logf("auth: invitations are configured with no Config.SendInvitation: POST <admin>/api/users/invitations refuses to invite unless AdminOptions.RevealInvitationToken hands the token to its caller")
+	}
 	return svc, nil
 }
 

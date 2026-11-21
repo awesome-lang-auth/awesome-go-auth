@@ -93,7 +93,7 @@ func MountWithConfig(r chi.Router, a *auth.Auth, cfg auth.HTTPConfig) {
 	}
 
 	if !resolved.ResourceServer {
-		mountCredentialRoutes(r, h, guard, prefix, resolved.RegisterMounted())
+		mountCredentialRoutes(r, h, guard, prefix, resolved.RegisterMounted(), a.InvitationsEnabled())
 	}
 	// /me authenticates itself (nethttp's Me) rather than sitting behind the
 	// auth middleware, so the claims hook runs once and the token is verified once.
@@ -174,7 +174,9 @@ func MountWithConfig(r chi.Router, a *auth.Auth, cfg auth.HTTPConfig) {
 // same list and carries the reasoning. HTTPConfig.ResourceServer is the switch
 // that skips this call, and HTTPConfig.ClosedRegistration the one that skips
 // POST /register alone: register is auth.HTTPConfig.RegisterMounted.
-func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(http.Handler) http.Handler, prefix string, register bool) {
+// invitations is auth.Auth.InvitationsEnabled, the switch for the invitation
+// accept route, which ClosedRegistration leaves mounted.
+func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(http.Handler) http.Handler, prefix string, register, invitations bool) {
 	if register {
 		r.With(guard).MethodFunc(http.MethodPost, prefix+auth.RegisterRoute, h.Register)
 	}
@@ -204,4 +206,9 @@ func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(h
 	r.With(guard).MethodFunc(http.MethodGet, prefix+"/verify-email", h.VerifyEmail)
 	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+"/change-email/request", h.ChangeEmailRequest)
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/change-email/confirm", h.ChangeEmailConfirm)
+	// The invitation accept route, served by nethttp's handler: present only
+	// on an Auth with an InvitationStore.
+	if invitations {
+		r.With(guard).MethodFunc(http.MethodPost, prefix+auth.InvitationAcceptRoute, h.AcceptInvitation)
+	}
 }

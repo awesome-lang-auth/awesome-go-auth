@@ -237,6 +237,10 @@ func TestCSRFExemptionsMatchTheReference(t *testing.T) {
 		{http.MethodPost, "/2fa/verify"},
 		{http.MethodPost, "/link-verify"},
 		{http.MethodPost, "/sessions/cleanup"},
+		// This port's invitation accept route, which the reference does not
+		// have: unauthenticated, its credential the token in the body, exempt
+		// as /reset-password is.
+		{http.MethodPost, "/invitations/accept"},
 	}
 
 	for _, tc := range enforced {

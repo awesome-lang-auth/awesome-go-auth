@@ -99,6 +99,12 @@ type OpenAPIInfo struct {
 	// document the built-in UI reads its branding and feature flags from. The
 	// adapters mount that route only under that flag, so set the two together.
 	UI bool
+	// Invitations adds POST <prefix>/invitations/accept, which the adapters
+	// mount only on an Auth with an InvitationStore (Auth.InvitationsEnabled).
+	// Set the two together. ClosedRegistration leaves it in place, as the
+	// adapters do; ResourceServer takes it out again, as it takes out every
+	// credential route.
+	Invitations bool
 }
 
 // GenerateOpenAPISpec returns an OpenAPI 3.0 spec for the mounted auth endpoints.
@@ -259,13 +265,14 @@ func openAPIJWKSPath() map[string]any {
 }
 
 // openAPIPathsFor is openAPIPaths plus and minus what the configuration
-// changes. Five things do so far: resource-server mode drops the credential
+// changes. Six things do so far: resource-server mode drops the credential
 // routes, which is the same list the adapters skip registering
 // (ResourceServerGatedRoutes), an IdP adds the JWKS route and the four OIDC
 // endpoints — both mounted by the adapters from auth.WithIDP — an enabled UI
-// adds the config route they mount from HTTPConfig.UI.Enabled, and the two
-// documentation routes join them under HTTPConfig.Docs.Enabled, so the spec
-// and the mount stay in step under any of them, or all of them.
+// adds the config route they mount from HTTPConfig.UI.Enabled, an
+// InvitationStore adds the invitation accept route, and the two documentation
+// routes join them under HTTPConfig.Docs.Enabled, so the spec and the mount
+// stay in step under any of them, or all of them.
 //
 // The subtraction runs first, in the order the adapters mount in: they
 // register the JWKS route whether or not resource-server mode is on, and skip
@@ -316,6 +323,15 @@ func openAPIPathsFor(info OpenAPIInfo) map[string]any {
 	// uses, so there is nothing for it to collide with.
 	if info.UI {
 		paths[prefix+UIConfigRoute] = openAPIUIConfigPath()
+	}
+	// The invitation accept route, a credential route the adapters mount only
+	// with an InvitationStore and never under resource-server mode. Nothing
+	// else lives below <prefix>/invitations, but the guard is the one the JWKS
+	// item uses: a documented route wins over a conditional one.
+	if info.Invitations && !info.ResourceServer {
+		if key := prefix + InvitationAcceptRoute; !openAPIHasPath(paths, key) {
+			paths[key] = openAPIInvitationAcceptPath()
+		}
 	}
 	// The two documentation routes, mounted last and added last, guarded the
 	// same way and for the same reason. Their own paths are constants, but the
@@ -1350,6 +1366,80 @@ func openAPIPaths(prefix string) map[string]any {
 				"responses": respond(http.StatusOK, "Second factor disabled", schema("Success"),
 					HTTPErrTwoFactorRequiredForUser, HTTPErrTwoFactorRequiredByPolicy,
 					HTTPErrUserNotFound, HTTPErrNoAccessToken, HTTPErrInvalidAccessToken, HTTPErrCSRFInvalid),
+			},
+		},
+	}
+}
+
+// openAPIInvitationAcceptPath describes POST <prefix>/invitations/accept. It is
+// a path item on its own because it is added conditionally, and it describes
+// this port's route: the reference has no invitation route to cite.
+//
+// Three answers succeed, by the account's state rather than the request's:
+// 201 RegisterResult when no second factor is demanded (with the session only
+// when Config.IssueSessionOnRegister allows one), and otherwise the login's own
+// challenge — 200 TwoFactorChallenge when the account has a factor it can
+// present, 403 TwoFactorSetupRequired when it has none.
+func openAPIInvitationAcceptPath() map[string]any {
+	ref := func(name string) map[string]any {
+		return map[string]any{"$ref": "#/components/schemas/" + name}
+	}
+	jsonContent := func(s map[string]any) map[string]any {
+		return map[string]any{"application/json": map[string]any{"schema": s}}
+	}
+	refusal := func(entries ...HTTPError) map[string]any {
+		descriptions := make([]string, 0, len(entries))
+		for _, e := range entries {
+			description := e.Message
+			if e.Code != "" {
+				description += " (`" + e.Code + "`)"
+			}
+			descriptions = append(descriptions, description)
+		}
+		return map[string]any{"description": strings.Join(descriptions, "; "), "content": jsonContent(ref("Error"))}
+	}
+	str := map[string]any{"type": "string"}
+	return map[string]any{
+		"post": map[string]any{
+			"summary": "Accept an invitation: set the password, then answer what the account's next step is",
+			"description": "Public: no credential and no CSRF pair — the token in the body is the credential, as on " +
+				"`/reset-password`. Mounted only when the `Auth` has an `InvitationStore`, under " +
+				"`HTTPConfig.ClosedRegistration` too, and never under `HTTPConfig.ResourceServer`. The token is " +
+				"single use: it is spent before the password is stored, and every refusal of it — unknown, " +
+				"expired, revoked, already accepted, or an account that is gone or already active — is the same " +
+				"401. A missing field or a short password is refused before the token is touched. On success the " +
+				"password is set and the address marked verified. When a second factor is demanded of the account " +
+				"the answer is the login's own challenge: under `Config.EnrolOnLogin` the 403's `tempToken` is an " +
+				"enrolment token for `/2fa/setup` and `/2fa/verify-setup`, which open the session once a TOTP " +
+				"factor is enrolled. Otherwise it is the registration's answer, with a session only when " +
+				"`Config.IssueSessionOnRegister` allows one.",
+			"operationId": "acceptInvitation",
+			"tags":        []string{"Auth"},
+			"parameters":  []map[string]any{{"$ref": "#/components/parameters/AuthStrategy"}},
+			"requestBody": map[string]any{
+				"required": true,
+				"content": jsonContent(map[string]any{
+					"type":       "object",
+					"required":   []string{"token", "password"},
+					"properties": map[string]any{"token": str, "password": str},
+				}),
+			},
+			"responses": map[string]any{
+				strconv.Itoa(http.StatusCreated): map[string]any{
+					"description": "Invitation accepted; a session only when Config.IssueSessionOnRegister allows one",
+					"content":     jsonContent(ref("RegisterResult")),
+				},
+				strconv.Itoa(http.StatusOK): map[string]any{
+					"description": "Invitation accepted; a second factor is required and the account can present one (`requiresTwoFactor`)",
+					"content":     jsonContent(ref("TwoFactorChallenge")),
+				},
+				strconv.Itoa(http.StatusForbidden): map[string]any{
+					"description": "Invitation accepted; a second factor is required and the account has none (`" + CodeTwoFactorSetupRequired + "`)",
+					"content":     jsonContent(ref("TwoFactorSetupRequired")),
+				},
+				strconv.Itoa(http.StatusBadRequest):          refusal(HTTPErrInvalidBody, HTTPErrInvitationInputRequired, HTTPErrWeakPassword),
+				strconv.Itoa(http.StatusUnauthorized):        refusal(HTTPErrInvalidInvitation),
+				strconv.Itoa(http.StatusInternalServerError): refusal(HTTPErrInternal),
 			},
 		},
 	}

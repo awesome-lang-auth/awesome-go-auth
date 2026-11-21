@@ -849,7 +849,9 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"`features.register` answers `false`, the built-in UI hides its sign-up link " +
 					"and the served OpenAPI document leaves the path out, which is the reference's " +
 					"hookless deployment on every surface. `Service.Register` stays callable by " +
-					"the host either way, for invitations and admin-created accounts. " +
+					"the host either way, and the invitation routes stay mounted under the flag " +
+					"(`invitations-are-an-addition`): they are how a closed deployment's " +
+					"accounts are made over HTTP. " +
 					"Resource-server mode also unmounts the route, with the rest of the credential " +
 					"set — see `resource-server-gates-all-credential-routes` — and the flag does " +
 					"not follow it there, which is what the reference does too for a resource " +
@@ -885,6 +887,73 @@ func CompatibilityNotes() APICompatibilityNotes {
 							"sets `AutoCreate: false` too, or configures no provider. The built-in " +
 							"UI's `<prefix>/ui/register` page is still served, as the reference serves " +
 							"it without a hook; its form posts to the route that is gone.",
+					},
+				},
+			},
+			{
+				ID: "invitations-are-an-addition",
+				Title: "Invitations: an admin route creates a pending account and a public route redeems it, " +
+					"where the reference ships only the mail",
+				Surface: "`POST` and `GET <admin>/api/users/invitations`, `DELETE <admin>/api/users/invitations/{id}`, " +
+					"`POST <prefix>/invitations/accept`, and `Config.Invitations` (`WithInvitationStore`)",
+				Behaviour: "With an `InvitationStore` configured, and only then, the admin router invites an " +
+					"address: `POST <admin>/api/users/invitations` `{email, role?, tenantId?, metadata?}` " +
+					"creates a pending account (no password, no factor, address unverified) and a single-use " +
+					"token valid `Config.InvitationTTL`, 72 hours by default, of which the store keeps only the " +
+					"SHA-256. The token goes to `Config.SendInvitation` — `InvitationMailer` renders the " +
+					"reference's `invitation` template, `DeliveryWebhook` posts it — and never into the answer, " +
+					"except with no sender and `AdminOptions.RevealInvitationToken` set. An address that has an " +
+					"account is `409`, unless `Config.InvitationReinvite` invites a still-pending one again. " +
+					"`POST <prefix>/invitations/accept` `{token, password}` is public, mounted under " +
+					"`HTTPConfig.ClosedRegistration` too and never under `ResourceServer`, CSRF-exempt and behind " +
+					"the rate-limiter slot. It spends the token, sets the password and marks the address " +
+					"verified, then answers what the login would: its second-factor challenge when one is " +
+					"demanded — `403 2FA_SETUP_REQUIRED` with an enrolment token under `Config.EnrolOnLogin` — " +
+					"and otherwise the registration's `201 {\"success\": true, \"userId\": …}`, with a session " +
+					"only when `Config.IssueSessionOnRegister` allows one. Every refusal of the token — unknown, " +
+					"expired, revoked, replayed, or naming an account already active — is one " +
+					"`401 INVALID_INVITATION`. Revoking deletes the account if nobody has used it. Three " +
+					"events outside `EventNames` record the flow: `identity.user.invited`, " +
+					"`identity.user.invitation.accepted` and `identity.user.invitation.revoked`.",
+				Reference: "Ships the mail and nothing around it. `MailerService.sendInvitation(to, link, data, " +
+					"lang)` renders the `invitation` template with `{...data, link}`, but no route creates, " +
+					"delivers or redeems an invitation. The admin router's user routes list, read and delete — " +
+					"none creates an account — and `/register` exists only when the host supplies `onRegister`, " +
+					"so a deployment without the hook, the invite-only one, has no HTTP way to create an account.",
+				Citations: []string{"mailer.service.ts:210-227", "admin.router.ts:746-815", "auth.router.ts:712-715"},
+				Why: "An invite-only deployment, often under a mandatory second factor, still has to provision " +
+					"its people, and the reference leaves that to host code on both sides. The mail it does ship " +
+					"fixes the template and the `{link}` it is rendered with, and both are kept, so a stored " +
+					"template written for the reference renders here unchanged; the routes around it are this " +
+					"port's. The token is hashed at rest and spent atomically before the password is written, so " +
+					"a replay and a race both lose; every refusal answers alike, so the route says nothing about " +
+					"which tokens or accounts exist; and the acceptance answers through the login's own " +
+					"second-factor logic, so under `Require2FA` no session exists before a factor is enrolled.",
+				Notes: []DeviationNote{
+					{
+						Label: "The pending account is a real account",
+						Text: "Until it is accepted it is an ordinary row with no password, so `/forgot-password` " +
+							"and magic-link login reach it as they reach any account, for whoever reads the " +
+							"invited mailbox — the trust the invitation itself rests on, and the way in a " +
+							"deployment that accepts invitations by magic link relies on. Revoking the invitation " +
+							"deletes the account only if nobody has used it — no password, no factor, the address " +
+							"still unverified, no session ever opened, no linked provider — which closes those " +
+							"doors on an account nobody claimed. An account the invitee signed in to is kept, and " +
+							"`accountRemoved` says so; removing it is an explicit `DELETE <admin>/api/users/{id}`. " +
+							"An expired invitation stays listed, as expired, until it is revoked.",
+					},
+					{
+						Label: "Enrolling at acceptance is still opt-in",
+						Text: "Under `Config.Require2FA` without `Config.EnrolOnLogin` the acceptance answers " +
+							"`2FA_SETUP_REQUIRED` with a token no route completes, exactly as the login does, and " +
+							"the account is enrolled out of band. A deployment that wants invitees to enrol at " +
+							"acceptance turns `EnrolOnLogin` on: accepting an invitation is first use.",
+					},
+					{
+						Label: "Not in the admin document",
+						Text: "The admin OpenAPI document transcribes the reference's generator and describes none " +
+							"of the three admin routes, as it does not describe the promote route. The accept route " +
+							"is in the auth document under `OpenAPIInfo.Invitations`.",
 					},
 				},
 			},
@@ -1055,6 +1124,16 @@ func CompatibilityNotes() APICompatibilityNotes {
 							"password-and-TOTP login now completes. It is not counted among the " +
 							"twenty-six, which are the development line's; see " +
 							"`forced-enrolment-opens-a-session`.",
+					},
+					{
+						Label: "The invitation flow's own events",
+						Text: "With an `InvitationStore` the library raises three events no tree " +
+							"declares — `identity.user.invited`, `identity.user.invitation.accepted`, " +
+							"`identity.user.invitation.revoked` — outside the vocabulary `EventNames` " +
+							"returns, as `identity.admin.machine.access` is. An acceptance that opens a " +
+							"session raises `identity.auth.login.success` with `method: \"local\"`, the " +
+							"payload a registration that opens one raises. None is counted among the " +
+							"twenty-six; see `invitations-are-an-addition`.",
 					},
 				},
 			},

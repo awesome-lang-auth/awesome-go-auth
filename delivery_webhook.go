@@ -49,14 +49,17 @@ const (
 	DeliveryKindEmailVerification = "email-verification"
 	DeliveryKindEmailChange       = "email-change"
 	DeliveryKindSMSCode           = "sms-code"
+	// DeliveryKindInvitation is an InvitationDelivery, posted by SendInvitation.
+	DeliveryKindInvitation = "invitation"
 )
 
 // DeliveryWebhookRequest is the body DeliveryWebhook posts. Delivery is the
 // delivery struct that matches Kind — MagicLinkDelivery for
 // DeliveryKindMagicLink, PasswordResetDelivery for DeliveryKindPasswordReset,
-// EmailVerificationDelivery, EmailChangeDelivery, SMSCodeDelivery — encoded with
-// its JSON tags, so a receiver written in Go decodes Kind, switches on it and
-// unmarshals Delivery into the very type this package sent.
+// EmailVerificationDelivery, EmailChangeDelivery, SMSCodeDelivery,
+// InvitationDelivery — encoded with its JSON tags, so a receiver written in Go
+// decodes Kind, switches on it and unmarshals Delivery into the very type this
+// package sent.
 type DeliveryWebhookRequest struct {
 	Kind     string          `json:"kind"`
 	Delivery json.RawMessage `json:"delivery"`
@@ -73,8 +76,8 @@ type DeliveryWebhookRequest struct {
 // is unset. A route is waiting on the answer, so it is short.
 const defaultDeliveryWebhookTimeout = 5 * time.Second
 
-// DeliveryWebhook is a sender for every delivery kind at once. Its five Send
-// methods have the five sender signatures, so one value serves every seam:
+// DeliveryWebhook is a sender for every delivery kind at once. Its six Send
+// methods have the six sender signatures, so one value serves every seam:
 //
 //	hook, err := auth.NewDeliveryWebhook("https://hooks.example.com/auth-delivery", secret)
 //	a, err := auth.New(
@@ -83,6 +86,7 @@ const defaultDeliveryWebhookTimeout = 5 * time.Second
 //		auth.WithEmailVerificationSender(hook.SendEmailVerification),
 //		auth.WithEmailChangeSender(hook.SendEmailChange),
 //		auth.WithSMSCodeSender(hook.SendSMSCode),
+//		auth.WithInvitationSender(hook.SendInvitation),
 //	)
 //
 // Each call POSTs one request to URL with Content-Type: application/json, the
@@ -161,6 +165,12 @@ func (w *DeliveryWebhook) SendEmailVerification(ctx context.Context, delivery Em
 // Its signature is EmailChangeSender's.
 func (w *DeliveryWebhook) SendEmailChange(ctx context.Context, delivery EmailChangeDelivery) error {
 	return w.post(ctx, DeliveryKindEmailChange, delivery, emailDomain(delivery.NewEmail))
+}
+
+// SendInvitation posts an invitation delivery, addressed to the invited
+// mailbox. Its signature is InvitationSender's.
+func (w *DeliveryWebhook) SendInvitation(ctx context.Context, delivery InvitationDelivery) error {
+	return w.post(ctx, DeliveryKindInvitation, delivery, emailDomain(delivery.Email))
 }
 
 // SendSMSCode posts an SMS-code delivery. Its signature is SMSCodeSender's.

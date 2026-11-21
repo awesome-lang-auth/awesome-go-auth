@@ -101,6 +101,12 @@ var csrfExemptRoutes = map[csrfExemption]bool{
 	{http.MethodPost, "/2fa/verify"}:           true,
 	{http.MethodPost, "/link-verify"}:          true,
 	{http.MethodPost, "/sessions/cleanup"}:     true,
+	// This port's own route, not the reference's (invitation.go): mounted only
+	// with an InvitationStore, unauthenticated, and exempt for the reason
+	// /reset-password and /change-email/confirm are — the emailed token in the
+	// body is the credential, so the accept form has to work from a browser
+	// that holds another account's cookies and no CSRF pair.
+	{http.MethodPost, InvitationAcceptRoute}: true,
 }
 
 // csrfManualCheckRoutes are the routes the reference CSRF-checks by hand inside

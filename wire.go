@@ -210,6 +210,8 @@ func HTTPErrorFor(err error) HTTPError {
 		return HTTPErrSMSNotConfigured
 	case errors.Is(err, ErrSessionNotFound), errors.Is(err, ErrInvalidToken):
 		return HTTPErrInvalidToken
+	case errors.Is(err, ErrInvalidInvitation):
+		return HTTPErrInvalidInvitation
 	default:
 		return HTTPErrInternal
 	}

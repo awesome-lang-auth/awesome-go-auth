@@ -75,6 +75,7 @@ var wantDeviationIDs = []string{
 	"identity-events-are-raised-from-the-development-line",
 	"idp-mode-adds-an-oauth-authorization-server",
 	"inbound-webhook-script-runs-out-of-process",
+	"invitations-are-an-addition",
 	"jwks-cors-wildcard-string-form",
 	"jwks-unknown-kid-refetch-is-rate-limited",
 	"link-request-exempts-bearer-from-csrf",
@@ -210,6 +211,20 @@ var wantClaims = map[string][]string{
 	// self-registration paths: an entry that dropped AutoCreate would read as
 	// "sign-up is closed" to a deployment whose OAuth callback still creates
 	// accounts.
+	// The switch, what is stored and for how long, where the token goes and the
+	// one way it reaches an HTTP caller, the two mounts the accept route keeps
+	// and loses, both answers and the one refusal, the enrolment it hands on,
+	// the events, the reference's mail and the hook whose absence is the gap —
+	// and the side door the pending account leaves, without which the entry
+	// would read as a lock the flow is not.
+	"invitations-are-an-addition": {
+		"Config.Invitations", "InvitationStore", "pending account", "SHA-256", "72 hours",
+		"Config.SendInvitation", "AdminOptions.RevealInvitationToken", "409", "Config.InvitationReinvite",
+		"HTTPConfig.ClosedRegistration", "ResourceServer", "CSRF-exempt", "rate-limiter slot",
+		"2FA_SETUP_REQUIRED", "Config.EnrolOnLogin", "201", "Config.IssueSessionOnRegister",
+		"401 INVALID_INVITATION", "identity.user.invited", "EventNames", "sendInvitation",
+		"{...data, link}", "onRegister", "/forgot-password", "deletes the account",
+	},
 	"register-route-is-always-mounted": {
 		"features.register", "onRegister", "404", "Service.Register",
 		"HTTPConfig.ClosedRegistration", "features.register: false", "OpenAPIInfo.ClosedRegistration",
