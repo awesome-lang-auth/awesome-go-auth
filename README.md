@@ -900,17 +900,17 @@ revision the whole contract was extracted from.
   CSRF-exempt and behind the rate-limiter slot. It spends the token, sets the
   password and marks the address verified — a password bcrypt could not hash,
   over 72 bytes, is refused like a short one before the token is touched, and a
-  failure after the spend hands the token back — then answers what the login
-  would: its second-factor challenge when one is demanded —
-  `403 2FA_SETUP_REQUIRED` with an enrolment token under `Config.EnrolOnLogin` —
-  and otherwise the registration's `201 {"success": true, "userId": …}`, with a
-  session only when `Config.IssueSessionOnRegister` allows one. Every refusal of
-  the token — unknown, expired, revoked, replayed, or naming an account already
-  active — is one `401 INVALID_INVITATION`. Revoking deletes the account if
-  nobody has used it. Under `AdminFirstUser` the admin route refuses to invite
-  (`501`). Three events outside `EventNames` record the flow:
-  `identity.user.invited`, `identity.user.invitation.accepted` and
-  `identity.user.invitation.revoked`.
+  failure after the spend hands the token back unless the password may already
+  be stored — then answers what the login would: its second-factor challenge
+  when one is demanded — `403 2FA_SETUP_REQUIRED` with an enrolment token under
+  `Config.EnrolOnLogin` — and otherwise the registration's
+  `201 {"success": true, "userId": …}`, with a session only when
+  `Config.IssueSessionOnRegister` allows one. Every refusal of the token —
+  unknown, expired, revoked, replayed, or naming an account already active — is
+  one `401 INVALID_INVITATION`. Revoking deletes the account if nobody has used
+  it. Under `AdminFirstUser` the admin route refuses to invite (`501`). Three
+  events outside `EventNames` record the flow: `identity.user.invited`,
+  `identity.user.invitation.accepted` and `identity.user.invitation.revoked`.
 - **The reference**: Ships the mail and nothing around it.
   `MailerService.sendInvitation(to, link, data, lang)` renders the `invitation`
   template with `{...data, link}`, but no route creates, delivers or redeems an

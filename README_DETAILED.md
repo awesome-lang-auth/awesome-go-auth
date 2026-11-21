@@ -294,8 +294,25 @@ address flag is undone if it was set, the invitation is handed back
 (`InvitationStore.ReleaseInvitation`), and the `500` can simply be retried with
 the same link. Only if the hand-back fails as well is the account left pending
 with no invitation; that is logged with both ids, and
-`DELETE <admin>/api/users/{id}` followed by a new invitation is the way out. A
-session that cannot be opened after the password is stored does not undo the
+`DELETE <admin>/api/users/{id}` followed by a new invitation is the way out.
+
+The password write is the exception, because a write can land and still answer
+an error — a timeout, a client that went away after the commit — and undoing
+the flag under a stored password would leave a password on an unverified
+address, which neither the login nor the invitation accepts. So the row is read
+back first, and only a row with no password is undone as above. A row holding
+the password just written is an acceptance that happened: it completes, with
+the event and the usual answer, and the error is only logged. A row that cannot
+be read, or that holds a password this acceptance did not write, is left as it
+is — the address verified, the invitation spent — so a retry of that `500` is
+the `401`: the invitee's password logs in if it was stored, and otherwise
+`/forgot-password` reaches the account, whose address is verified. That case is
+logged with both ids. The read back sees only a write that has landed by then,
+so a store whose reads can lag its writes makes `GetUserByID` a consistent read
+(`ConsistentRead` on DynamoDB): a stale row without the password would undo an
+acceptance that happened.
+
+A session that cannot be opened after the password is stored does not undo the
 acceptance: the answer is the `201` without a session, and the invitee logs in.
 
 The route is mounted under `HTTPConfig.ClosedRegistration`, never under

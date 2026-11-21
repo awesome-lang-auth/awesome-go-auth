@@ -1409,7 +1409,9 @@ func openAPIInvitationAcceptPath() map[string]any {
 				"expired, revoked, already accepted, or an account that is gone or already active — is the same " +
 				"401. A missing field, or a password shorter than the minimum or longer than the 72 bytes bcrypt " +
 				"hashes, is refused before the token is touched; a 500 after it hands the token back, so the same " +
-				"request can be retried. On success the " +
+				"request can be retried — unless the server could not tell whether the password was stored: the " +
+				"retry is then the 401, and the invitee logs in, or resets the password through " +
+				"`/forgot-password`. On success the " +
 				"password is set and the address marked verified. When a second factor is demanded of the account " +
 				"the answer is the login's own challenge: under `Config.EnrolOnLogin` the 403's `tempToken` is an " +
 				"enrolment token for `/2fa/setup` and `/2fa/verify-setup`, which open the session once a TOTP " +

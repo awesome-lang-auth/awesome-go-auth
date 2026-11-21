@@ -107,11 +107,12 @@ const (
 	// invitedBy, invitedByKind, expiresAt, and accountCreated — false when a
 	// re-invitation reused the pending account (Config.InvitationReinvite).
 	EventUserInvited = "identity.user.invited"
-	// EventUserInvitationAccepted is raised once the invitee's password is set
-	// and the address marked verified, before any challenge or session. Data:
-	// invitationId. A session that the acceptance opens raises
+	// EventUserInvitationAccepted is raised once the invitee's password is
+	// stored and the address marked verified, before the acceptance answers.
+	// A second-factor challenge is minted before those writes but answered
+	// after the event; a session that the acceptance opens raises
 	// identity.auth.login.success after it, with method "local", as a
-	// registration that opens one does.
+	// registration that opens one does. Data: invitationId.
 	EventUserInvitationAccepted = "identity.user.invitation.accepted"
 	// EventUserInvitationRevoked is raised when an administrator revokes an
 	// invitation. Data: invitationId, revokedBy, revokedByKind, and
@@ -820,10 +821,35 @@ func (s *Service) deliverInvitation(ctx context.Context, invitation Invitation, 
 // same request, retried, finds the invitation and the account as they were.
 // Only when the hand-back fails as well is the account left pending with no
 // invitation; that is logged with both ids, and DELETE <admin>/api/users/{id}
-// followed by a new invitation is the way out. A session that cannot be opened
-// at step 7 does not undo the acceptance: the account is active by then, so the
-// answer is the registration's without a session, the failure is logged, and
-// the invitee logs in.
+// followed by a new invitation is the way out.
+//
+// The password write is the exception, because a write can land and still
+// answer an error — a timeout, a request cancelled after the commit — and
+// undoing the flag of an account whose password landed leaves a password on
+// an unverified address, which neither the login nor the invitation accepts.
+// So before undoing anything the row is read back (UserStore.GetUserByID, on a
+// context the request's cancellation does not reach):
+//
+//   - The hash this call wrote is there: the write landed, and the acceptance
+//     completes — steps 6 and 7 — with the error only logged.
+//   - No password is there: the write did not land, and the acceptance is
+//     undone as above.
+//   - The row cannot be read, or holds a password this call did not write:
+//     whether the write landed cannot be told, and either undo could strand
+//     the account. Nothing is undone. The address stays verified and the
+//     invitation spent, and the error is returned and logged with both ids. A
+//     retry is then refused, and the invitee logs in with the password if it
+//     was stored; if it was not, /forgot-password reaches the account, whose
+//     address is verified.
+//
+// The read back tells only a write that has landed by the time it reads, so a
+// store whose reads can lag its writes makes GetUserByID a consistent read
+// (ConsistentRead on DynamoDB). A stale row without the password would undo an
+// acceptance that happened.
+//
+// A session that cannot be opened at step 7 does not undo the acceptance: the
+// account is active by then, so the answer is the registration's without a
+// session, the failure is logged, and the invitee logs in.
 func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput) (InvitationAcceptance, error) {
 	store := s.cfg.Invitations
 	if store == nil {
@@ -870,7 +896,8 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 	}
 
 	// From here the token is spent. A refusal leaves it spent; any other
-	// failure hands it back (abandonAcceptance).
+	// failure hands it back (abandonAcceptance), except a failed password
+	// write whose outcome cannot be told, which leaves it spent too (below).
 	user, err := s.users.GetUserByID(ctx, invitation.UserID, invitation.TenantID)
 	switch {
 	case errors.Is(err, ErrUserNotFound):
@@ -906,19 +933,51 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 	// account the handed-back invitation can activate — even when undoing the
 	// flag fails too, since a verified address does not stop an acceptance.
 	// The other order would leave a password on an unverified address, which
-	// neither the login nor the invitation accepts.
+	// neither the login nor the invitation accepts. Undoing the flag after a
+	// password write that did land would leave the same thing, so a failed
+	// password write is undone only once the row shows it did not land.
 	if !user.IsEmailVerified {
 		if err := verification.MarkEmailVerified(ctx, user.ID, user.TenantID, true); err != nil {
 			return s.abandonAcceptance(ctx, invitation, fmt.Errorf("auth: accept invitation: verify address: %w", err))
 		}
 	}
 	if err := passwords.UpdatePassword(ctx, user.ID, user.TenantID, pwHash); err != nil {
-		if !user.IsEmailVerified {
-			if undoErr := verification.MarkEmailVerified(context.WithoutCancel(ctx), user.ID, user.TenantID, false); undoErr != nil {
-				s.logf("auth: accept invitation %s: marking the address of account %s unverified again failed: %v", invitation.ID, user.ID, undoErr)
+		err = fmt.Errorf("auth: accept invitation: set password: %w", err)
+		// A write can land and still answer an error: a timeout, or a request
+		// cancelled after the commit. The row is read back before anything is
+		// undone, on a context that cancellation does not reach.
+		stored, readErr := s.users.GetUserByID(context.WithoutCancel(ctx), user.ID, user.TenantID)
+		switch {
+		case readErr == nil && stored.PasswordHash == pwHash:
+			// It landed: the account is active with the password the invitee
+			// chose, so the acceptance completes. Only the error is logged.
+			s.logf("auth: accept invitation %s: the password write for account %s answered an error, "+
+				"but the password is stored; the acceptance completes: %v", invitation.ID, user.ID, err)
+		case readErr == nil && stored.PasswordHash == "":
+			// It did not land: the account is still pending, and the
+			// acceptance is undone like any other failure.
+			if !user.IsEmailVerified {
+				if undoErr := verification.MarkEmailVerified(context.WithoutCancel(ctx), user.ID, user.TenantID, false); undoErr != nil {
+					s.logf("auth: accept invitation %s: marking the address of account %s unverified again failed: %v", invitation.ID, user.ID, undoErr)
+				}
 			}
+			return s.abandonAcceptance(ctx, invitation, err)
+		default:
+			// Whether it landed cannot be told: the row cannot be read, or it
+			// holds a password this call did not write. Undoing the flag or
+			// handing the invitation back would be a guess that can strand the
+			// account, so neither is done: the address stays verified, the
+			// invitation spent, and the log says what to do.
+			why := "it holds a password this acceptance did not write"
+			if readErr != nil {
+				why = fmt.Sprintf("reading it back failed: %v", readErr)
+			}
+			s.logf("auth: accept invitation %s: the password write for account %s failed and whether it landed "+
+				"cannot be told (%s), so the invitation stays spent and the address verified; if the password was "+
+				"not stored, /forgot-password reaches the account, or DELETE <admin>/api/users/{id} and a new "+
+				"invitation start over: %v", invitation.ID, user.ID, why, err)
+			return InvitationAcceptance{}, err
 		}
-		return s.abandonAcceptance(ctx, invitation, fmt.Errorf("auth: accept invitation: set password: %w", err))
 	}
 
 	s.publish(ctx, func() Event {
@@ -951,7 +1010,9 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 // abandonAcceptance is how AcceptInvitation fails after the consume for a
 // reason of its own rather than a refusal of the token: it hands the invitation
 // back (InvitationStore.ReleaseInvitation) and returns err, so that the
-// invitee's retry finds the invitation pending and its token honoured. The
+// invitee's retry finds the invitation pending and its token honoured. A
+// failed password write whose outcome the row read back cannot tell is the one
+// such failure that does not come here: the invitation stays spent. The
 // release runs on a context the caller's cancellation does not reach: a client
 // that went away mid-request is the likeliest cause of the failure, and must
 // not also strand the account.

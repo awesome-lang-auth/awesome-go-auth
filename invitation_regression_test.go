@@ -17,8 +17,9 @@ import (
 // proof of concept that pinned a defect — an invitation spent by a password
 // bcrypt cannot hash, an account locked out by /forgot-password, the console
 // handed to an invitee under the first-user policy, an accepted account deleted
-// by a failed send's undo, an invitation minted by a cross-site form — and now
-// pin the fix.
+// by a failed send's undo, an invitation minted by a cross-site form, an
+// account stranded by undoing a password write that had landed — and now pin
+// the fix.
 
 func (f *invitationFixture) logged() string {
 	f.mu.Lock()
@@ -315,6 +316,252 @@ func TestAcceptInvitationWhenTheHandBackFailsToo(t *testing.T) {
 	}
 	if rec := f.machine(http.MethodPost, AdminInvitationsPath, `{"email":"`+invitedEmail+`","tenantId":"t1"}`); rec.Code != http.StatusCreated {
 		t.Fatalf("a new invitation = %d %s, want 201", rec.Code, rec.Body.String())
+	}
+}
+
+// unsettledPasswordWrite is a user store whose first password write answers an
+// error after leaving lands(hash) on the row: the hash it was given, as a
+// write that committed and lost its answer does; another one, as when
+// something else wrote the row; or "", nothing, as a write that failed
+// outright does. With cancel set it cancels the request first, as a client
+// that goes away does. Its reads honour the context, as a networked store's
+// do, and with unreadable set every read after that write fails.
+type unsettledPasswordWrite struct {
+	*MemoryUserStore
+	lands      func(hash string) string
+	cancel     context.CancelFunc
+	unreadable bool
+
+	mu      sync.Mutex
+	written bool
+}
+
+func (s *unsettledPasswordWrite) GetUserByID(ctx context.Context, id, tenantID string) (User, error) {
+	if err := ctx.Err(); err != nil {
+		return User{}, err
+	}
+	s.mu.Lock()
+	failing := s.written && s.unreadable
+	s.mu.Unlock()
+	if failing {
+		return User{}, errUserStoreDown
+	}
+	return s.MemoryUserStore.GetUserByID(ctx, id, tenantID)
+}
+
+func (s *unsettledPasswordWrite) UpdatePassword(ctx context.Context, id, tenantID, hash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.written {
+		return s.MemoryUserStore.UpdatePassword(ctx, id, tenantID, hash)
+	}
+	s.written = true
+	if landed := s.lands(hash); landed != "" {
+		if err := s.MemoryUserStore.UpdatePassword(ctx, id, tenantID, landed); err != nil {
+			return err
+		}
+	}
+	if s.cancel != nil {
+		s.cancel()
+		return ctx.Err()
+	}
+	return context.DeadlineExceeded
+}
+
+// theHashWritten and nothingWritten are what a password write's own outcome can
+// leave on the row.
+func theHashWritten(hash string) string { return hash }
+func nothingWritten(string) string      { return "" }
+
+// TestAcceptInvitationCompletesWhenThePasswordWriteLandsButFails: a password
+// write that committed and then answered an error — a store client that timed
+// out, a client that went away after the commit — used to be undone like one
+// that failed: the address marked unverified again and the invitation handed
+// back, over a stored password. That left a password on an unverified address,
+// which the login refuses outside lazy mode, and an invitation the retry could
+// only spend: the retry was 401, a re-invitation 409, a reset left the address
+// unverified, and nothing was logged. The row is now read back, and a write
+// that landed completes the acceptance.
+func TestAcceptInvitationCompletesWhenThePasswordWriteLandsButFails(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		opts       []Option
+		cancelled  bool
+		challenged bool
+	}{
+		{name: "a store that times out after the commit"},
+		{name: "a client that goes away after the commit", cancelled: true},
+		{
+			name:       "a second factor demanded: the challenge is the answer",
+			opts:       []Option{WithRequire2FA(true), WithEnrolOnLogin(true)},
+			challenged: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newAdminInvitationFixture(t, nil, append([]Option{WithInvitationReinvite(true)}, tc.opts...)...)
+			result := f.invite(invitedEmail)
+			reqCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			users := &unsettledPasswordWrite{MemoryUserStore: f.users, lands: theHashWritten}
+			if tc.cancelled {
+				users.cancel = cancel
+			}
+			f.svc().users = users
+			f.reset()
+			f.mu.Lock()
+			f.logs = nil
+			f.mu.Unlock()
+
+			acceptance, err := f.auth.AcceptInvitation(reqCtx, AcceptInvitationInput{Token: result.Token, Password: "a-new-password"})
+			if err != nil {
+				t.Fatalf("accept = %v, want the acceptance the stored password made", err)
+			}
+			f.svc().users = f.users
+			stored, _ := f.users.GetUserByID(ctx, result.User.ID, "t1")
+			if !stored.IsEmailVerified || !verifyPassword("a-new-password", stored.PasswordHash) {
+				t.Fatalf("stored = hash %v verified %v, want the password set and the address verified", stored.PasswordHash != "", stored.IsEmailVerified)
+			}
+			if pending, _ := f.store.PendingInvitationsForUser(ctx, result.User.ID); len(pending) != 0 {
+				t.Fatalf("pending = %+v, want the invitation spent by the acceptance", pending)
+			}
+			if names := eventNamesOf(f.raised()); strings.Join(names, ",") != EventUserInvitationAccepted {
+				t.Fatalf("raised %v, want the acceptance", names)
+			}
+			logs := f.logged()
+			for _, want := range []string{result.Invitation.ID, result.User.ID, "the acceptance completes"} {
+				if !strings.Contains(logs, want) {
+					t.Errorf("logs = %q, want %q in them", logs, want)
+				}
+			}
+			for _, secret := range []string{result.Token, result.Invitation.TokenHash, stored.PasswordHash} {
+				if strings.Contains(logs, secret) {
+					t.Fatalf("a log line carries the token, its hash or the password hash: %q", logs)
+				}
+			}
+			if got := acceptance.Challenge != nil; got != tc.challenged {
+				t.Fatalf("challenge = %+v, want one: %v", acceptance.Challenge, tc.challenged)
+			}
+			if tc.challenged {
+				// Minted before the writes from the hash about to be stored, it
+				// enrols against the hash that was.
+				if _, err := f.auth.VerifyEnrolmentToken(ctx, acceptance.Challenge.TempToken); err != nil {
+					t.Fatalf("the challenge does not enrol: %v", err)
+				}
+				return
+			}
+
+			// The retry is refused: the acceptance happened and spent the token.
+			if _, err := f.accept(result.Token, "a-new-password"); !errors.Is(err, ErrInvalidInvitation) {
+				t.Fatalf("retry = %v, want ErrInvalidInvitation", err)
+			}
+			// The password the invitee chose logs in.
+			if _, _, err := f.auth.Login(ctx, LoginInput{Email: invitedEmail, Password: "a-new-password", TenantID: "t1"}); err != nil {
+				t.Fatalf("login = %v, want the password just set to log in", err)
+			}
+			// The account is active: a re-invitation is the 409 of any active one.
+			if rec := f.machine(http.MethodPost, AdminInvitationsPath, `{"email":"`+invitedEmail+`","tenantId":"t1"}`); rec.Code != http.StatusConflict {
+				t.Fatalf("re-invite = %d %s, want 409", rec.Code, rec.Body.String())
+			}
+			// And a reset is an ordinary one, on a verified address.
+			token, err := f.auth.ForgotPassword(ctx, ForgotPasswordInput{Email: invitedEmail, TenantID: "t1"})
+			if err != nil || token == "" {
+				t.Fatalf("forgot = %q, %v", token, err)
+			}
+			if err := f.auth.ResetPassword(ctx, ResetPasswordInput{Token: token, NewPassword: "a-reset-password"}); err != nil {
+				t.Fatalf("reset: %v", err)
+			}
+			if _, _, err := f.auth.Login(ctx, LoginInput{Email: invitedEmail, Password: "a-reset-password", TenantID: "t1"}); err != nil {
+				t.Fatalf("login after the reset = %v", err)
+			}
+		})
+	}
+}
+
+// TestAcceptInvitationWhenAFailedPasswordWriteCannotBeTold: when the row read
+// back after a failed password write cannot say whether the write landed — it
+// cannot be read, or it holds a password the acceptance did not write —
+// nothing is undone. Undoing the flag over a password that landed strands the
+// account, and handing the invitation back to an account with a password only
+// lets the retry spend it. The address stays verified and the invitation
+// spent, the log names both ids and the way out, and the way out works.
+func TestAcceptInvitationWhenAFailedPasswordWriteCannotBeTold(t *testing.T) {
+	anotherHash, err := hashPassword("somebody-elses-password", testBcryptCost)
+	if err != nil {
+		t.Fatalf("hashPassword: %v", err)
+	}
+	for _, tc := range []struct {
+		name       string
+		lands      func(hash string) string
+		unreadable bool
+		// logsIn is the password the account has afterwards, "" for none.
+		logsIn string
+	}{
+		{name: "the password landed, and the row cannot be read back", lands: theHashWritten, unreadable: true, logsIn: "a-new-password"},
+		{name: "nothing landed, and the row cannot be read back", lands: nothingWritten, unreadable: true},
+		{
+			name:   "the row holds a password this acceptance did not write",
+			lands:  func(string) string { return anotherHash },
+			logsIn: "somebody-elses-password",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newInvitationFixture(t)
+			result := f.invite(invitedEmail)
+			f.svc().users = &unsettledPasswordWrite{MemoryUserStore: f.users, lands: tc.lands, unreadable: tc.unreadable}
+			f.reset()
+
+			_, err := f.accept(result.Token, "a-new-password")
+			if err == nil || errors.Is(err, ErrInvalidInvitation) || InvitationAcceptHTTPError(err) != HTTPErrInternal {
+				t.Fatalf("accept = %v, want the failure itself, answered as the generic 500", err)
+			}
+			f.svc().users = f.users
+			stored, _ := f.users.GetUserByID(ctx, result.User.ID, "t1")
+			if !stored.IsEmailVerified {
+				t.Fatalf("stored = %+v, want the address left verified", stored)
+			}
+			if tc.logsIn == "" && stored.PasswordHash != "" {
+				t.Fatalf("stored = %+v, want no password", stored)
+			}
+			if pending, _ := f.store.PendingInvitationsForUser(ctx, result.User.ID); len(pending) != 0 {
+				t.Fatalf("pending = %+v, want the invitation left spent", pending)
+			}
+			if names := eventNamesOf(f.raised()); len(names) != 0 {
+				t.Fatalf("raised %v for an acceptance that cannot be told", names)
+			}
+			logs := f.logged()
+			for _, want := range []string{result.Invitation.ID, result.User.ID, "cannot be told", "/forgot-password", "DELETE <admin>/api/users/{id}"} {
+				if !strings.Contains(logs, want) {
+					t.Errorf("logs = %q, want %q in them", logs, want)
+				}
+			}
+			for _, secret := range []string{result.Token, result.Invitation.TokenHash} {
+				if strings.Contains(logs, secret) {
+					t.Fatalf("a log line carries the token or its hash: %q", logs)
+				}
+			}
+			if _, err := f.accept(result.Token, "a-new-password"); !errors.Is(err, ErrInvalidInvitation) {
+				t.Fatalf("retry = %v, want ErrInvalidInvitation: the invitation stays spent", err)
+			}
+			if tc.logsIn != "" {
+				if _, _, err := f.auth.Login(ctx, LoginInput{Email: invitedEmail, Password: tc.logsIn, TenantID: "t1"}); err != nil {
+					t.Fatalf("login with the stored password: %v", err)
+				}
+			}
+			// The way out the log names: the address is verified, so the
+			// account is not reserved, and a reset logs in.
+			token, err := f.auth.ForgotPassword(ctx, ForgotPasswordInput{Email: invitedEmail, TenantID: "t1"})
+			if err != nil || token == "" {
+				t.Fatalf("forgot = %q, %v, want a reset for the account", token, err)
+			}
+			if err := f.auth.ResetPassword(ctx, ResetPasswordInput{Token: token, NewPassword: "a-reset-password"}); err != nil {
+				t.Fatalf("reset: %v", err)
+			}
+			if _, _, err := f.auth.Login(ctx, LoginInput{Email: invitedEmail, Password: "a-reset-password", TenantID: "t1"}); err != nil {
+				t.Fatalf("login after the reset: %v", err)
+			}
+		})
 	}
 }
 

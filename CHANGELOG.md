@@ -74,8 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the acceptance's own once the token is spent — a store write, a challenge
     that cannot be minted, a client gone away — hands the token back
     (`InvitationStore.ReleaseInvitation`) with the account still pending, so the
-    same link can simply be retried; a session that cannot be opened after the
-    password is stored leaves the `201` without one, and the invitee logs in.
+    same link can simply be retried. A password write that answers an error is
+    read back first, since it may have landed: one that did completes the
+    acceptance, and one whose outcome cannot be told leaves the token spent and
+    the address verified — so `/forgot-password` reaches the account — and is
+    logged with both ids. A session that cannot be opened after the password
+    is stored leaves the `201` without one, and the invitee logs in.
   - **Delivery:** `InvitationDelivery`, `InvitationSender`, `InvitationURL`
     (`<base>/invitations/accept?token=…`; no page ships for it),
     `InvitationMailer` (the reference's template, rendered with `{link}` alone,
