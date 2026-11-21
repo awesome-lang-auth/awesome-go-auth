@@ -137,16 +137,26 @@ var (
 			secret: "482913",
 			to:     "+15555550104",
 		},
+		{
+			kind: DeliveryKindInvitation,
+			send: func(w *DeliveryWebhook, ctx context.Context) error {
+				return w.SendInvitation(ctx, InvitationDelivery{InvitationID: "inv_1", UserID: "usr_1", TenantID: "t1", Email: "ada@example.com", Role: "operator", Token: "tok-invite-9f3a", ExpiresAt: webhookExpiry})
+			},
+			body:   `{"kind":"invitation","delivery":{"invitationId":"inv_1","userId":"usr_1","tenantId":"t1","email":"ada@example.com","role":"operator","token":"tok-invite-9f3a","expiresAt":"2026-09-11T10:00:00Z"}}`,
+			secret: "tok-invite-9f3a",
+			to:     "ada@example.com",
+		},
 	}
 )
 
-// One value has to be wireable to all five seams; that is the point of it.
+// One value has to be wireable to all six seams; that is the point of it.
 var (
 	_ MagicLinkSender         = (&DeliveryWebhook{}).SendMagicLink
 	_ PasswordResetSender     = (&DeliveryWebhook{}).SendPasswordReset
 	_ EmailVerificationSender = (&DeliveryWebhook{}).SendEmailVerification
 	_ EmailChangeSender       = (&DeliveryWebhook{}).SendEmailChange
 	_ SMSCodeSender           = (&DeliveryWebhook{}).SendSMSCode
+	_ InvitationSender        = (&DeliveryWebhook{}).SendInvitation
 )
 
 func TestDeliveryWebhookWiresToEverySeam(t *testing.T) {
@@ -162,6 +172,7 @@ func TestDeliveryWebhookWiresToEverySeam(t *testing.T) {
 		WithEmailVerificationSender(hook.SendEmailVerification),
 		WithEmailChangeSender(hook.SendEmailChange),
 		WithSMSCodeSender(hook.SendSMSCode),
+		WithInvitationSender(hook.SendInvitation),
 	)
 	if err != nil {
 		t.Fatalf("new auth: %v", err)

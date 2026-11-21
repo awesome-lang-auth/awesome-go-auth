@@ -123,6 +123,13 @@ const (
 	// (admin.router.ts:372-374). AdminUserStore's doc comment carries why that
 	// ordering is a contract here and a promise the reference's own stores do
 	// not keep.
+	//
+	// Under this policy POST <admin>/api/users/invitations refuses to invite
+	// (501). An invitation creates its account, with an id minted at random,
+	// the moment it is sent, and the user this policy names is chosen by id
+	// order, so the invited account could become that user. A host must not
+	// call Auth.InviteUser directly under this policy either; an invite-only
+	// deployment uses AdminIsAdminFlag or AdminPredicate.
 	AdminPolicyFirstUser AdminPolicyKind = "first-user"
 	// AdminPolicyIsAdminFlag grants a user whose IsAdmin is set, and reads
 	// nothing else — not Role, not RBAC (admin.router.ts:370). See User.IsAdmin.
@@ -402,6 +409,23 @@ type AdminOptions struct {
 	// Nil, the default, is the reference's guard exactly. See the
 	// admin-machine-access-is-a-host-seam deviation.
 	MachineAccess func(*http.Request) (principal string, ok bool)
+	// RevealInvitationToken lets POST <admin>/api/users/invitations answer
+	// with the invitation's one-time token and accept link — "token" and
+	// "acceptUrl" — when the deployment has no Config.SendInvitation, so that
+	// the caller delivers the invitation itself: a back-office service that
+	// mails through a notification system of its own, a test environment.
+	//
+	// It is read only when no sender is configured. A deployment with one
+	// never hands a token to an HTTP caller, whatever this says. Without a
+	// sender and without this, the route refuses to invite at all (501)
+	// rather than create an invitation nobody can deliver.
+	//
+	// A token in a response body travels wherever responses travel — an API
+	// gateway's log, a client's trace. Turn it on where the caller is a
+	// service that forwards the token straight to the invitee, and accept
+	// that the address is then verified on that service's word: accepting an
+	// invitation marks the address verified (Service.AcceptInvitation).
+	RevealInvitationToken bool
 }
 
 // AdminPath is AdminOptions.Path resolved: the configured value normalised the
@@ -1033,6 +1057,14 @@ func (a *Auth) AdminHandler(cfg HTTPConfig) http.Handler {
 		id, _ := matchAdminPromote(r.Method, adminRelativePath(r.URL.EscapedPath(), cfg.AdminPath()))
 		a.adminPromoteUser(w, r, cfg, id)
 	}))
+
+	// The invitation routes (admin_invitations.go), registered only with an
+	// InvitationStore and behind the same Protect, so MachineAccess and the
+	// session policy decide them as they decide everything else here.
+	invitations := guard.Protect(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		route, id := matchAdminInvitation(r.Method, adminRelativePath(r.URL.EscapedPath(), cfg.AdminPath()))
+		a.serveAdminInvitation(w, r, cfg, route, id)
+	}))
 	if cfg.Admin.RateLimiter != nil {
 		promote = cfg.Admin.RateLimiter(promote)
 	}
@@ -1068,6 +1100,7 @@ func (a *Auth) AdminHandler(cfg HTTPConfig) http.Handler {
 		credential, _ := matchAdminCredential(r.Method, escaped)
 		upload, _ := matchAdminUpload(r.Method, escaped)
 		_, promotes := matchAdminPromote(r.Method, escaped)
+		invitation, _ := matchAdminInvitation(r.Method, escaped)
 		switch {
 		case rel == AdminLoginPath && r.Method == http.MethodPost:
 			if !guard.LoginRoutesMounted() {
@@ -1089,6 +1122,14 @@ func (a *Auth) AdminHandler(cfg HTTPConfig) http.Handler {
 			shell.ServeHTTP(w, r)
 		case rel == AdminPingPath && isAdminRead(r):
 			ping.ServeHTTP(w, r)
+		// The three invitation routes, ahead of the reads: this is the one
+		// place the classification below is not disjoint, because GET
+		// /api/users/invitations is also GET /api/users/:id with the id
+		// "invitations". With an InvitationStore the listing wins; without one
+		// this case never matches and the path is the detail route's, as it
+		// always was. admin_invitations.go says why the shadowing is harmless.
+		case a.adminInvitationRegistered(invitation):
+			invitations.ServeHTTP(w, r)
 		// The fourteen read routes of admin_read.go. They are one case rather
 		// than fourteen because six of them carry a path parameter, which a
 		// `rel ==` case cannot express; the route table is matchAdminRead.

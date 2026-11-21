@@ -238,6 +238,14 @@ func (a *Adapter) mountCredentialRoutes(mux *http.ServeMux, prefix string) {
 	mux.Handle("GET "+prefix+"/verify-email", a.guard(http.HandlerFunc(a.VerifyEmail)))
 	mux.Handle("POST "+prefix+"/change-email/request", a.guard(a.Middleware()(http.HandlerFunc(a.ChangeEmailRequest))))
 	mux.Handle("POST "+prefix+"/change-email/confirm", a.guard(http.HandlerFunc(a.ChangeEmailConfirm)))
+	// The invitation accept route (invitations.go): a credential route, so it
+	// is here and gone under ResourceServer, but not one of the nineteen —
+	// it exists only on an Auth with an InvitationStore, and
+	// ClosedRegistration, which closes sign-up, leaves it mounted because it
+	// is how an invite-only deployment gets its accounts.
+	if a.auth.InvitationsEnabled() {
+		mux.Handle("POST "+prefix+auth.InvitationAcceptRoute, a.InvitationAcceptHandler())
+	}
 }
 
 // guard wraps a mounted route in the outer chain every auth route carries: the

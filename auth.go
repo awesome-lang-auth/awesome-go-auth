@@ -449,6 +449,60 @@ func WithEmailChangedSender(sender EmailChangedSender) Option {
 	}
 }
 
+// WithInvitationStore sets Config.Invitations and with it turns the invitation
+// flow on: POST <prefix>/invitations/accept on every adapter, and the three
+// invitation routes of the admin router. See invitation.go.
+//
+//	auth.WithInvitationStore(auth.NewMemoryInvitationStore())
+//
+// MemoryInvitationStore is correct only in a single process; a serverless or
+// multi-instance deployment supplies a shared InvitationStore.
+func WithInvitationStore(store InvitationStore) Option {
+	return func(b *authBuilder) error {
+		if store == nil {
+			return errors.New("auth: invitation store is required")
+		}
+		b.cfg.Invitations = store
+		return nil
+	}
+}
+
+// WithInvitationTTL sets Config.InvitationTTL, how long an invitation's token
+// is honoured. The default is DefaultInvitationTTL, 72 hours.
+func WithInvitationTTL(ttl time.Duration) Option {
+	return func(b *authBuilder) error {
+		if ttl <= 0 {
+			return errors.New("auth: invitation ttl must be > 0")
+		}
+		b.cfg.InvitationTTL = ttl
+		return nil
+	}
+}
+
+// WithInvitationReinvite sets Config.InvitationReinvite: whether inviting an
+// address whose account is still pending invites it again (true) or is refused
+// like any existing address (false, the default).
+func WithInvitationReinvite(enabled bool) Option {
+	return func(b *authBuilder) error {
+		b.cfg.InvitationReinvite = enabled
+		return nil
+	}
+}
+
+// WithInvitationSender wires invitation delivery: the reference's
+// mailer.sendInvitation as a seam. Pass a callback, InvitationMailer.Send for
+// the reference's invitation template over a MailerTransport, or
+// DeliveryWebhook.SendInvitation.
+func WithInvitationSender(sender InvitationSender) Option {
+	return func(b *authBuilder) error {
+		if sender == nil {
+			return errors.New("auth: invitation sender is required")
+		}
+		b.cfg.SendInvitation = sender
+		return nil
+	}
+}
+
 // WithTemplateStore sets Config.Templates: the store whose mail templates
 // override the built-ins for every ready-made mailer the service calls — the
 // reference's config.templateStore (mailer.service.ts:146, 156-179). See

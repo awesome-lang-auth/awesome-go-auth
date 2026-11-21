@@ -58,6 +58,13 @@ func main() {
   for an invite-only deployment with `HTTPConfig.ClosedRegistration`, which
   unmounts `POST <prefix>/register` and leaves `Service.Register` to the host
   ([Closing public registration](README_DETAILED.md#closing-public-registration--httpconfigclosedregistration)).
+- Invitations for that invite-only deployment (`WithInvitationStore`):
+  `POST <admin>/api/users/invitations` creates a pending account and delivers a
+  single-use token, hashed at rest and valid 72 hours by default, through
+  `Config.SendInvitation`; `POST <prefix>/invitations/accept` — mounted under
+  `ClosedRegistration` too — sets the password, verifies the address and, under
+  `Require2FA`, hands the invitee to the forced enrolment before any session
+  opens ([Invitations](README_DETAILED.md#invitations--configinvitations)).
 - Signed access token + refresh token (HMAC-SHA256) with expiry.
 - Stateful sessions with refresh token rotation and revocation (logout).
 - Configurable session check policy (`allcalls` / `refresh` / `none`).
@@ -836,11 +843,13 @@ revision the whole contract was extracted from.
   the router's `404` — `features.register` answers `false`, the built-in UI
   hides its sign-up link and the served OpenAPI document leaves the path out,
   which is the reference's hookless deployment on every surface.
-  `Service.Register` stays callable by the host either way, for invitations and
-  admin-created accounts. Resource-server mode also unmounts the route, with the
-  rest of the credential set — see `resource-server-gates-all-credential-routes`
-  — and the flag does not follow it there, which is what the reference does too
-  for a resource server that supplied the hook.
+  `Service.Register` stays callable by the host either way, and the invitation
+  routes stay mounted under the flag (`invitations-are-an-addition`): they are
+  how a closed deployment's accounts are made over HTTP. Resource-server mode
+  also unmounts the route, with the rest of the credential set — see
+  `resource-server-gates-all-credential-routes` — and the flag does not follow
+  it there, which is what the reference does too for a resource server that
+  supplied the hook.
 - **The reference**: Mounts `/register` only when `routerOptions.onRegister` is
   supplied, the host having written the account-creation function itself, and
   reports `!!routerOptions?.onRegister` in `features.register`. A deployment
@@ -867,6 +876,90 @@ revision the whole contract was extracted from.
   `AutoCreate: false` too, or configures no provider. The built-in UI's
   `<prefix>/ui/register` page is still served, as the reference serves it
   without a hook; its form posts to the route that is gone.
+
+### Invitations: an admin route creates a pending account and a public route redeems it, where the reference ships only the mail
+
+`invitations-are-an-addition`
+
+- **Surface**: `POST` and `GET <admin>/api/users/invitations`,
+  `DELETE <admin>/api/users/invitations/{id}`,
+  `POST <prefix>/invitations/accept`, and `Config.Invitations`
+  (`WithInvitationStore`).
+- **This port**: With an `InvitationStore` configured, and only then, the admin
+  router invites an address: `POST <admin>/api/users/invitations`
+  `{email, role?, tenantId?, metadata?}` creates a pending account (no password,
+  no factor, address unverified) and a single-use token valid
+  `Config.InvitationTTL`, 72 hours by default, of which the store keeps only the
+  SHA-256. The token goes to `Config.SendInvitation` — `InvitationMailer`
+  renders the reference's `invitation` template, `DeliveryWebhook` posts it —
+  and never into the answer, except with no sender and
+  `AdminOptions.RevealInvitationToken` set. An address that has an account is
+  `409`, unless `Config.InvitationReinvite` invites a still-pending one again.
+  `POST <prefix>/invitations/accept` `{token, password}` is public, mounted
+  under `HTTPConfig.ClosedRegistration` too and never under `ResourceServer`,
+  CSRF-exempt and behind the rate-limiter slot. It spends the token, sets the
+  password and marks the address verified — a password bcrypt could not hash,
+  over 72 bytes, is refused like a short one before the token is touched, and a
+  failure after the spend hands the token back unless the password may already
+  be stored — then answers what the login would: its second-factor challenge
+  when one is demanded — `403 2FA_SETUP_REQUIRED` with an enrolment token under
+  `Config.EnrolOnLogin` — and otherwise the registration's
+  `201 {"success": true, "userId": …}`, with a session only when
+  `Config.IssueSessionOnRegister` allows one. Every refusal of the token —
+  unknown, expired, revoked, replayed, or naming an account already active — is
+  one `401 INVALID_INVITATION`. Revoking deletes the account if nobody has used
+  it. Under `AdminFirstUser` the admin route refuses to invite (`501`). Three
+  events outside `EventNames` record the flow: `identity.user.invited`,
+  `identity.user.invitation.accepted` and `identity.user.invitation.revoked`.
+- **The reference**: Ships the mail and nothing around it.
+  `MailerService.sendInvitation(to, link, data, lang)` renders the `invitation`
+  template with `{...data, link}`, but no route creates, delivers or redeems an
+  invitation. The admin router's user routes list, read and delete — none
+  creates an account — and `/register` exists only when the host supplies
+  `onRegister`, so a deployment without the hook, the invite-only one, has no
+  HTTP way to create an account (`mailer.service.ts:210-227`,
+  `admin.router.ts:746-815`, `auth.router.ts:712-715`).
+- **Why**: An invite-only deployment, often under a mandatory second factor,
+  still has to provision its people, and the reference leaves that to host code
+  on both sides. The mail it does ship fixes the template and the `{link}` it is
+  rendered with, and both are kept, so a stored template written for the
+  reference renders here unchanged; the routes around it are this port's. The
+  token is hashed at rest and spent atomically before the password is written,
+  so a replay and a race both lose; every refusal answers alike, so the route
+  says nothing about which tokens or accounts exist; and the acceptance answers
+  through the login's own second-factor logic, so under `Require2FA` no session
+  exists before a factor is enrolled.
+- **The pending account is a real account**: Until it is accepted it is an
+  ordinary row with no password, so magic-link login reaches it as it reaches
+  any account, for whoever reads the invited mailbox — the trust the invitation
+  itself rests on, and the way in a deployment that accepts invitations by magic
+  link relies on. `/forgot-password` does not: while an invitation still
+  reserves the account — no password, no factor, the address unverified — it
+  answers as for an unknown address and sends nothing, and `/reset-password`
+  refuses a token for it, because a reset would leave a password on an
+  unverified address, which the login refuses outside lazy mode, on an account
+  the invitation can no longer activate. Revoking the invitation deletes the
+  account only if nobody has used it — no password, no factor, the address still
+  unverified, no session ever opened, no linked provider — which closes the
+  remaining door on an account nobody claimed. An account the invitee signed in
+  to is kept, and `accountRemoved` says so; removing it is an explicit
+  `DELETE <admin>/api/users/{id}`. An expired invitation stays listed, as
+  expired, until it is revoked, and so does its account: the window bounds the
+  token, not the account.
+- **Not under the first-user policy**: `AdminFirstUser` names the console's user
+  by user-id order, and an invitation creates its account, with an id minted at
+  random, the moment it is sent, so the invited account could become the user
+  that policy names. `POST <admin>/api/users/invitations` answers `501` under
+  that policy, whoever calls it.
+- **Enrolling at acceptance is still opt-in**: Under `Config.Require2FA` without
+  `Config.EnrolOnLogin` the acceptance answers `2FA_SETUP_REQUIRED` with a token
+  no route completes, exactly as the login does, and the account is enrolled out
+  of band. A deployment that wants invitees to enrol at acceptance turns
+  `EnrolOnLogin` on: accepting an invitation is first use.
+- **Not in the admin document**: The admin OpenAPI document transcribes the
+  reference's generator and describes none of the three admin routes, as it does
+  not describe the promote route. The accept route is in the auth document under
+  `OpenAPIInfo.Invitations`.
 
 ### The documentation routes are off until asked for, and the document describes them
 
@@ -1013,6 +1106,14 @@ revision the whole contract was extracted from.
   of the `POST <prefix>/2fa/verify` site, reached from the one other place a
   password-and-TOTP login now completes. It is not counted among the twenty-six,
   which are the development line's; see `forced-enrolment-opens-a-session`.
+- **The invitation flow's own events**: With an `InvitationStore` the library
+  raises three events no tree declares — `identity.user.invited`,
+  `identity.user.invitation.accepted`, `identity.user.invitation.revoked` —
+  outside the vocabulary `EventNames` returns, as
+  `identity.admin.machine.access` is. An acceptance that opens a session raises
+  `identity.auth.login.success` with `method: "local"`, the payload a
+  registration that opens one raises. None is counted among the twenty-six; see
+  `invitations-are-an-addition`.
 
 ### Refreshing rotates the token inside the session instead of opening a new one
 
@@ -2027,7 +2128,7 @@ release that closes the gap.
 | Token management (cookie/bearer, access/refresh rotation, secure cookies) | ✅ Implemented | HS256 JWS, `X-Auth-Strategy: bearer`, rotation on refresh, `__Host-`/`__Secure-`/bare cookie policy. | — |
 | Stateful sessions | ✅ Implemented | Revocation, rotation, `Config.SessionCheckOn` (`allcalls`/`refresh`/`none`). | — |
 | CSRF protection | ✅ Implemented | `CSRFMiddleware`, double-submit cookie + header, exemption table pinned to the reference. | — |
-| Account management | ✅ Implemented | Register (closable with `HTTPConfig.ClosedRegistration`, the reference's deployment without `onRegister`), `UpdateProfile`, `DeleteAccount`, password and email lifecycle. | — |
+| Account management | ✅ Implemented | Register (closable with `HTTPConfig.ClosedRegistration`, the reference's deployment without `onRegister`), invitations for the closed deployment (`WithInvitationStore`; the reference ships the invitation mail and no route, so the routes are this port's — `invitations-are-an-addition`), `UpdateProfile`, `DeleteAccount`, password and email lifecycle. | — |
 | OAuth login + account linking | ✅ Implemented | Signed state, PKCE, single-use nonce; Google and GitHub presets, `AdditionalAuthParams` and declarative `ProfileMap`/`MapProfile` for generic providers; `OAuthProvisioning` replaces the reference's abstract `findOrCreateUser` (auto-create, domain allowlist, verified-address demand, `FieldMap`), and the account-conflict flow is complete — stash, the reference's `/account-conflict` redirect, then `/link-request` and `/link-verify`. | — |
 | Dynamic email templates + UI i18n fallback | ✅ Implemented | The reference's six template ids with its en/it built-ins, `TemplateStore` overrides rendered under its `{{T.key}}`/`{{key}}` rule, per-request site-URL links and the old-address notice on `/change-email/confirm`. The `welcome` template renders but `POST /register` does not mail it yet (the reference does, `auth.router.ts:719-724`); UI translations are stored and are read by `GET <prefix>/ui/config`, which serves the `config` page for the requested language with the reference's `en` fallback. | — |
 | Custom token claims | ✅ Implemented | `Config.BuildTokenClaims` hook, plus `StaticClaims`/`UserFieldClaims`/`ChainClaims` and the synchronous `ClaimsWebhook` (this port's extension); the hook runs at mint time and on `/me`, never in the middleware. | — |

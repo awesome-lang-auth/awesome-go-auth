@@ -120,10 +120,11 @@ func (ad *Adapter) Mount(group gin.IRoutes) {
 		}
 	}
 
-	// The shared net/http adapter behind the two groups gin does not implement
-	// itself: the UI config route below and the OAuth group at the bottom. One
-	// adapter for both, because building a second would re-run
-	// ResolveHTTPConfig on the same config and leave two of them to drift.
+	// The shared net/http adapter behind the groups gin does not implement
+	// itself: the UI config route below, the invitation accept route and the
+	// OAuth group at the bottom. One adapter for all of them, because building
+	// a second would re-run ResolveHTTPConfig on the same config and leave two
+	// of them to drift.
 	h := nethttpadapter.NewWithConfig(ad.auth, ad.cfg)
 
 	// The built-in UI, mounted only when it is enabled — the reference gates its
@@ -160,6 +161,15 @@ func (ad *Adapter) Mount(group gin.IRoutes) {
 
 	if !ad.cfg.ResourceServer {
 		ad.mountCredentialRoutes(group, prefix)
+		// The invitation accept route, a credential route that exists only on
+		// an Auth with an InvitationStore and that ClosedRegistration leaves
+		// mounted. It is the shared net/http handler, already wrapped in the
+		// same guard, as the OAuth group below is: the route is entirely
+		// body-driven, so a second implementation would only be somewhere to
+		// drift.
+		if ad.auth.InvitationsEnabled() {
+			group.POST(prefix+auth.InvitationAcceptRoute, serveHTTP(h.InvitationAcceptHandler()))
+		}
 	}
 	// /me authenticates itself (see me) rather than sitting behind Middleware,
 	// so the token is verified once and the claims hook runs once.

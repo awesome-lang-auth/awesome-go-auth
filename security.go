@@ -25,7 +25,18 @@ func newID(prefix string) (string, error) {
 	return prefix + "_" + hex.EncodeToString(b), nil
 }
 
+// bcryptMaxPasswordBytes is the longest password hashPassword can hash:
+// golang.org/x/crypto/bcrypt refuses a longer one with ErrPasswordTooLong
+// rather than truncate it, as some bcrypt libraries do. It is a count of bytes,
+// not of characters: 25 four-byte runes are 100 bytes.
+const bcryptMaxPasswordBytes = 72
+
 // hashPassword hashes password at the given bcrypt cost.
+//
+// A password longer than bcryptMaxPasswordBytes is an error, bcrypt's own,
+// wrapped like any other failure. A caller that must not fail after a
+// side effect it cannot take back checks the length first, as
+// Service.AcceptInvitation does before it spends the invitation's token.
 //
 // A zero cost means "unset" and resolves to bcrypt.DefaultCost. This is the one
 // place that resolution happens, so every caller may pass Config.BcryptCost

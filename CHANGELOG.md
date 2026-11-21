@@ -7,6 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Invitations: how a closed deployment gets its accounts over HTTP**,
+  behind `Config.Invitations` (`WithInvitationStore`), off by default. Under
+  `HTTPConfig.ClosedRegistration` no route created an account at all — the
+  admin API lists, reads, deletes and promotes — so an invite-only deployment
+  had to provision people from host code. The reference ships the mail and no
+  route around it (`MailerService.sendInvitation` and its `invitation`
+  template, `mailer.service.ts:210-227`); the routes are this port's,
+  registered as the deviation `invitations-are-an-addition`. With a store
+  configured, and only then:
+  - **`POST <admin>/api/users/invitations`** `{email, role?, tenantId?,
+    metadata?, emailLang?}`, behind the admin guard — `MachineAccess` and the
+    session policy decide it as they decide every admin route — creates a
+    pending account (no password, no factor, address unverified, `role` on
+    `User.Role`, `metadata` through the `UserMetadataStore`) and an invitation:
+    a token of 256 random bits of which the store keeps the SHA-256, valid
+    `Config.InvitationTTL` (`WithInvitationTTL`, 72 hours by default; zero
+    means the default, so a hand-built `Config` stays valid). It answers
+    `201 {success, invitationId, userId, email, expiresAt}`. The body must be
+    `application/json` (`415` otherwise: the admin router has no CSRF layer, and
+    a cross-site form cannot send JSON), and the address one plain mailbox — no
+    list, display name, whitespace or control character
+    (`ErrInvalidInvitationEmail`, `400`), since accepting marks it verified. The
+    token goes to the new `Config.SendInvitation` (`WithInvitationSender`) and
+    **never into the answer** — unless the deployment has no sender and
+    `AdminOptions.RevealInvitationToken` says the caller delivers it, when the
+    answer adds `token` and `acceptUrl`. With neither the route refuses (`501`)
+    rather than create an invitation nobody can deliver. An address that has an
+    account is `409`; with `Config.InvitationReinvite`
+    (`WithInvitationReinvite`) a still-pending one is invited again — `200`, the
+    same account as it is, a fresh token, the earlier tokens retired — and a
+    re-invitation naming another `role` or `tenantId` is `409`
+    (`ErrInvitationMismatch`). A send that fails is `502` and is undone, so the
+    call can be repeated; an account the invitee accepted in the meantime (a
+    sender that delivered, then failed) is kept. Under the console's
+    `AdminFirstUser` policy the route answers `501`: the account an invitation
+    creates, the moment it is sent, could become the first user that policy
+    names.
+  - **`GET <admin>/api/users/invitations`** lists the invitations neither
+    accepted nor revoked, `status` `pending` or `expired`, never a token or its
+    hash; **`DELETE <admin>/api/users/invitations/{id}`** revokes one (`404`
+    unknown, `409` no longer pending) and deletes the account it reserved only
+    if nobody has used it — no password, no factor, the address unverified, no
+    session, no linked provider; `accountRemoved` says which. An account that
+    goes takes the role assignments, tenant memberships and metadata a host
+    attached to it. With a store configured the listing path
+    shadows `GET <admin>/api/users/{id}` for the id `"invitations"`, which no
+    id this package mints can be.
+  - **`POST <prefix>/invitations/accept`** `{token, password}` on all four
+    adapters: public, CSRF-exempt, behind `HTTPConfig.RateLimiter`, mounted
+    under `ClosedRegistration` too and never under `ResourceServer`. A missing
+    field (`400 INVALID_INPUT`), or a password shorter than `MinPasswordLen` or
+    longer than the 72 bytes bcrypt hashes (`400 WEAK_PASSWORD`), is refused
+    before the token is touched. The token is then consumed —
+    atomically, once — and every refusal of it is one answer,
+    `401 {"error":"Invalid or expired invitation","code":"INVALID_INVITATION"}`:
+    unknown, expired, revoked, replayed, or naming an account that is gone,
+    already active or whose address moved. On success the password is set, the
+    address marked verified, and the answer is what the login would give next:
+    under `Config.Require2FA` (or the user's flag) its challenge —
+    `403 2FA_SETUP_REQUIRED` whose `tempToken`, under `Config.EnrolOnLogin`, is
+    the enrolment token of #102, so the invitee enrols TOTP before any session
+    opens — and otherwise the registration's `201 {success, userId}`, with a
+    session only when `Config.IssueSessionOnRegister` allows one. A failure of
+    the acceptance's own once the token is spent — a store write, a challenge
+    that cannot be minted, a client gone away — hands the token back
+    (`InvitationStore.ReleaseInvitation`) with the account still pending, so the
+    same link can simply be retried. A password write that answers an error is
+    read back first, since it may have landed: one that did completes the
+    acceptance, and one whose outcome cannot be told leaves the token spent and
+    the address verified — so `/forgot-password` reaches the account — and is
+    logged with both ids. A session that cannot be opened after the password
+    is stored leaves the `201` without one, and the invitee logs in.
+  - **Delivery:** `InvitationDelivery`, `InvitationSender`, `InvitationURL`
+    (`<base>/invitations/accept?token=…`; no page ships for it),
+    `InvitationMailer` (the reference's template, rendered with `{link}` alone,
+    `en` and `it`) and `DeliveryWebhook.SendInvitation`
+    (`DeliveryKindInvitation`, `"invitation"`).
+  - **Events**, outside `EventNames()` as `identity.admin.machine.access` is:
+    `identity.user.invited` (`invitationId`, `email`, `invitedBy`,
+    `invitedByKind`, `expiresAt`, `accountCreated`),
+    `identity.user.invitation.accepted` (`invitationId`) and
+    `identity.user.invitation.revoked` (`invitationId`, `revokedBy`,
+    `revokedByKind`, `accountRemoved`), with the account's user and tenant and
+    the request's provenance. Each invitation records who created it —
+    `InvitedBy` is the `MachineAccess` principal or the administrator's user id
+    — and a machine call also raises the guard's own audit event. No event, log
+    line or error carries a token or its hash.
+  - **The store seam:** `InvitationStore` (six methods; its doc comment is the
+    implementor's contract, the atomic consume, the release that hands a
+    failed acceptance's consume back, and the DynamoDB layout included),
+    `MemoryInvitationStore` (one process only; it forgets an accepted or
+    revoked record a day after it ended), and the `Invitation` record. New too: `Service.InviteUser`, `AcceptInvitation`,
+    `RevokeInvitation`, `ListPendingInvitations`, `InvitationsEnabled` with
+    `Auth` delegates; `InviteUserInput`, `InvitationResult`,
+    `AcceptInvitationInput`, `InvitationAcceptance`, `InvitationRevocation`,
+    `InvitationAcceptRequest`; `InvitationAcceptHTTPError`,
+    `HTTPConfig.WriteInvitationAcceptance`, `HTTPErrInvalidInvitation`,
+    `HTTPErrInvitationInputRequired`, `CodeInvalidInvitation`;
+    `ErrInvalidInvitation`, `ErrInvitationNotFound`, `ErrInvitationNotPending`,
+    `ErrInvalidInvitationEmail`, `ErrInvitationMismatch`;
+    `InvitationAcceptRoute`, `AdminInvitationsPath`, `DefaultInvitationTTL`,
+    `InvitedByMachine`, `InvitedByUser`; `OpenAPIInfo.Invitations` (set by
+    `(*nethttp.Adapter).OpenAPIInfo()`); `(*nethttp.Adapter).AcceptInvitation`
+    and `InvitationAcceptHandler`.
+
+### Security
+- **Until it is accepted, an invited account is an ordinary passwordless
+  row**, so magic-link login reaches it as it reaches any account, for whoever
+  reads the invited mailbox — the same trust the invitation rests on, and the
+  way in for a deployment that accepts invitations by magic link.
+  **`/forgot-password` does not reach it**: while an invitation still reserves
+  the account (no password, no factor, the address unverified, an invitation
+  outstanding, expired or not) the route answers as for an unknown address and
+  sends nothing, and `/reset-password` refuses a token for it. A reset would
+  have set a password on an unverified address — refused by the login outside
+  lazy mode — on an account the invitation could then no longer activate,
+  locking the invitee out of both; an invitee who signed in by magic link has a
+  verified address and resets as anyone does. Revoking deletes the account only
+  if nobody has used it, which closes the remaining door on an account nobody
+  claimed; an account the invitee signed in to is kept, and removing it is an
+  explicit `DELETE <admin>/api/users/{id}`. An expired invitation stays listed
+  (as `expired`) until it is revoked, and its account with it: the TTL bounds
+  the token, not the account, so an offer meant to lapse is revoked. Accepting
+  marks the address verified, on the
+  strength of the token having reached the mailbox; a host that turns on
+  `RevealInvitationToken` and hands tokens over another channel takes that on
+  itself. Under `Require2FA` without `EnrolOnLogin` the acceptance answers
+  `2FA_SETUP_REQUIRED` with a token no route completes, as the login does: an
+  invite-only deployment that wants invitees to enrol at acceptance turns
+  `EnrolOnLogin` on, knowing it is trust on first use.
+
 ## [0.14.0] - 2026-11-21
 
 Closed registration for invite-only deployments, an enforced second factor at

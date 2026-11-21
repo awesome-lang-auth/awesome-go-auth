@@ -252,6 +252,10 @@ func TestUnmappedSentinelsAreDeliberate(t *testing.T) {
 		// any error mapping runs; reaching a mapper with it means the redirect
 		// was lost, and the 500 that follows is the right complaint.
 		ErrOAuthAccountConflict: "wire-contract §4 OAuth callback, a redirect rather than a body",
+		// The invitation admin routes (admin_invitations.go), which answer the
+		// admin envelope: 404 and 409 of their own.
+		ErrInvitationNotFound:   "admin invitations, 404",
+		ErrInvitationNotPending: "admin invitations, 409",
 	}
 	all := []error{
 		ErrInvalidCredentials, ErrUserExists, ErrInvalidToken, ErrSessionNotFound,
@@ -259,6 +263,7 @@ func TestUnmappedSentinelsAreDeliberate(t *testing.T) {
 		ErrInvalidCode, ErrTwoFactorRequired, ErrAlreadyExists, ErrTenantNotFound,
 		ErrRoleNotFound, ErrEmailNotConfigured, ErrSMSNotConfigured,
 		ErrOAuthAccountConflict, ErrInvalidInput,
+		ErrInvalidInvitation, ErrInvitationNotFound, ErrInvitationNotPending,
 	}
 	for _, err := range all {
 		mapped := HTTPErrorFor(err) != HTTPErrInternal

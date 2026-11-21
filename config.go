@@ -193,6 +193,45 @@ type Config struct {
 	// the reference's generic 500 with the change already committed — see
 	// Service.ConfirmEmailChange.
 	SendEmailChanged EmailChangedSender
+	// Invitations is the store of the invitation flow (invitation.go), and
+	// the switch for the whole of it: set, the adapters mount POST
+	// <prefix>/invitations/accept — under HTTPConfig.ClosedRegistration too,
+	// which is what the flow is for — and the admin router registers
+	// POST and GET <admin>/api/users/invitations and DELETE
+	// <admin>/api/users/invitations/{id}. Nil, the default, registers none of
+	// the four, and nothing changes. The reference has no counterpart: see
+	// the invitations-are-an-addition deviation. WithInvitationStore sets it.
+	Invitations InvitationStore
+	// InvitationTTL is how long an invitation's token is honoured. Zero means
+	// DefaultInvitationTTL, 72 hours, so a Config built by hand before this
+	// field existed is still valid; a negative value is refused.
+	// WithInvitationTTL sets it.
+	//
+	// It bounds the token, not the account. The pending account an expired
+	// invitation reserved stays — listed with its invitation as expired, and
+	// signed in to by a magic link to its address, with the invited role —
+	// until an administrator revokes the invitation, which removes the account
+	// if nobody has used it. An offer meant to lapse is revoked.
+	InvitationTTL time.Duration
+	// InvitationReinvite decides what inviting an address that already has an
+	// account does when that account is still pending — created by an
+	// invitation that has not been accepted. False, the default, refuses it
+	// like any other existing address (409); true makes the call idempotent:
+	// the same account is invited again as it is, a fresh token is delivered,
+	// and the tokens it replaces stop working. A re-invitation that names a
+	// role or a tenant other than the account's is refused
+	// (ErrInvitationMismatch) rather than answered as if it had been applied.
+	// An active account is refused either way. WithInvitationReinvite sets it.
+	InvitationReinvite bool
+	// SendInvitation delivers an invitation's token — the reference's
+	// mailer.sendInvitation (mailer.service.ts:210-227) as a seam, like the
+	// five senders above. InvitationMailer.Send renders the reference's
+	// template over a transport; DeliveryWebhook.SendInvitation posts the
+	// delivery. Nil means no delivery: Service.InviteUser still returns the
+	// token to a direct caller, and the admin route refuses to invite unless
+	// AdminOptions.RevealInvitationToken hands the token to its caller.
+	// WithInvitationSender sets it.
+	SendInvitation InvitationSender
 	// Templates is the reference's config.templateStore
 	// (auth-config.model.ts:400, read by mailer.service.ts:146): a TemplateStore whose
 	// templates override the built-ins for every ready-made mailer the service
@@ -337,6 +376,9 @@ func (c Config) validate() error {
 	}
 	if c.EmailVerificationTTL <= 0 || c.EmailChangeTTL <= 0 || c.TempTokenTTL <= 0 {
 		return errors.New("auth: email and temp token ttl must be > 0")
+	}
+	if c.InvitationTTL < 0 {
+		return errors.New("auth: invitation ttl must be > 0, or 0 for the default (72h)")
 	}
 	return nil
 }

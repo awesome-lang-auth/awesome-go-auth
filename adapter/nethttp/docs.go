@@ -23,8 +23,8 @@ import (
 // documented base path: the mount prefix, unless DocsOptions.BasePath moves the
 // description somewhere else — which is what that option is for, so this one
 // field is allowed to differ from the mount and says so. IDProvider, JWKSPath,
-// ResourceServer and ClosedRegistration are read off the mount itself and
-// cannot disagree with it.
+// ResourceServer, ClosedRegistration and Invitations are read off the mount
+// itself and cannot disagree with it.
 // Title, Description, Version and ServerURL are left at their defaults: they
 // name the host's API, not this library, so a caller that wants them fills them
 // in on the copy.
@@ -34,6 +34,7 @@ func (a *Adapter) OpenAPIInfo() auth.OpenAPIInfo {
 		ResourceServer:     a.cfg.ResourceServer,
 		ClosedRegistration: a.cfg.ClosedRegistration,
 		Docs:               a.cfg.Docs.Enabled,
+		Invitations:        a.auth.InvitationsEnabled(),
 	}
 	if idp := a.auth.IDP(); idp != nil {
 		info.IDProvider = true
