@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-21
+
+Staff invitations for invite-only realms (#106): an administrator, or a back
+office through `AdminOptions.MachineAccess`, invites an address; the invitee
+accepts once with a single-use, hashed-at-rest token, sets a password and, under
+`Require2FA`, enrols TOTP before any session opens.
+
+Opt-in: with no `InvitationStore` (`WithInvitationStore`) none of the routes is
+mounted and nothing changes. Stores that implement `InvitationStore` must read
+users with strong consistency (the acceptance reads the row back after an
+ambiguous password write). The `amr`/`auth_time`/`mfa_at` claims (#103) remain
+held back by their open security review.
+
 ### Added
 - **Invitations: how a closed deployment gets its accounts over HTTP**,
   behind `Config.Invitations` (`WithInvitationStore`), off by default. Under
