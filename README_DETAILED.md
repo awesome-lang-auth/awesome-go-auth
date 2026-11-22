@@ -2064,6 +2064,17 @@ detail — a transport failure must not describe itself to the caller) and leave
 stored credential in place, which is what the reference does: an undelivered token
 is unguessable and expires on its own.
 
+`PasswordResetSender` is the exception on both counts. `POST /auth/forgot-password`
+answers `200` whatever the sender returns (the deviation
+`forgot-password-succeeds-on-delivery-failure`), and the reset token is stored only
+once the sender has returned `nil`: storing replaces the token the account held, so
+a send that fails stores nothing and the link the person was mailed before keeps
+working. A sender therefore returns `nil` only for a message accepted for delivery;
+one that errors after the message did leave (a timeout on the answer) leaves that
+message's link unusable, the earlier one intact. With no sender configured the
+token is stored at once, for a caller of `Service.ForgotPassword` that delivers the
+returned token itself.
+
 ### Built-in senders
 
 ```go

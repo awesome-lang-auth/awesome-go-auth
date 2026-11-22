@@ -587,9 +587,23 @@ func (s *Service) sessionIDOf(tokens AuthTokens) string {
 }
 
 // ForgotPassword mints a password-reset token for the account that holds an
-// address, stores its hash and delivers it through Config.SendPasswordReset.
+// address, delivers it through Config.SendPasswordReset and, once the
+// delivery has succeeded, stores its hash — or at once when no sender is
+// configured, so that a caller delivering the returned token itself still can.
 // An address no account holds is silence: an empty token and no error, so
 // that the route answers it as it answers a known one.
+//
+// The send comes before the store, the reverse of the reference's order
+// (auth.router.ts:784 then :787-792), because storing replaces whatever token
+// the account held: with the store first, a request whose mail was then
+// refused or lost — a relay's cap, a gateway that is down — killed the link
+// the person had been mailed before, for a mail nobody received, and enough
+// such requests kept an account out of the reset altogether. Now a failed send
+// stores nothing, and the earlier link keeps working until it expires or a
+// delivered one replaces it. What the order costs is narrower: a sender that
+// reports a failure after the mail did go out (a timeout) leaves that mail's
+// link unusable, and so does a store write that fails after a good send, which
+// is reported as the store failure it is and logged.
 //
 // An account an invitation still reserves (reservedByInvitation) is answered
 // the same way, and nothing is stored or sent: the invitation is how it gets
@@ -619,14 +633,18 @@ func (s *Service) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (s
 		return "", err
 	}
 	expiresAt := s.now().Add(s.cfg.ResetTokenTTL)
-	if err := ps.UpdateResetToken(ctx, user.ID, user.TenantID, hashToken(resetToken), expiresAt); err != nil {
+	// Send first, then store; see the doc comment for why. A delivery failure
+	// is reported to the caller with nothing stored; Auth.ForgotPassword is
+	// where the HTTP surface decides not to let it change the answer.
+	if err := s.deliverPasswordReset(ctx, user, resetToken, expiresAt, in.LinkBase, in.Lang); err != nil {
 		return "", err
 	}
-	// Store first, then send, as on the passwordless routes and in the reference
-	// (auth.router.ts:784 then :787-792). A delivery failure is reported to the
-	// caller and leaves the token in place; Auth.ForgotPassword is where the HTTP
-	// surface decides not to let it change the answer.
-	if err := s.deliverPasswordReset(ctx, user, resetToken, expiresAt, in.LinkBase, in.Lang); err != nil {
+	if err := ps.UpdateResetToken(ctx, user.ID, user.TenantID, hashToken(resetToken), expiresAt); err != nil {
+		if s.cfg.SendPasswordReset != nil {
+			// The address stays out of the log, as on the delivery failure's
+			// line: the route's job is not to say who is registered.
+			s.logf("auth: a password reset was delivered but its token could not be stored, so the link it carries will not work: %v", err)
+		}
 		return "", err
 	}
 	return resetToken, nil

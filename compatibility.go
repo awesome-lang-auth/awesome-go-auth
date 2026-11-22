@@ -138,24 +138,42 @@ func CompatibilityNotes() APICompatibilityNotes {
 				Surface: "`POST <prefix>/forgot-password`",
 				Behaviour: `Always ` + "`200 {\"success\": true}`" + ` — when the mail was sent, when the ` +
 					"configured sender returns an error, and when no sender is configured at " +
-					"all. The reset token stays stored in every case. A *store* failure still " +
-					"answers `500`, which is the reference's behaviour and is kept.",
-				Reference: "The send sits inside the route's `try`, so a throwing mailer reaches " +
-					"`handleError` and answers `500`.",
-				Citations: []string{"auth.router.ts:787-798"},
+					"all. The reset token is stored only once the sender has accepted it (at " +
+					"once when none is configured), so a send that fails stores nothing and the " +
+					"account's earlier link, if it has one, keeps working. A *store* failure " +
+					"still answers `500`, which is the reference's behaviour and is kept.",
+				Reference: "Stores the new token, which replaces the account's earlier one, and " +
+					"then sends; the send sits inside the route's `try`, so a throwing mailer " +
+					"reaches `handleError` and answers `500` with the earlier link already dead.",
+				Citations: []string{"auth.router.ts:784", "auth.router.ts:787-798"},
 				Why: "That `500` fires only for an address that **exists**, so a broken mail " +
 					"gateway turns the one route whose purpose is to reveal nothing about who is " +
 					"registered into an account-enumeration oracle. The contract records the " +
 					"status as `[UNTESTED]`, and no client can depend on one that appears only " +
-					"when the operator's mailer is down.",
-				Notes: []DeviationNote{{
-					Label: "Observing the failure",
-					Text: "Only the HTTP surface swallows it. `Auth.ForgotPassword` absorbs " +
-						"`ErrDeliveryFailed` (and nothing else) and logs `auth: password reset " +
-						"delivery failed; the route still answered success: …`, without naming the " +
-						"address. `Service.ForgotPassword` still returns the error, so a direct " +
-						"library caller learns about it.",
-				}},
+					"when the operator's mailer is down. Sending before storing is the same " +
+					"route's other failure mode: with the store first, a request whose mail is " +
+					"refused — a relay's cap, a gateway that is down — kills the link the person " +
+					"was mailed before, for a mail nobody received, and enough such requests " +
+					"keep an account out of the reset altogether.",
+				Notes: []DeviationNote{
+					{
+						Label: "Observing the failure",
+						Text: "Only the HTTP surface swallows it. `Auth.ForgotPassword` absorbs " +
+							"`ErrDeliveryFailed` (and nothing else) and logs `auth: password reset " +
+							"delivery failed; the route still answered success: …`, without naming the " +
+							"address. `Service.ForgotPassword` still returns the error, so a direct " +
+							"library caller learns about it.",
+					},
+					{
+						Label: "What sending first costs",
+						Text: "A sender that reports a failure after the mail did leave — a timeout " +
+							"on its answer — leaves that mail's link unusable, while the earlier one " +
+							"keeps working; and a store write that fails after a good send answers the " +
+							"`500` above with a mailed link that will not work, which is logged " +
+							"(`auth: a password reset was delivered but its token could not be stored, " +
+							"…`).",
+					},
+				},
 			},
 			{
 				ID:      "temp-token-is-typed-not-an-access-token",

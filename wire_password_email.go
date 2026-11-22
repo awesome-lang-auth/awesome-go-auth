@@ -286,9 +286,10 @@ func DecodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 }
 
 // ForgotPassword delegates to Service.ForgotPassword and then throws away one
-// class of failure: a send that failed after the token was stored. The route
-// answers 200 {"success":true} for it, exactly as it does for an address that does
-// not exist.
+// class of failure: a send that failed, whose token the service therefore never
+// stored. The route answers 200 {"success":true} for it, exactly as it does for
+// an address that does not exist, and the account keeps whatever link it was
+// mailed before.
 //
 // This is a deliberate divergence, and the only one on this route. The
 // reference's send sits inside the route's try block, so a throwing mailer reaches
@@ -303,10 +304,11 @@ func DecodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 //
 // Store failures are NOT swallowed: those still 500, and that oracle *is*
 // reproduced (see ForgotPasswordHTTPError and the suite case that pins it). The
-// difference is that a store that cannot persist a reset token has minted no
-// credential and served no request correctly, while a stored-but-undelivered token
-// is harmless — unguessable, single-use, expiring — so silence costs the caller
-// nothing but a mail that never arrives.
+// difference is that a store that cannot persist a reset token has served no
+// request correctly — since the send now comes first, it may even have mailed a
+// link that will not work, which the service logs — while an undelivered token
+// is never stored at all, so silence costs the caller nothing but a mail that
+// never arrives, and the earlier link still works.
 //
 // Divergence from Service.ForgotPassword is the same arrangement as
 // Auth.ChangePassword's: the Auth methods are the HTTP surface, and a library

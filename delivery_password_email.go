@@ -21,6 +21,10 @@ import (
 // that is credential material, the sender on Config rather than behind a
 // UserStore assertion, no sender required by Config.validate, and store-first-
 // then-send so a failed send leaves an unguessable token that expires on its own.
+// /forgot-password is the exception to that last one: it sends first and stores
+// the token only once the send succeeded, because storing replaces the token the
+// account held, and a failed send must not kill the link mailed before it (see
+// Service.ForgotPassword).
 //
 // What differs from magic-link and SMS is what an *unconfigured* deployment sees,
 // and the difference is the reference's, not a simplification:
@@ -46,11 +50,15 @@ import (
 // have no anti-enumeration duty. It is deliberately *not* reproduced on
 // /forgot-password — see ErrDeliveryFailed and Auth.ForgotPassword.
 
-// ErrDeliveryFailed marks a send that failed after the credential was already
-// stored. It is joined to the transport's own error rather than replacing it, so
-// a caller can still read the cause, and it exists for exactly one reason:
-// /forgot-password has to tell a delivery failure apart from a store failure in
-// order to swallow the first and report the second (Auth.ForgotPassword).
+// ErrDeliveryFailed marks a send that failed: on the authenticated routes after
+// the credential was already stored, which leaves it there, and on
+// /forgot-password before it was, which leaves nothing stored and the account's
+// earlier token in force. Its text keeps the first wording so as not to break a
+// match a host already has on it. It is joined to the transport's own error
+// rather than replacing it, so a caller can still read the cause, and it exists
+// for exactly one reason: /forgot-password has to tell a delivery failure apart
+// from a store failure in order to swallow the first and report the second
+// (Auth.ForgotPassword).
 //
 // It maps to no catalog entry of its own. HTTPErrorFor does not know it, so it
 // falls through to the generic 500 — which is what the reference answers for a
@@ -131,6 +139,12 @@ type EmailChangeDelivery struct {
 //
 // An error does NOT fail POST <prefix>/forgot-password: that route answers 200
 // {"success":true} whatever happens. See Auth.ForgotPassword.
+//
+// The token is stored only once the sender returns nil, and storing it is what
+// replaces the token the account held. So nil must mean the message was
+// accepted for delivery, and an error that the message was not — or may not
+// have been: an error after the message did leave (a timeout on the answer)
+// leaves its link unusable, while the account keeps its earlier one.
 type PasswordResetSender func(ctx context.Context, delivery PasswordResetDelivery) error
 
 // EmailVerificationSender delivers an email-verification token. An error fails
@@ -217,7 +231,9 @@ func EmailChangeConfirmURL(base, token string) string {
 // -----------------------------------------------------------------------------
 
 // deliverPasswordReset, deliverEmailVerification and deliverEmailChange are the
-// three send steps, called after the token hash is stored.
+// three send steps: deliverEmailVerification and deliverEmailChange are called
+// after the token hash is stored, deliverPasswordReset before it (see
+// Service.ForgotPassword).
 //
 // A nil sender returns nil: on these routes an unconfigured deployment sends
 // nothing and still succeeds. A failing sender returns an error joining

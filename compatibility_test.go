@@ -103,7 +103,7 @@ var wantDeviationIDs = []string{
 // and named reference mechanisms rather than phrases, so they hold across a
 // rewording and fail on a reversal. Each must appear somewhere in the entry.
 var wantClaims = map[string][]string{
-	"forgot-password-succeeds-on-delivery-failure": {"200", "500", "enumeration"},
+	"forgot-password-succeeds-on-delivery-failure": {"200", "500", "enumeration", "stores nothing", "earlier link"},
 	"jwks-cors-wildcard-string-form": {
 		"Access-Control-Allow-Origin", "string | string[]", "corsOrigins === '*'",
 	},

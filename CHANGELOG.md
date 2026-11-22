@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`POST <prefix>/forgot-password`: a refused or failed delivery no longer
+  kills the link mailed before it.** The route stored the new token — which
+  replaces the account's earlier one — and then sent it, so a request whose
+  mail was then refused or lost (a relay's daily cap, a gateway that is down)
+  left the account with a token nobody had received and the earlier link dead;
+  a handful of such requests, well inside any per-address rate limit, kept an
+  account out of the reset until a mail got through. `Service.ForgotPassword`
+  now sends first and stores the token only once `Config.SendPasswordReset`
+  returned `nil` (at once when no sender is configured, as before, so a caller
+  delivering the returned token itself is unaffected). A failed send stores
+  nothing: the earlier link keeps working until it expires or a delivered one
+  replaces it, and the route still answers `200 {"success":true}` for every
+  address. This works with any `UserPasswordStore`, a replace-on-issue one
+  included — nothing changes in the store contract. What the order costs: a
+  sender that reports a failure after the message did leave (a timeout on its
+  answer) leaves that message's link unusable, and a store write that fails
+  after a good send answers the `500` a store failure always answered, with a
+  mailed link that will not work — logged as `auth: a password reset was
+  delivered but its token could not be stored, …`, without the address. The
+  two authenticated routes keep the reference's store-then-send order. The
+  `forgot-password-succeeds-on-delivery-failure` entry now says so.
+
 ## [0.15.0] - 2026-11-21
 
 Staff invitations for invite-only realms (#106): an administrator, or a back

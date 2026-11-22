@@ -515,23 +515,12 @@ func TestWithTemplateStoreRejectsNil(t *testing.T) {
 
 // Each sender reads the row it was called about while the call is still in
 // flight. A hash already there is the ordering; the reference stores first too
-// (auth.router.ts:784 then :787-792, :953 then :956-961, :1024 then :1027-1032).
+// (auth.router.ts:953 then :956-961, :1024 then :1027-1032).
+//
+// /forgot-password is not here: it sends first and stores only once the send
+// succeeded, so that a failed send cannot replace — and kill — the link the
+// account was mailed before. TestForgotPasswordSendsBeforeItStores pins that.
 func TestSectionTwoDeliveryStoresBeforeItSends(t *testing.T) {
-	t.Run("forgot password", func(t *testing.T) {
-		spy := &passwordEmailSpy{}
-		svc := newPasswordEmailSvc(t, spy)
-		user := seedUser(t, svc, "resetorder@example.com")
-		var seen string
-		spy.inspect = func() { seen = storedUser(t, svc, user.ID).ResetTokenHash }
-
-		if _, err := svc.ForgotPassword(context.Background(), ForgotPasswordInput{Email: user.Email, TenantID: "t1"}); err != nil {
-			t.Fatalf("forgot password: %v", err)
-		}
-		if seen == "" {
-			t.Error("the sender was called before the token was stored")
-		}
-	})
-
 	t.Run("send verification email", func(t *testing.T) {
 		spy := &passwordEmailSpy{}
 		svc := newPasswordEmailSvc(t, spy)
@@ -573,23 +562,11 @@ func TestSectionTwoDeliveryStoresBeforeItSends(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // The service reports a failed send, wrapping both ErrDeliveryFailed and the
-// transport's own error, and leaves the credential stored. All three behave the
-// same way here; the difference is what the HTTP surface then does with it.
+// transport's own error, and leaves the credential stored. Both authenticated
+// routes behave that way; the generic 500 is what the HTTP surface makes of it.
+// /forgot-password reports the failure the same way and stores nothing:
+// TestForgotPasswordFailedSendStoresNothing.
 func TestSectionTwoDeliveryFailureKeepsTheCredential(t *testing.T) {
-	t.Run("forgot password", func(t *testing.T) {
-		spy := &passwordEmailSpy{fail: errors.New("mail gateway unreachable")}
-		svc := newPasswordEmailSvc(t, spy)
-		user := seedUser(t, svc, "resetfail@example.com")
-
-		_, err := svc.ForgotPassword(context.Background(), ForgotPasswordInput{Email: user.Email, TenantID: "t1"})
-		if !errors.Is(err, ErrDeliveryFailed) || !errors.Is(err, spy.fail) {
-			t.Fatalf("err = %v, want it to wrap both ErrDeliveryFailed and the transport failure", err)
-		}
-		if storedUser(t, svc, user.ID).ResetTokenHash == "" {
-			t.Error("the stored token was rolled back; the reference leaves it in place")
-		}
-	})
-
 	t.Run("send verification email", func(t *testing.T) {
 		spy := &passwordEmailSpy{fail: errors.New("mail gateway unreachable")}
 		svc := newPasswordEmailSvc(t, spy)
@@ -723,14 +700,15 @@ func TestAuthForgotPasswordSwallowsADeliveryFailure(t *testing.T) {
 	if len(spy.resets) != 1 {
 		t.Fatalf("the sender was called %d times, want 1", len(spy.resets))
 	}
-	// The token is still spendable: swallowing the report does not discard the
-	// credential, so a later resend or a manual delivery still works.
+	// Nothing was stored: the token the failed send carried never reached a
+	// mailbox, and storing it would have replaced whatever link the account
+	// held (TestForgotPasswordFailedSendStoresNothing has one).
 	stored, err := a.Service().users.GetUserByID(context.Background(), spy.resets[0].UserID, "t1")
 	if err != nil {
 		t.Fatalf("read back the user: %v", err)
 	}
-	if stored.ResetTokenHash != hashToken(spy.resets[0].Token) {
-		t.Error("the stored hash does not match the token the sender was handed")
+	if stored.ResetTokenHash != "" {
+		t.Error("the token of a failed send was stored")
 	}
 
 	// Swallowed on the wire, but not in silence: the log is the only signal a
