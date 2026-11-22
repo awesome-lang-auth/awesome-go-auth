@@ -606,6 +606,23 @@ func WithSiteURLs(urls ...string) Option {
 	}
 }
 
+// WithEmailLangs sets Config.EmailLangs: the languages a request's emailLang
+// may select for a mail. A value matching one of them — without regard to
+// case, or by its primary subtag — reaches the sender as that entry, and
+// anything else as "", the sender's default.
+//
+//	auth.WithEmailLangs("it", "en") // the languages of the built-in templates
+//
+// Not calling it, or calling it with no arguments, passes emailLang through as
+// it was sent, which is the behaviour before the option existed. An entry that
+// is not a language tag makes New fail. See Config.EmailLangs.
+func WithEmailLangs(langs ...string) Option {
+	return func(b *authBuilder) error {
+		b.cfg.EmailLangs = append([]string(nil), langs...)
+		return nil
+	}
+}
+
 // WithIDP registers an OIDC Identity Provider on the Auth, which is what makes
 // every adapter mount its JWKS document at GET <prefix><IDPConfig.JWKSPath>,
 // public and ahead of any middleware.

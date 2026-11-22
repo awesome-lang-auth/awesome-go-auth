@@ -296,7 +296,95 @@ type Config struct {
 	// adapters hand the ready-made mailers no per-request base and their static
 	// BaseURL applies, as it did before this field existed. WithSiteURLs sets it.
 	SiteURLs []string
-	Logger   func(format string, args ...any)
+	// EmailLangs lists the languages a mail may be asked for through a
+	// request's emailLang: the languages this deployment's senders render.
+	// Set, the language every mail carries — the four link mails of
+	// forgot-password, send-verification-email, change-email/request and
+	// magic-link/send, the link-request mail, the invitation, and the
+	// email-changed notice a direct caller asks a language for — reaches the
+	// sender as one of these entries or not at all. The value is matched
+	// without regard to case, first whole and then by its primary language
+	// subtag ("IT", "it-IT" and "it_IT" are "it"), and anything else — an
+	// unlisted language, a value that is not a language tag, one longer than
+	// 35 characters — is replaced by "", which every sender reads as the
+	// deployment's default, as it reads a request that sent none. No request
+	// is refused for its language, so no answer depends on it.
+	//
+	// Empty — the zero value — keeps the behaviour this field predates: the
+	// value reaches the sender as it was sent, as the reference passes
+	// emailLang to its mailer (auth.router.ts:779, 788). The library's own
+	// mailers honour "it" and "en" and fall back to their Locale for anything
+	// else (resolveLang), so a deployment on them loses nothing with
+	// []string{"it", "en"}; one with a sender of its own lists what that
+	// sender renders. Each entry must be a language tag — subtags of letters
+	// and digits separated by '-' or '_', the first two to eight letters, at
+	// most 35 characters — or NewService refuses the configuration.
+	// WithEmailLangs sets it.
+	EmailLangs []string
+	Logger     func(format string, args ...any)
+}
+
+// maxLanguageTagLen is the longest language tag EmailLangs accepts or lets
+// through: the length RFC 5646 §4.4.1 asks every implementation to support.
+const maxLanguageTagLen = 35
+
+// isLanguageTag reports whether s has the shape of a language tag: one or more
+// subtags of ASCII letters and digits, separated by '-' or '_' (the POSIX
+// spelling of a locale is common in a request), the first of two to eight
+// letters and each of one to eight characters, at most maxLanguageTagLen in
+// all. It checks the shape and not the registry: "xx" is a tag here, and
+// whether a deployment has templates for it is what EmailLangs says.
+func isLanguageTag(s string) bool {
+	if s == "" || len(s) > maxLanguageTagLen {
+		return false
+	}
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i < len(s) && s[i] != '-' && s[i] != '_' {
+			c := s[i] | 0x20 // ASCII lower case; leaves digits as they are
+			letter := c >= 'a' && c <= 'z'
+			digit := s[i] >= '0' && s[i] <= '9'
+			if !letter && (!digit || start == 0) {
+				return false
+			}
+			continue
+		}
+		n := i - start
+		if n < 1 || n > 8 || (start == 0 && n < 2) {
+			return false
+		}
+		start = i + 1
+	}
+	return true
+}
+
+// emailLang is the language a delivery carries for the emailLang a request
+// sent: under EmailLangs, the matching entry as configured, or "" for the
+// sender's default; with none configured, the value as it was sent. See
+// EmailLangs.
+func (c Config) emailLang(requested string) string {
+	if len(c.EmailLangs) == 0 {
+		return requested
+	}
+	tag := strings.TrimSpace(requested)
+	if !isLanguageTag(tag) {
+		return ""
+	}
+	for _, lang := range c.EmailLangs {
+		if strings.EqualFold(tag, lang) {
+			return lang
+		}
+	}
+	primary := tag
+	if i := strings.IndexAny(tag, "-_"); i >= 0 {
+		primary = tag[:i]
+	}
+	for _, lang := range c.EmailLangs {
+		if strings.EqualFold(primary, lang) {
+			return lang
+		}
+	}
+	return ""
 }
 
 // DefaultConfig returns secure defaults for development and production bootstrap.
@@ -379,6 +467,11 @@ func (c Config) validate() error {
 	}
 	if c.InvitationTTL < 0 {
 		return errors.New("auth: invitation ttl must be > 0, or 0 for the default (72h)")
+	}
+	for _, lang := range c.EmailLangs {
+		if !isLanguageTag(lang) {
+			return fmt.Errorf("auth: email language %q is not a language tag (subtags of letters and digits separated by '-' or '_', at most %d characters)", lang, maxLanguageTagLen)
+		}
 	}
 	return nil
 }

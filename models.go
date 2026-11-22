@@ -217,7 +217,8 @@ type ForgotPasswordInput struct {
 	// empty, in which case a ready-made mailer uses its static BaseURL.
 	LinkBase string
 	// Lang is the request's emailLang body field, copied onto
-	// PasswordResetDelivery.Lang untouched (auth.router.ts:779, 788).
+	// PasswordResetDelivery.Lang untouched (auth.router.ts:779, 788), or
+	// through Config.EmailLangs when it lists the deployment's languages.
 	Lang string
 }
 

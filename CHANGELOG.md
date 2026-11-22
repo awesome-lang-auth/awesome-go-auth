@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Config.EmailLangs` (`WithEmailLangs("it", "en")`): the languages a
+  request's `emailLang` may select.** The body field reached every sender
+  exactly as posted — any string, as long as the request body allowed — so a
+  delivery webhook relayed whatever a stranger typed, and a receiver that bounds
+  its own input could refuse the delivery for it. With the option set, the
+  language of every mail that carries one — `forgot-password`,
+  `send-verification-email`, `change-email/request`, `magic-link/send`, the
+  `link-request` mail, the invitation, and the email-changed notice for a direct
+  caller — reaches the sender as one of the configured entries, matched without
+  regard to case and then by its primary language subtag (`IT`, `it-IT` and
+  `it_IT` are `it`), or as `""` for anything else: an unlisted language, a value
+  that is not a language tag, one longer than 35 characters. `""` is what every
+  sender reads as the deployment's default, so no request is refused for its
+  language and no answer depends on it. Unset — the default — `emailLang`
+  passes through as sent, as before, so a sender rendering more languages than
+  the built-in `it` and `en` keeps them. Entries that are not language tags
+  make `New` fail. The normalisation happens where each delivery is built, so
+  it holds for the four adapters and for a direct caller of the service alike.
+
 ### Fixed
 - **`POST <prefix>/forgot-password`: a refused or failed delivery no longer
   kills the link mailed before it.** The route stored the new token — which

@@ -173,9 +173,10 @@ type EmailChangedDelivery struct {
 	OldEmail string `json:"oldEmail"`
 	// NewEmail is the address the account has now (:1057, 1062).
 	NewEmail string `json:"newEmail"`
-	// Lang is ConfirmEmailChangeInput.Lang, copied through untouched. The
-	// routes leave it empty — the reference calls sendEmailChanged with no
-	// language (:1062, 1065) — so EmailChangedMailer renders in its Locale.
+	// Lang is ConfirmEmailChangeInput.Lang, copied through untouched, or
+	// through Config.EmailLangs when it lists languages. The routes leave it
+	// empty — the reference calls sendEmailChanged with no language (:1062,
+	// 1065) — so EmailChangedMailer renders in its Locale.
 	Lang string `json:"lang"`
 }
 
@@ -241,9 +242,10 @@ func EmailChangeConfirmURL(base, token string) string {
 // swallow one failure mode without swallowing store failures too.
 //
 // linkBase and lang are the request's, copied from the service input onto the
-// delivery untouched: the service neither resolves nor validates them, exactly
-// as the reference's routes hand `link` and `emailLang` to the sender as built
-// and as received (auth.router.ts:788, 957, 1028).
+// delivery: linkBase untouched, as the reference's routes hand `link` to the
+// sender as built, and lang through Config.EmailLangs, which with no languages
+// configured is untouched too — the reference hands `emailLang` over as received
+// (auth.router.ts:788, 957, 1028) — and with some is one of them or nothing.
 //
 // Every sender is called with senderContext(ctx), which is how Config.Templates
 // reaches a ready-made mailer.
@@ -258,7 +260,7 @@ func (s *Service) deliverPasswordReset(ctx context.Context, user User, token str
 		Token:     token,
 		ExpiresAt: expiresAt,
 		LinkBase:  linkBase,
-		Lang:      lang,
+		Lang:      s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver password reset: %w: %w", ErrDeliveryFailed, err)
@@ -277,7 +279,7 @@ func (s *Service) deliverEmailVerification(ctx context.Context, user User, token
 		Token:     token,
 		ExpiresAt: expiresAt,
 		LinkBase:  linkBase,
-		Lang:      lang,
+		Lang:      s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver email verification: %w: %w", ErrDeliveryFailed, err)
@@ -296,7 +298,7 @@ func (s *Service) deliverEmailChange(ctx context.Context, user User, newEmail, t
 		Token:     token,
 		ExpiresAt: expiresAt,
 		LinkBase:  linkBase,
-		Lang:      lang,
+		Lang:      s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver email change: %w: %w", ErrDeliveryFailed, err)
@@ -316,7 +318,7 @@ func (s *Service) deliverEmailChanged(ctx context.Context, user User, oldEmail, 
 		TenantID: user.TenantID,
 		OldEmail: oldEmail,
 		NewEmail: newEmail,
-		Lang:     lang,
+		Lang:     s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver email changed: %w: %w", ErrDeliveryFailed, err)

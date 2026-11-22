@@ -438,6 +438,7 @@ type Config struct {
     Settings              SettingsStore                 // optional; the admin-flipped runtime settings — see Runtime settings
     Events                *EventBus                     // optional; WithEventBus sets it — see Event Bus
     SiteURLs              []string                      // first = canonical link base; all = origin allowlist — see Delivery
+    EmailLangs            []string                      // optional; the languages emailLang may select, e.g. {"it", "en"} — see Per-request link base and language
     Logger                func(format string, args ...any)
 }
 ```
@@ -1031,6 +1032,7 @@ Pass to `auth.New(...)`:
 | `WithTemplateStore(TemplateStore)` | Run-time overrides of the built-in mail templates — see [`TemplateStore` interface](#templatestore-interface) |
 | `WithSettingsStore(SettingsStore)` | Global settings an administrator flips at run time; only `require2FA` is acted on — see [Runtime settings](#runtime-settings) |
 | `WithSiteURLs(urls ...string)` | Front-end base URLs: the first is the canonical link base, all are the origin allowlist — see [Per-request link base and language](#per-request-link-base-and-language) |
+| `WithEmailLangs(langs ...string)` | The languages a request's `emailLang` may select; anything else reaches the sender as `""`, its default. Unset, `emailLang` passes through as sent — see [Per-request link base and language](#per-request-link-base-and-language) |
 | `WithLogger(func)` | Logging callback |
 
 Pass to `NewService(...)` as `ServiceOption`:
@@ -2284,7 +2286,7 @@ has two extra members:
 
 ```go
 LinkBase string // e.g. "https://app.example.com/auth"; "" when no site URL is configured
-Lang     string // the request's emailLang body field, untouched; "" when omitted
+Lang     string // the request's emailLang body field — untouched, or bounded by Config.EmailLangs; "" when omitted
 ```
 
 `LinkBase` is resolved in three steps, each a transcription of the reference:
@@ -2324,8 +2326,32 @@ mailing exactly the links it did. A custom sender reads the two members directly
 
 The service inputs carry the same two members (`ForgotPasswordInput`,
 `EmailVerificationInput`, `ChangeEmailRequestInput`, `MagicLinkSendInput`) and
-copy them onto the delivery untouched; a caller driving the service directly
-supplies them or leaves them empty.
+copy them onto the delivery; a caller driving the service directly supplies them
+or leaves them empty.
+
+**Bounding the language: `Config.EmailLangs`.** By default `Lang` is the body's
+`emailLang` exactly as sent — any string a caller cares to post, up to the body
+limit, as the reference forwards it. `WithEmailLangs("it", "en")` names the
+languages the deployment's senders render, and then every mail that carries a
+request's language — the four above, the `/link-request` mail
+(`LinkTokenDelivery.EmailLang`), the invitation and the email-changed notice —
+reaches its sender as one of them or as `""`:
+
+| `emailLang` sent | `Lang` delivered under `WithEmailLangs("it", "en")` |
+|---|---|
+| `it`, `IT`, ` it ` | `it` |
+| `it-IT`, `it_IT` — a region of a listed language | `it` |
+| `de`, `xx`, `english` — an unlisted language | `""` |
+| `en<script>`, `it--IT`, 36 characters or more — not a language tag | `""` |
+| nothing | `""` |
+
+`""` is what every sender already reads as "the deployment's default" — the
+built-in mailers then use their `Locale` — so no request is refused for its
+language and the answer never depends on it. Entries must themselves be language
+tags (subtags of letters and digits separated by `-` or `_`, at most 35
+characters), or `New` fails. A deployment on the built-in mailers loses nothing
+with `{"it", "en"}`, the languages their templates have; one with its own sender
+lists what that sender renders.
 
 ---
 

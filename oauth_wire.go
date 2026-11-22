@@ -265,8 +265,10 @@ type LinkTokenDelivery struct {
 	Provider string
 	Token    string
 	URL      string
-	// EmailLang is the /link-request body's emailLang, passed through untouched so
-	// the host's mail transport can localise. Empty when the caller omitted it.
+	// EmailLang is the /link-request body's emailLang, passed through so the
+	// host's mail transport can localise: untouched, or under
+	// Config.EmailLangs one of those languages or nothing. Empty when the
+	// caller omitted it.
 	EmailLang string
 }
 
@@ -985,7 +987,7 @@ func (a *Auth) LinkRequest(ctx context.Context, in LinkRequestInput) (LinkReques
 			Provider:  provider,
 			Token:     token,
 			URL:       link,
-			EmailLang: in.EmailLang,
+			EmailLang: a.service.cfg.emailLang(in.EmailLang),
 		}); err != nil {
 			a.service.logf("auth: link token delivery failed for %q: %v", email, err)
 		}

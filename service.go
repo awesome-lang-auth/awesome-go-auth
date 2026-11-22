@@ -805,9 +805,10 @@ func (s *Service) SendMagicLink(ctx context.Context, in MagicLinkSendInput) (str
 	// unguessable and expires on its own. Sending first would risk the opposite,
 	// a delivered link the store never learned about.
 	//
-	// LinkBase and Lang are the request's, copied through untouched: the
-	// reference hands the strategy its siteUrlOverride and lang as built and as
-	// received (auth.router.ts:1104/1114 → magic-link.strategy.ts:25-29).
+	// LinkBase and Lang are the request's: LinkBase copied through untouched,
+	// as the reference hands the strategy its siteUrlOverride as built
+	// (auth.router.ts:1104/1114 → magic-link.strategy.ts:25-29), and Lang
+	// through Config.EmailLangs, untouched too when it lists no language.
 	if err := s.cfg.SendMagicLink(s.senderContext(ctx), MagicLinkDelivery{
 		UserID:    user.ID,
 		TenantID:  user.TenantID,
@@ -815,7 +816,7 @@ func (s *Service) SendMagicLink(ctx context.Context, in MagicLinkSendInput) (str
 		Token:     magicToken,
 		ExpiresAt: expiresAt,
 		LinkBase:  in.LinkBase,
-		Lang:      in.Lang,
+		Lang:      s.cfg.emailLang(in.Lang),
 	}); err != nil {
 		return "", fmt.Errorf("auth: deliver magic link: %w", err)
 	}

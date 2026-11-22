@@ -149,6 +149,22 @@ func runLinkResolutionCases(t *testing.T, mount Mounter, probe linkProbe) {
 		check(t, auth.DefaultHTTPConfig(), site, map[string]string{"Origin": app}, "it", app+"/auth", "it")
 	})
 
+	// Config.EmailLangs, off in the case above: on, the sender is handed one of
+	// the configured languages or nothing, whatever the body carried, and the
+	// route answers the same 200 (each probe asserts it).
+	t.Run("with EmailLangs only a configured language reaches the sender", func(t *testing.T) {
+		langs := append(append([]auth.Option(nil), site...), auth.WithEmailLangs("it", "en"))
+		for _, tc := range []struct{ sent, want string }{
+			{"EN", "en"},
+			{"it-IT", "it"},
+			{"de", ""},
+			{"en<script>", ""},
+			{strings.Repeat("a", 4096), ""},
+		} {
+			check(t, auth.DefaultHTTPConfig(), langs, map[string]string{"Origin": app}, tc.sent, app+"/auth", tc.want)
+		}
+	})
+
 	// With no site URL configured the delivery carries no base at all, which is
 	// what leaves a ready-made mailer on the static BaseURL it was built with —
 	// the arrangement every deployment had before Config.SiteURLs existed.
