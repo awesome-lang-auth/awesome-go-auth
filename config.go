@@ -162,7 +162,46 @@ type Config struct {
 	// answers the plain 201 and the account logs in through the login's own
 	// gates.
 	IssueSessionOnRegister bool
-	Require2FA             bool
+	// RevokeSessionsOnPasswordReset decides whether a successful POST
+	// <prefix>/reset-password — and Service.ResetPassword — also ends every
+	// session the account holds: when true, once the new password is stored,
+	// each session the SessionStore lists for the account
+	// (SessionAdminStore.ListSessionsForUser, under the account's tenant)
+	// that is neither revoked nor expired is revoked
+	// (SessionAdminStore.RevokeSessionByID), before the token is cleared.
+	//
+	// What that ends, and when:
+	//
+	//   - A refresh token of those sessions is refused at once: POST
+	//     <prefix>/refresh answers 401 SESSION_REVOKED, on which the family's
+	//     browser clients log out.
+	//   - An access token already issued stays valid until it expires —
+	//     AccessTokenTTL, 15 minutes by default — under SessionCheckOn
+	//     "refresh" or "none", because those modes do not read the session on
+	//     a protected request. Under "allcalls" every protected request does,
+	//     and answers 401 SESSION_REVOKED at once.
+	//   - The reset itself opens no session, either way; the person signs in
+	//     with the new password.
+	//
+	// A revocation the store refuses fails the reset: the generic 500, with a
+	// line through Config.Logger naming the user and the store's error. The
+	// password has been changed by then and the sessions the store did revoke
+	// stay revoked, but answering success would tell the person that a session
+	// still usable is gone. The token is left as it is: a store that keeps it
+	// until ClearResetToken, as MemoryUserStore does, lets the same link run the
+	// reset and the revocation again; a store that consumes it at lookup needs
+	// a new link, which does the same.
+	//
+	// The option needs a session store that implements SessionAdminStore, and
+	// NewService refuses it on one that does not, rather than accept a promise
+	// it could not keep. MemorySessionStore implements it.
+	//
+	// False — the zero value, and what DefaultConfig leaves — is the
+	// reference's answer: a reset leaves every session alive (registered as
+	// reset-password-can-revoke-sessions). WithRevokeSessionsOnPasswordReset
+	// sets it.
+	RevokeSessionsOnPasswordReset bool
+	Require2FA                    bool
 	// EnrolOnLogin lets an account that must present a second factor and has
 	// none enrol one at login, and opens its session when it does: the
 	// tempToken of the 403 2FA_SETUP_REQUIRED answer POST <prefix>/login gives

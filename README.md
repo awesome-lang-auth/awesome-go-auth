@@ -71,7 +71,7 @@ func main() {
 - Authenticated user retrieval (`Me`).
 - Account management (`UpdateProfile`, `DeleteAccount`) in addition to password/email lifecycle.
 - CSRF double-submit middleware (cookie + header) for browser flows.
-- Password reset (`ForgotPassword`, `ResetPassword`, `ChangePassword`).
+- Password reset (`ForgotPassword`, `ResetPassword`, `ChangePassword`); a reset can also end the account's sessions, opt-in with `WithRevokeSessionsOnPasswordReset(true)` ([RevokeSessionsOnPasswordReset](README_DETAILED.md#revokesessionsonpasswordreset)).
 - Passwordless magic link (`SendMagicLink`, `VerifyMagicLink`).
 - SMS OTP login (`SendSMSCode`, `VerifySMSCode`).
 - Mail and SMS delivery for both of the above via `Config.SendMagicLink` / `Config.SendSMSCode`, with built-in senders over an HTTP mailer or SMS gateway ([Delivery](README_DETAILED.md#delivery)).
@@ -469,6 +469,37 @@ revision the whole contract was extracted from.
   applied at registration. `WEAK_PASSWORD` has no reference counterpart, so a
   client that does not know the code still sees a `400` it must show the user
   either way.
+
+### `reset-password` can also end the account's sessions, when the instance opts in — `Config.RevokeSessionsOnPasswordReset`, off by default
+
+`reset-password-can-revoke-sessions`
+
+- **Surface**: `POST <prefix>/reset-password`.
+- **This port**: By default answers what the reference answers: the new password
+  is stored, the token cleared, `200 {"success": true}`, and every session the
+  account holds stays alive. `Config.RevokeSessionsOnPasswordReset`
+  (`WithRevokeSessionsOnPasswordReset(true)`) is an addition the instance
+  administrator may turn on: once the new password is stored, every session of
+  the account that is neither revoked nor expired is revoked through
+  `SessionAdminStore`, so its refresh token answers `401 SESSION_REVOKED` from
+  then on. An access token already issued stays valid until it expires
+  (`AccessTokenTTL`) unless `SessionCheckOn` is `allcalls`, under which it is
+  refused at once with the same code. The answer is the same `200`, and the
+  reset opens no session. A revocation the session store refuses fails the reset
+  with the generic `500`, the password already changed, and `NewService` refuses
+  the option on a session store without `SessionAdminStore`.
+- **The reference**: Sets the password and clears the token and nothing else: no
+  session is revoked and no cookie cleared, so every refresh token issued before
+  the reset keeps working (`auth.router.ts:801-825`).
+- **Why**: A reset is how a person recovers from a password that may have
+  leaked, and a leak comes with the sessions it opened: leaving them alive means
+  the reset ends nothing an attacker already holds. The default stays the
+  reference's answer, so an unconfigured instance answers what the reference
+  answers. It is registered because turning it on makes the family's fast-logout
+  code reach the refresh tokens of every device the account was signed in on,
+  which a client written against the reference never sees after a reset.
+- **Matching the reference exactly**: Leave the option off, the default: a reset
+  revokes no session.
 
 ### `2fa/setup` omits the QR code
 

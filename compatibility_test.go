@@ -87,6 +87,7 @@ var wantDeviationIDs = []string{
 	"refresh-secret-falls-back-to-secret",
 	"register-issues-a-session",
 	"register-route-is-always-mounted",
+	"reset-password-can-revoke-sessions",
 	"resource-server-gates-all-credential-routes",
 	"session-rotated-reports-one-session-id",
 	"sse-slow-consumer-is-disconnected",
@@ -148,6 +149,14 @@ var wantClaims = map[string][]string{
 	},
 	"link-request-exempts-bearer-from-csrf": {"Bearer", "CSRF_INVALID", "CORS-safelisted"},
 	"password-policy-on-reset-and-change":   {"WEAK_PASSWORD", "400", "minLength: 8"},
+	// The knob and its default, what a revoked session answers, the access
+	// token's posture in both session-check modes, the failure answer, the
+	// store it needs — and the reference revoking nothing, which is the
+	// difference itself.
+	"reset-password-can-revoke-sessions": {
+		"Config.RevokeSessionsOnPasswordReset", "off by default", "401 SESSION_REVOKED",
+		"AccessTokenTTL", "allcalls", "`500`", "SessionAdminStore", "no session is revoked",
+	},
 	"totp-setup-omits-qrcode":               {"otpauthUrl", "qrCode"},
 	"totp-issuer-defaults-to-config-issuer": {"otpauthUrl", "awesome-node-auth", "Config.Issuer", "TwoFactorAppName"},
 	"totp-accepts-one-step-of-skew":         {"TOTPSkew", "epochTolerance", "totp.strategy.ts"},

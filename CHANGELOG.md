@@ -26,6 +26,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the built-in `it` and `en` keeps them. Entries that are not language tags
   make `New` fail. The normalisation happens where each delivery is built, so
   it holds for the four adapters and for a direct caller of the service alike.
+- **A password reset can end the account's sessions, behind
+  `Config.RevokeSessionsOnPasswordReset` (`WithRevokeSessionsOnPasswordReset(true)`),
+  off by default.** Off, `POST <prefix>/reset-password` stays the reference's
+  answer: the password changes and every session opened before stays alive,
+  so a reset after a leak ended nothing the leak had opened. On, once the new
+  password is stored and before the token is cleared, `Service.ResetPassword`
+  revokes every session the account holds under its tenant that is neither
+  revoked nor expired, through `SessionAdminStore` (`ListSessionsForUser`,
+  `RevokeSessionByID`); one the store no longer has is skipped. Refresh tokens
+  of those sessions then answer `401 SESSION_REVOKED`, and the OIDC grants that
+  end with their session end with them. Access tokens already issued stay valid
+  until they expire (`AccessTokenTTL`, 15 minutes by default) under
+  `SessionCheckOn` `refresh` or `none`; under `allcalls` they are refused at
+  once. The answer is the same `200` and the reset still opens no session.
+  **A revocation the store refuses fails the reset** with the generic `500` and
+  a `Config.Logger` line naming the user: the password has changed by then, but
+  a `200` would tell the person that a session still usable was gone. The others
+  are revoked all the same, and the token is left as it is, so on a store that
+  keeps it until it is cleared (`MemoryUserStore`) the same link completes the
+  revocation; a store that consumes it at lookup needs a new link. The store's
+  error is formatted, not wrapped, so no session store can turn the answer into
+  `400 Invalid reset token` for a reset that has changed the password.
+  `NewService` (and so `New`) refuses the option on a session store without
+  `SessionAdminStore`. Registered as the deviation
+  `reset-password-can-revoke-sessions`.
 
 ### Security
 - **The public credential routes refuse a body over 16 KiB, before anything

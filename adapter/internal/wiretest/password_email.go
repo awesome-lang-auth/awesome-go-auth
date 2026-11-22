@@ -261,11 +261,46 @@ func testResetPassword(t *testing.T, mount Mounter) {
 
 		// Nothing is revoked: the session that existed before the reset still
 		// works, as in the reference, which clears no cookie and kills no session.
+		// That is the default; Config.RevokeSessionsOnPasswordReset is the case
+		// below.
 		me := env.Do(bearer(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+"/me", nil), tokens))
 		AssertStatus(t, me, http.StatusOK)
 
 		replay := env.Do(env.Request(http.MethodPost, "/reset-password", map[string]string{"token": token, "password": "thirdpassword1"}))
 		AssertError(t, replay, http.StatusBadRequest, "Invalid reset token", "")
+	})
+
+	// Config.RevokeSessionsOnPasswordReset, off in the case above, which pins
+	// the reference's answer. On, the session that existed before the reset is
+	// revoked: its refresh token gets the family's fast-logout code, and under
+	// allcalls so does its access token, at once. The reset itself still opens
+	// no session and writes no session cookie.
+	t.Run("with RevokeSessionsOnPasswordReset the sessions opened before it end", func(t *testing.T) {
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig(),
+			auth.WithRevokeSessionsOnPasswordReset(true),
+			auth.WithSessionCheckOn(auth.SessionCheckOnAllCalls))
+		_, tokens := env.Seed("resetrevoke@example.com")
+
+		assertSuccessBody(t, env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{
+			"email": "resetrevoke@example.com", "tenantId": "t1",
+		})))
+		if len(env.Delivered.PasswordResets) != 1 {
+			t.Fatalf("delivered %d resets, want 1", len(env.Delivered.PasswordResets))
+		}
+		rec := env.Do(env.Request(http.MethodPost, "/reset-password", map[string]string{
+			"token": env.Delivered.PasswordResets[0].Token, "password": "newpassword1",
+		}))
+		assertSuccessBody(t, rec)
+		AssertNoCookie(t, rec, hostAccess)
+		AssertNoCookie(t, rec, hostRefresh)
+
+		refresh := env.Do(env.Request(http.MethodPost, "/refresh", map[string]string{"refreshToken": tokens.RefreshToken}))
+		AssertError(t, refresh, http.StatusUnauthorized, "Session has been revoked", auth.CodeSessionRevoked)
+		me := env.Do(bearer(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+"/me", nil), tokens))
+		AssertError(t, me, http.StatusUnauthorized, "Session has been revoked", auth.CodeSessionRevoked)
+
+		fresh := env.Do(env.Request(http.MethodPost, "/login", map[string]string{"email": "resetrevoke@example.com", "password": "newpassword1", "tenantId": "t1"}))
+		AssertStatus(t, fresh, http.StatusOK)
 	})
 
 	// Port-only: the reference applies no password policy on this route at all, so

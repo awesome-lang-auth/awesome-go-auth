@@ -416,6 +416,7 @@ type Config struct {
     EmailVerificationMode string                        // none|lazy|strict (default: none)
     EmailChangeTTL        time.Duration                 // default: 1h
     IssueSessionOnRegister bool                         // default: false, the reference's answer — see IssueSessionOnRegister
+    RevokeSessionsOnPasswordReset bool                  // default: false, the reference's answer — see RevokeSessionsOnPasswordReset
     TempTokenTTL          time.Duration                 // default: 5m; the step-up token a 2FA challenge hands the client
     ClockSkew             time.Duration                 // default: 30s
     MinPasswordLen        int                           // default: 8
@@ -562,6 +563,49 @@ mid-send can therefore neither leave a mailed link unstored nor turn a store
 that honours its context into a `500` that only a known address gets. A sender
 needs a timeout of its own for the same reason (`DeliveryWebhook` has one):
 nothing cancels it when the client leaves.
+
+### `RevokeSessionsOnPasswordReset`
+
+Whether a successful `POST <prefix>/reset-password` (and `Service.ResetPassword`)
+also ends every session the account holds. A person who resets because the
+password may have leaked usually wants exactly that; the reference revokes
+nothing, and that stays the default.
+
+| `RevokeSessionsOnPasswordReset` | sessions opened before the reset |
+|---|---|
+| `false` — the default, and the reference's answer | stay alive |
+| `true` | revoked, once the new password is stored and before the token is cleared |
+
+With it on, the service lists the account's sessions under its tenant
+(`SessionAdminStore.ListSessionsForUser`) and revokes each one that is neither
+revoked nor expired (`SessionAdminStore.RevokeSessionByID`). What that ends:
+
+- **Refresh tokens, at once.** `POST <prefix>/refresh` answers
+  `401 SESSION_REVOKED`, the code on which the family's browser clients log out.
+- **Access tokens already issued, at their expiry** — `AccessTokenTTL`,
+  15 minutes by default — under `SessionCheckOn` `refresh` or `none`, which do
+  not read the session on a protected request. Under `allcalls` every protected
+  request does, and answers `401 SESSION_REVOKED` at once.
+- **The OIDC grants that end with their session** (see
+  [The OIDC endpoints](#the-oidc-endpoints)).
+
+The reset itself opens no session either way; the person signs in with the new
+password. Another account's sessions are never touched.
+
+**A revocation that fails fails the reset**, with the generic `500` and a line
+through `Config.Logger` naming the user and the store's error. By then the
+password has changed and the sessions the store did revoke stay revoked, but a
+`200` would tell the person that a session still usable is gone. The token is
+left as it is: with a store that keeps it until it is cleared, as
+`MemoryUserStore` does, the same link runs the reset and the revocation again;
+with one that consumes it when it is looked up, a new link does.
+
+The session store must implement `SessionAdminStore` (`MemorySessionStore`
+does): `NewService`, and so `New`, refuses the option on one that does not,
+rather than accept a promise it could not keep. A store whose listing is
+eventually consistent may miss a session opened in the moment before the reset;
+none can be opened with the old password after it. `WithRevokeSessionsOnPasswordReset(true)`
+turns it on. Registered as the deviation `reset-password-can-revoke-sessions`.
 
 ### `TwoFactorAppName` and the TOTP parameters
 
@@ -1152,6 +1196,7 @@ Pass to `auth.New(...)`:
 | `WithTenantProvider(TenantStore)` | Enable multi-tenancy |
 | `WithBcryptCost(int)` | Password hashing cost, `bcrypt.MinCost`..`bcrypt.MaxCost` |
 | `WithRequire2FA(bool)` | Require 2FA for all users |
+| `WithRevokeSessionsOnPasswordReset(bool)` | A successful `POST /reset-password` also revokes the account's sessions; off by default, the reference's answer — see [RevokeSessionsOnPasswordReset](#revokesessionsonpasswordreset) |
 | `WithTwoFactorAppName(string)` | Issuer of the TOTP provisioning URI, the reference's `twoFactor.appName`; empty keeps `Issuer` — see [TwoFactorAppName](#twofactorappname-and-the-totp-parameters) |
 | `WithTokenClaimsBuilder(TokenClaimsBuilder)` | Custom JWT claims — see [Custom Claims](#custom-claims) |
 | `WithPasswordVerifier(PasswordVerifier)` | Accept the previous identity provider's password on first login and adopt it locally; a port extension, off unless set — see [Password verifier](#password-verifier-migration-seam) |
@@ -3000,9 +3045,11 @@ unconditionally; a host that wants none for any client sets
 `DisableRefreshTokenGrant`, and a per-client flag is a possible follow-up.
 The requested scope is stored as sent, not checked against
 `scopes_supported`. **A password change or reset does not revoke grants**,
-exactly as it revokes no session, which is also the reference's behaviour
-for its sessions; a grant ends with its session, so a host that revokes a
-user's sessions after a reset ends that user's grants too.
+exactly as it revokes no session by default, which is also the reference's
+behaviour for its sessions; a grant ends with its session, so a host that
+revokes a user's sessions after a reset ends that user's grants too — which
+is what [`Config.RevokeSessionsOnPasswordReset`](#revokesessionsonpasswordreset)
+does for a reset.
 
 
 **Resource-server mode gates two of them.** `HTTPConfig.ResourceServer`
