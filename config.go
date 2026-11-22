@@ -75,14 +75,40 @@ type Config struct {
 	// bcrypt.MinCost. A Config that was never told a cost must not silently get
 	// the weakest one. Any other value must lie in
 	// [bcrypt.MinCost, bcrypt.MaxCost]; validate rejects the rest.
-	BcryptCost            int
-	ResetTokenTTL         time.Duration
-	MagicLinkTTL          time.Duration
-	SMSCodeTTL            time.Duration
-	EmailVerificationTTL  time.Duration
-	EmailVerificationMode string
-	EmailChangeTTL        time.Duration
-	TempTokenTTL          time.Duration
+	BcryptCost    int
+	ResetTokenTTL time.Duration
+	// ForgotPasswordMinResponseTime is the least time POST
+	// <prefix>/forgot-password takes to answer, measured from when the request
+	// reaches Auth.ForgotPassword: whichever branch it took — a known address
+	// whose mail was sent, an unknown one, one an invitation reserves, a
+	// delivery that failed, a store that failed — the answer is held until the
+	// floor has passed. It exists because the branches cost differently: a
+	// known address waits for the delivery, a synchronous webhook or mail
+	// relay that can take seconds, and the others answer right after a lookup,
+	// so the time alone says which addresses have accounts though the status
+	// and the body do not. Sending asynchronously is no fix for a deployment
+	// whose runtime freezes once the answer is written, as AWS Lambda's does.
+	//
+	// It hides the difference only where the floor is above the slow branch's
+	// worst case: a branch that already took longer is not held further, so
+	// set it at or above the sender's own timeout (a DeliveryWebhook's Timeout,
+	// for one) plus the lookup. The hold never runs past the request context:
+	// it ends early, forgotPasswordAnswerHeadroom (100 ms) before the context's
+	// deadline — on Lambda the function's, where an answer written after it is
+	// a timeout — and at once when the context is cancelled. A body refused
+	// before the service is reached (400 INVALID_BODY, 413 BODY_TOO_LARGE) is
+	// not held: it depends on no address. Service.ForgotPassword, the library
+	// call, is never held.
+	//
+	// Zero — the default — is off, the behaviour this field predates. A
+	// negative value is refused. WithForgotPasswordMinResponseTime sets it.
+	ForgotPasswordMinResponseTime time.Duration
+	MagicLinkTTL                  time.Duration
+	SMSCodeTTL                    time.Duration
+	EmailVerificationTTL          time.Duration
+	EmailVerificationMode         string
+	EmailChangeTTL                time.Duration
+	TempTokenTTL                  time.Duration
 	// IssueSessionOnRegister decides whether POST <prefix>/register — and
 	// Service.Register — also logs the new account in: when true, a successful
 	// registration opens a session exactly as a successful POST <prefix>/login
@@ -467,6 +493,9 @@ func (c Config) validate() error {
 	}
 	if c.InvitationTTL < 0 {
 		return errors.New("auth: invitation ttl must be > 0, or 0 for the default (72h)")
+	}
+	if c.ForgotPasswordMinResponseTime < 0 {
+		return errors.New("auth: forgot-password minimum response time must be >= 0, and 0 is off")
 	}
 	for _, lang := range c.EmailLangs {
 		if !isLanguageTag(lang) {

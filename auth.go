@@ -606,6 +606,24 @@ func WithSiteURLs(urls ...string) Option {
 	}
 }
 
+// WithForgotPasswordMinResponseTime sets Config.ForgotPasswordMinResponseTime:
+// the least time POST <prefix>/forgot-password takes to answer, whichever
+// branch the request took, so that a known address — which waits for its
+// mail to be sent — is not told apart from an unknown one by the time alone.
+//
+//	auth.WithForgotPasswordMinResponseTime(5 * time.Second) // at or above the sender's timeout
+//
+// Zero, or not calling it, is off, as before the option existed; a negative
+// value makes New fail. The hold ends shortly before the request context's
+// deadline and at once when it is cancelled. See
+// Config.ForgotPasswordMinResponseTime.
+func WithForgotPasswordMinResponseTime(d time.Duration) Option {
+	return func(b *authBuilder) error {
+		b.cfg.ForgotPasswordMinResponseTime = d
+		return nil
+	}
+}
+
 // WithEmailLangs sets Config.EmailLangs: the languages a request's emailLang
 // may select for a mail. A value matching one of them — without regard to
 // case, or by its primary subtag — reaches the sender as that entry, and

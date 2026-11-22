@@ -19,6 +19,10 @@ type Service struct {
 	rbac     RolesPermissionsStore
 	tenants  TenantStore
 	now      func() time.Time
+	// sleep waits d or until ctx is done: sleepContext, held here beside now so
+	// that a test can record the wait a minimum response time asks for instead
+	// of sleeping it. See Auth.ForgotPassword.
+	sleep func(ctx context.Context, d time.Duration)
 }
 
 type ServiceOption func(*Service)
@@ -48,6 +52,7 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 		users:    users,
 		sessions: sessions,
 		now:      time.Now,
+		sleep:    sleepContext,
 	}
 	for _, opt := range opts {
 		if opt != nil {

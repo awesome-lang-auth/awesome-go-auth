@@ -409,6 +409,7 @@ type Config struct {
     RefreshTokenTTL       time.Duration                 // default: 30d
     SessionCheckOn        string                        // allcalls|refresh|none (default: refresh)
     ResetTokenTTL         time.Duration                 // default: 1h
+    ForgotPasswordMinResponseTime time.Duration         // default: 0, off; the least time /forgot-password takes to answer — see ForgotPasswordMinResponseTime
     MagicLinkTTL          time.Duration                 // default: 15m
     SMSCodeTTL            time.Duration                 // default: 10m
     EmailVerificationTTL  time.Duration                 // default: 24h
@@ -483,6 +484,46 @@ log straight in gets the plain `201` and no session — an unverified address un
 `EmailVerificationMode` `strict` (the service logs this once at startup when both
 are configured), or any account under `Require2FA`. A refused registration never
 issues anything. `WithIssueSessionOnRegister(true)` turns it on.
+
+### `ForgotPasswordMinResponseTime`
+
+`POST /auth/forgot-password` answers `200 {"success": true}` for every address,
+but not in the same time: a known address waits for its reset mail to be handed
+to the sender — a synchronous webhook or mail relay, often a second or more —
+while an unknown address, or one an invitation still reserves, is answered right
+after a lookup. The status and the body say nothing; the clock says which
+addresses have accounts. Sending asynchronously is not a fix for a deployment
+whose runtime freezes as soon as the answer is written, as AWS Lambda's does.
+
+`WithForgotPasswordMinResponseTime(d)` holds the answer until `d` has passed since
+the request reached `Auth.ForgotPassword`, on every branch alike:
+
+| Branch | Work before the answer | Held until |
+|---|---|---|
+| known address, mail sent | lookup, send, store | `d` |
+| unknown address | lookup | `d` |
+| an invitation reserves the address | lookup, invitation check | `d` |
+| known address, the send failed (still `200`) | lookup, failed send | `d` |
+| known address, the store failed after the send (`500`) | lookup, send, failed store | `d` |
+
+- **Set it above the slow branch's worst case.** A branch that already took
+  longer than `d` is not held further, so the floor hides the difference only
+  when it covers the sender's own timeout (a `DeliveryWebhook`'s `Timeout`, 5
+  seconds unless set) plus the lookup. A floor between the typical and the worst
+  delivery time hides the typical case and not the outliers.
+- **It never runs past the request.** The hold ends 100 ms before the request
+  context's deadline — on Lambda the function's own, where an answer written
+  after it is a timeout — and at once when the context is cancelled, a client
+  that went away included.
+- **What it does not hold:** a body refused before the service is reached
+  (`400 INVALID_BODY`, `413 BODY_TOO_LARGE`), which depends on no address, and
+  `Service.ForgotPassword`, the library call, which is not the HTTP surface.
+- **What it costs:** every request on the route lasts at least `d`, so a
+  deployment that counts concurrent executions or connection time pays for the
+  floor on unknown addresses too.
+
+Zero — the default — is off, as before the option existed; a negative value
+makes `New` fail.
 
 ### `TwoFactorAppName` and the TOTP parameters
 
@@ -1032,6 +1073,7 @@ Pass to `auth.New(...)`:
 | `WithTemplateStore(TemplateStore)` | Run-time overrides of the built-in mail templates — see [`TemplateStore` interface](#templatestore-interface) |
 | `WithSettingsStore(SettingsStore)` | Global settings an administrator flips at run time; only `require2FA` is acted on — see [Runtime settings](#runtime-settings) |
 | `WithSiteURLs(urls ...string)` | Front-end base URLs: the first is the canonical link base, all are the origin allowlist — see [Per-request link base and language](#per-request-link-base-and-language) |
+| `WithForgotPasswordMinResponseTime(time.Duration)` | The least time `POST /forgot-password` takes to answer, on every branch alike; off by default — see [ForgotPasswordMinResponseTime](#forgotpasswordminresponsetime) |
 | `WithEmailLangs(langs ...string)` | The languages a request's `emailLang` may select; anything else reaches the sender as `""`, its default. Unset, `emailLang` passes through as sent — see [Per-request link base and language](#per-request-link-base-and-language) |
 | `WithLogger(func)` | Logging callback |
 

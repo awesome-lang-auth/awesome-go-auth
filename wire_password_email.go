@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 )
 
 // This file holds the wire conventions for the password-management and
@@ -313,7 +314,15 @@ func DecodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 // Divergence from Service.ForgotPassword is the same arrangement as
 // Auth.ChangePassword's: the Auth methods are the HTTP surface, and a library
 // consumer calling the service directly still learns that delivery failed.
+//
+// The HTTP surface is also where Config.ForgotPasswordMinResponseTime holds
+// the answer: every return below, the store failure's included, waits until
+// the floor has passed since this call began (holdForgotPasswordAnswer), so
+// the time a known address's delivery takes no longer sets it apart.
 func (a *Auth) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (string, error) {
+	if floor := a.service.cfg.ForgotPasswordMinResponseTime; floor > 0 {
+		defer a.service.holdForgotPasswordAnswer(ctx, a.service.now().Add(floor))
+	}
 	token, err := a.service.ForgotPassword(ctx, in)
 	if errors.Is(err, ErrDeliveryFailed) {
 		// Logged, because the wire deliberately cannot report it: a deployment
@@ -329,6 +338,39 @@ func (a *Auth) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (stri
 		return "", nil
 	}
 	return token, err
+}
+
+// forgotPasswordAnswerHeadroom is how long before the request context's
+// deadline a held /forgot-password answer is let go, so that there is still
+// time to write it. On AWS Lambda the context's deadline is the function's,
+// and an answer written after it is a timeout, not a slow answer.
+const forgotPasswordAnswerHeadroom = 100 * time.Millisecond
+
+// holdForgotPasswordAnswer waits until until — the start of the request plus
+// Config.ForgotPasswordMinResponseTime — and no later than
+// forgotPasswordAnswerHeadroom before ctx's deadline; it returns at once when
+// that moment has passed, which is the case of a branch that already took
+// longer than the floor, and when ctx is done.
+func (s *Service) holdForgotPasswordAnswer(ctx context.Context, until time.Time) {
+	if deadline, ok := ctx.Deadline(); ok {
+		if latest := deadline.Add(-forgotPasswordAnswerHeadroom); latest.Before(until) {
+			until = latest
+		}
+	}
+	if wait := until.Sub(s.now()); wait > 0 {
+		s.sleep(ctx, wait)
+	}
+}
+
+// sleepContext waits d, or until ctx is done, whichever comes first. It is
+// Service.sleep unless a test replaces it.
+func sleepContext(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
 }
 
 // ResetPassword delegates to Service.ResetPassword.

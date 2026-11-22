@@ -187,6 +187,25 @@ func testForgotPassword(t *testing.T, mount Mounter) {
 		assertSuccessBody(t, rec)
 	})
 
+	// Config.ForgotPasswordMinResponseTime: the answer is held until the floor
+	// has passed, for a known and an unknown address alike, on every adapter.
+	// Only the lower bound is asserted — a timer guarantees it — and the exact
+	// pads per branch are pinned in the root package against a fake clock.
+	t.Run("with ForgotPasswordMinResponseTime no answer comes before the floor", func(t *testing.T) {
+		const floor = 150 * time.Millisecond
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithForgotPasswordMinResponseTime(floor))
+		env.Seed("forgotfloor@example.com")
+		for _, email := range []string{"forgotfloor@example.com", "nobody@example.com"} {
+			start := time.Now()
+			rec := env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{"email": email, "tenantId": "t1"}))
+			elapsed := time.Since(start)
+			assertSuccessBody(t, rec)
+			if elapsed < floor {
+				t.Errorf("%s answered after %v, before the %v floor", email, elapsed, floor)
+			}
+		}
+	})
+
 	// An absent body is valid; a present but broken one is not. This is the
 	// port's own convention, shared with /register and /login — the reference's
 	// express.json() answers its own 400 for unparseable JSON.

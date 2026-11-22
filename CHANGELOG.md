@@ -52,6 +52,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in to keep the bound. Registered as the deviation
   `credential-route-bodies-are-bounded`: the reference leaves the bound to its
   host's `express.json()`, 100 kB by default.
+- **`POST <prefix>/forgot-password` can answer in the same time for every
+  address: `Config.ForgotPasswordMinResponseTime`
+  (`WithForgotPasswordMinResponseTime(d)`), off by default.** The route already
+  answered every address with the same status and body, but a known address
+  waited for its mail to be handed to the sender — a synchronous webhook or relay,
+  often a second or more — while an unknown address, or one an invitation
+  reserves, was answered right after a lookup, so the time alone told accounts
+  apart. With a floor set, `Auth.ForgotPassword` holds every answer until the
+  floor has passed since the request reached it: a mail sent, an unknown or
+  reserved address, a failed send, a failed store (the `500`) alike. A branch
+  that already took longer is not held further, so the floor hides the
+  difference only when it is above the sender's worst case (its timeout plus the
+  lookup). The hold ends 100 ms before the request context's deadline — on AWS
+  Lambda the function's, where an answer written later is a timeout — and at
+  once when the context is cancelled. A body refused before the service is
+  reached (`400`, `413`) is not held, and neither is `Service.ForgotPassword`.
+  Sending asynchronously instead is no option for a runtime that freezes once the
+  answer is written. Zero is off, as before; a negative value makes `New` fail.
 
 ### Fixed
 - **`POST <prefix>/forgot-password`: a refused or failed delivery no longer
