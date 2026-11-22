@@ -27,6 +27,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   make `New` fail. The normalisation happens where each delivery is built, so
   it holds for the four adapters and for a direct caller of the service alike.
 
+### Security
+- **The public credential routes refuse a body over 16 KiB, before anything
+  reads it.** `POST <prefix>/forgot-password`, `/reset-password`,
+  `/magic-link/send`, `/magic-link/verify`, `/sms/send`, `/sms/verify`,
+  `/change-email/confirm`, `/invitations/accept`, `/link-request` and
+  `/link-verify` read whatever body arrived, up to whatever the platform in
+  front of them allowed, and a rate limiter that decodes the body to find the
+  address it limits read it first. All four adapters now put
+  `CredentialRouteBodyLimit` in front of these routes, outermost — ahead of
+  `HTTPConfig.RateLimiter` and the CSRF check — and answer a body over
+  `CredentialRouteMaxBodyBytes` (16 KiB) with
+  `413 {"error":"Request body too large","code":"BODY_TOO_LARGE"}`
+  (`HTTPErrBodyTooLarge`, `CodeBodyTooLarge`): a declared `Content-Length` over
+  the bound is refused unread, and a body that declares none, or understates
+  it, is read to one byte past the bound and refused there. No account has been
+  looked up by then, so the answer is the same for every address. A body within
+  the bound is passed on byte for byte and answered as before; nothing those
+  routes read comes near 16 KiB. The served OpenAPI document lists the `413`
+  on the ten routes. New: `CredentialRouteMaxBodyBytes`, `CodeBodyTooLarge`,
+  `HTTPErrBodyTooLarge`, `LimitCredentialRouteBody` (the check, for gin, echo or
+  a host's own router) and `CredentialRouteBodyLimit` (the net/http
+  middleware), which a host that mounts one of these handlers by hand wraps it
+  in to keep the bound. Registered as the deviation
+  `credential-route-bodies-are-bounded`: the reference leaves the bound to its
+  host's `express.json()`, 100 kB by default.
+
 ### Fixed
 - **`POST <prefix>/forgot-password`: a refused or failed delivery no longer
   kills the link mailed before it.** The route stored the new token — which

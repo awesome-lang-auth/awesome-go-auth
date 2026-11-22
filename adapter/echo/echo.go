@@ -256,10 +256,10 @@ func (ad *Adapter) mountCredentialRoutes(group *echo.Group, prefix string) {
 	// enrolment token of a 2FA_SETUP_REQUIRED answer
 	// (auth.Auth.TOTPEnrolmentCaller); without it they sit behind the
 	// middleware, as they always did.
-	group.POST(prefix+"/magic-link/send", ad.guard(ad.magicLinkSend))
-	group.POST(prefix+"/magic-link/verify", ad.guard(ad.magicLinkVerify))
-	group.POST(prefix+"/sms/send", ad.guard(ad.smsSend))
-	group.POST(prefix+"/sms/verify", ad.guard(ad.smsVerify))
+	group.POST(prefix+"/magic-link/send", ad.credentialGuard(ad.magicLinkSend))
+	group.POST(prefix+"/magic-link/verify", ad.credentialGuard(ad.magicLinkVerify))
+	group.POST(prefix+"/sms/send", ad.credentialGuard(ad.smsSend))
+	group.POST(prefix+"/sms/verify", ad.credentialGuard(ad.smsVerify))
 	if ad.auth.EnrolOnLogin() {
 		group.POST(prefix+"/2fa/setup", ad.guard(ad.twoFactorSetup))
 		group.POST(prefix+"/2fa/verify-setup", ad.guard(ad.twoFactorVerifySetup))
@@ -312,6 +312,20 @@ func (ad *Adapter) guard(h echo.HandlerFunc) echo.HandlerFunc {
 			err = h(c)
 		})).ServeHTTP(c.Response(), c.Request())
 		return err
+	}
+}
+
+// credentialGuard is guard for the public routes that send or spend a
+// one-time credential, with the body bound in front of it:
+// auth.LimitCredentialRouteBody refuses a body over 16 KiB with 413 before the
+// rate limiter or the handler reads it, as the net/http adapter's does.
+func (ad *Adapter) credentialGuard(h echo.HandlerFunc) echo.HandlerFunc {
+	guarded := ad.guard(h)
+	return func(c echo.Context) error {
+		if !auth.LimitCredentialRouteBody(c.Response(), c.Request()) {
+			return nil
+		}
+		return guarded(c)
 	}
 }
 

@@ -192,6 +192,42 @@ revision the whole contract was extracted from.
   answers the `500` above with a mailed link that will not work, which is logged
   (`auth: a password reset was delivered but its token could not be stored, …`).
 
+### The public credential routes refuse a body over 16 KiB before anything reads it
+
+`credential-route-bodies-are-bounded`
+
+- **Surface**: `POST <prefix>/forgot-password`, `/reset-password`,
+  `/magic-link/send`, `/magic-link/verify`, `/sms/send`, `/sms/verify`,
+  `/change-email/confirm`, `/invitations/accept`, `/link-request` and
+  `/link-verify`.
+- **This port**: A body over 16 KiB (`CredentialRouteMaxBodyBytes`) is answered
+  `413 {"error": "Request body too large", "code": "BODY_TOO_LARGE"}`. A
+  declared `Content-Length` over the bound is refused unread; a body that
+  declares none, or understates it, is read up to one byte past the bound and
+  refused there. The bound sits outermost on each route, ahead of
+  `HTTPConfig.RateLimiter` and the CSRF check, so nothing has run when the
+  answer goes out — no rate limiter decoding the body, no account lookup — and
+  it is the same for every address. A body within the bound is handed on byte
+  for byte and answered as before.
+- **The reference**: Parses no body itself: the host mounts `express.json()` in
+  front of the router, whose default limit is 100 kB, and a larger body is
+  refused there with a `413` (`entity.too.large`) that the host application's
+  error handler writes. The routes read `req.body` as the parser left it
+  (`auth.router.ts:777-798`, `auth.router.ts:801-825`).
+- **Why**: Each of these routes takes a stranger's body with no session in front
+  of it and reads a few short fields from it — an address, a token, a password,
+  a code, a language. Without a bound of its own this port read whatever
+  arrived, up to what the platform in front of it allows, and a rate limiter
+  that decodes the body to find the address it limits read it first. The
+  reference's bound is its host's parser, and there is no host layer here to
+  leave it to. 16 KiB is far over anything the routes read and far under what a
+  relay further on may be asked to take.
+- **Mounting a handler yourself**: The adapters apply the bound to the routes
+  they mount. `auth.CredentialRouteBodyLimit` is the same check as net/http
+  middleware, and `auth.LimitCredentialRouteBody` as a function for other
+  routers: a host that mounts one of these handlers by hand wraps it to keep the
+  bound.
+
 ### The 2FA step-up token is typed, not an access token
 
 `temp-token-is-typed-not-an-access-token`

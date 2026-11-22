@@ -19,7 +19,7 @@ import (
 // Mount mounts it only when Auth.InvitationsEnabled, and never under
 // HTTPConfig.ResourceServer; HTTPConfig.ClosedRegistration leaves it mounted.
 func (a *Adapter) InvitationAcceptHandler() http.Handler {
-	return a.guard(http.HandlerFunc(a.AcceptInvitation))
+	return a.credentialGuard(http.HandlerFunc(a.AcceptInvitation))
 }
 
 // AcceptInvitation handles POST <prefix>/invitations/accept {token, password}.

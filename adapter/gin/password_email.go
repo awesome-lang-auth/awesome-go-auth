@@ -18,13 +18,13 @@ import (
 
 // mountPasswordEmail attaches the §2 routes.
 func (ad *Adapter) mountPasswordEmail(group gin.IRoutes, prefix string) {
-	group.POST(prefix+"/forgot-password", ad.guard(ad.forgotPassword))
-	group.POST(prefix+"/reset-password", ad.guard(ad.resetPassword))
+	group.POST(prefix+"/forgot-password", ad.credentialGuard(ad.forgotPassword))
+	group.POST(prefix+"/reset-password", ad.credentialGuard(ad.resetPassword))
 	group.POST(prefix+"/change-password", ad.guard(ad.Middleware()), ad.changePassword)
 	group.POST(prefix+"/send-verification-email", ad.guard(ad.Middleware()), ad.sendVerificationEmail)
 	group.GET(prefix+"/verify-email", ad.guard(ad.verifyEmail))
 	group.POST(prefix+"/change-email/request", ad.guard(ad.Middleware()), ad.changeEmailRequest)
-	group.POST(prefix+"/change-email/confirm", ad.guard(ad.changeEmailConfirm))
+	group.POST(prefix+"/change-email/confirm", ad.credentialGuard(ad.changeEmailConfirm))
 }
 
 // linkBase resolves the base an emailed link is built under for this request —

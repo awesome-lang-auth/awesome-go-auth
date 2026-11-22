@@ -67,6 +67,7 @@ var wantDeviationIDs = []string{
 	"advertised-2fa-methods-require-store-support",
 	"config-require2fa-is-a-system-policy-term",
 	"cookie-max-age-follows-configured-ttl",
+	"credential-route-bodies-are-bounded",
 	"csrf-cookie-not-reissued-with-tokens",
 	"docs-routes-are-opt-in",
 	"event-handler-panic-does-not-fail-the-publisher",
@@ -104,6 +105,13 @@ var wantDeviationIDs = []string{
 // rewording and fail on a reversal. Each must appear somewhere in the entry.
 var wantClaims = map[string][]string{
 	"forgot-password-succeeds-on-delivery-failure": {"200", "500", "enumeration", "stores nothing", "earlier link"},
+	// The status and code, the bound, both ways a body is measured, that the
+	// rate limiter has not run, that the answer does not depend on the address
+	// — and the reference's parser, which is where its own bound lives.
+	"credential-route-bodies-are-bounded": {
+		"413", "BODY_TOO_LARGE", "16 KiB", "Content-Length", "HTTPConfig.RateLimiter",
+		"same for every address", "express.json()", "100 kB",
+	},
 	"jwks-cors-wildcard-string-form": {
 		"Access-Control-Allow-Origin", "string | string[]", "corsOrigins === '*'",
 	},

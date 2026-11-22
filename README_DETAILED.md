@@ -3942,6 +3942,26 @@ the CSRF middleware, and adds the access-token middleware where the route needs
 it. A handler method mounted by hand gets none of these, so `Mount` is the
 supported way to serve the routes.
 
+**The public credential routes bound their body.** `POST /forgot-password`,
+`/reset-password`, `/magic-link/send`, `/magic-link/verify`, `/sms/send`,
+`/sms/verify`, `/change-email/confirm`, `/invitations/accept`, `/link-request`
+and `/link-verify` each take a stranger's body with no session in front of it,
+so every adapter puts `auth.CredentialRouteBodyLimit` in front of them,
+outermost — ahead of the rate-limiter slot and the CSRF check. A body over
+`auth.CredentialRouteMaxBodyBytes` (16 KiB) is answered
+`413 {"error": "Request body too large", "code": "BODY_TOO_LARGE"}`
+(`auth.HTTPErrBodyTooLarge`) before anything reads it: a declared
+`Content-Length` over the bound is refused unread, and a body without one is read
+up to the bound and refused there. Nothing has looked an account up by then, so
+the answer is the same for every address, and a limiter that decodes the body to
+find the address it limits never sees more than 16 KiB. A body within the bound
+reaches the limiter and the handler byte for byte. The reference leaves the
+bound to its host's `express.json()` (100 kB by default); see the deviation
+`credential-route-bodies-are-bounded`. A handler mounted by hand keeps the bound
+when wrapped in `auth.CredentialRouteBodyLimit` (net/http) or preceded by
+`auth.LimitCredentialRouteBody(w, r)`, which reports whether the request may go
+on and has written the answer when it may not.
+
 ### `HTTPConfig.RateLimiter` — the rate-limiter slot
 
 The reference declares `RouterOptions.rateLimiter` (`auth.router.ts:46`) and
