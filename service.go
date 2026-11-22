@@ -19,10 +19,11 @@ type Service struct {
 	rbac     RolesPermissionsStore
 	tenants  TenantStore
 	now      func() time.Time
-	// sleep waits d or until ctx is done: sleepContext, held here beside now so
-	// that a test can record the wait a minimum response time asks for instead
-	// of sleeping it. See Auth.ForgotPassword.
-	sleep func(ctx context.Context, d time.Duration)
+	// sleep waits d: time.Sleep, held here beside now so that a test can
+	// record the wait a minimum response time asks for instead of sleeping it.
+	// It takes no context on purpose: the wait must not end when the client
+	// goes away. See Auth.ForgotPassword.
+	sleep func(d time.Duration)
 }
 
 type ServiceOption func(*Service)
@@ -52,7 +53,7 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 		users:    users,
 		sessions: sessions,
 		now:      time.Now,
-		sleep:    sleepContext,
+		sleep:    time.Sleep,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -610,6 +611,18 @@ func (s *Service) sessionIDOf(tokens AuthTokens) string {
 // link unusable, and so does a store write that fails after a good send, which
 // is reported as the store failure it is and logged.
 //
+// Once the address has named an account, the rest — the invitation check, the
+// send, the store — runs under ctx without its cancellation (withoutCancel),
+// bounded by ctx's deadline when it has one. A caller that goes away mid-way
+// therefore cannot split the send from the store, which would leave a mailed
+// link that was never stored, nor fail the store or the invitation check,
+// which would answer an error that only a known address can get: on a Go
+// net/http server a client that half-closes its connection cancels the
+// request context and can still read the answer. The lookup itself keeps ctx,
+// since it fails alike for every address. A sender that relied on the
+// cancellation to stop now stops at its own timeout or at ctx's deadline, and
+// a direct caller cannot cancel a send once it has begun.
+//
 // An account an invitation still reserves (reservedByInvitation) is answered
 // the same way, and nothing is stored or sent: the invitation is how it gets
 // its password. A reset would set one and leave the address unverified, which
@@ -622,6 +635,10 @@ func (s *Service) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (s
 	if err != nil {
 		return "", nil
 	}
+	// From here on the request names an account, and nothing the caller does
+	// may change what happens to it; see the doc comment.
+	ctx, cancel := withoutCancel(ctx)
+	defer cancel()
 	reserved, err := s.reservedByInvitation(ctx, user)
 	if err != nil {
 		return "", err
@@ -653,6 +670,18 @@ func (s *Service) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (s
 		return "", err
 	}
 	return resetToken, nil
+}
+
+// withoutCancel is ctx without its cancellation and with its deadline, if it
+// has one: what a step runs under when a caller that goes away must not cut
+// it short. The values ctx carries — the template store, the event context —
+// come along. The returned cancel releases the deadline's timer.
+func withoutCancel(ctx context.Context) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(detached, deadline)
+	}
+	return detached, func() {}
 }
 
 // ResetPassword sets a new password with a token ForgotPassword minted, and

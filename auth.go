@@ -615,7 +615,9 @@ func WithSiteURLs(urls ...string) Option {
 //
 // Zero, or not calling it, is off, as before the option existed; a negative
 // value makes New fail. The hold ends shortly before the request context's
-// deadline and at once when it is cancelled. See
+// deadline, and not when the context is cancelled: a client that went away
+// costs the server the rest of the floor. Every request on the route lasts at
+// least d, which a runtime that counts concurrent executions pays for. See
 // Config.ForgotPasswordMinResponseTime.
 func WithForgotPasswordMinResponseTime(d time.Duration) Option {
 	return func(b *authBuilder) error {

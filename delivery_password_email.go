@@ -144,7 +144,18 @@ type EmailChangeDelivery struct {
 // replaces the token the account held. So nil must mean the message was
 // accepted for delivery, and an error that the message was not — or may not
 // have been: an error after the message did leave (a timeout on the answer)
-// leaves its link unusable, while the account keeps its earlier one.
+// leaves its link unusable, while the account keeps its earlier one. It
+// follows that the token cannot be redeemed while the sender runs: a sender,
+// or a test harness, that spends it from inside the call gets
+// ErrInvalidToken, and the token becomes valid once the sender has returned
+// nil. Only a delivered request replaces an outstanding link: one whose
+// delivery failed leaves the earlier link working until it is used, expires
+// or a delivered request replaces it.
+//
+// ctx is not cancelled when the request's client goes away: once the address
+// has named an account the send and the store run to the end, bounded by the
+// request's deadline when it has one (see Service.ForgotPassword). A sender
+// therefore needs a timeout of its own, as DeliveryWebhook has.
 type PasswordResetSender func(ctx context.Context, delivery PasswordResetDelivery) error
 
 // EmailVerificationSender delivers an email-verification token. An error fails

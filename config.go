@@ -91,14 +91,36 @@ type Config struct {
 	//
 	// It hides the difference only where the floor is above the slow branch's
 	// worst case: a branch that already took longer is not held further, so
-	// set it at or above the sender's own timeout (a DeliveryWebhook's Timeout,
-	// for one) plus the lookup. The hold never runs past the request context:
-	// it ends early, forgotPasswordAnswerHeadroom (100 ms) before the context's
-	// deadline — on Lambda the function's, where an answer written after it is
-	// a timeout — and at once when the context is cancelled. A body refused
+	// set it at or above the lookup, plus the sender's own timeout (a
+	// DeliveryWebhook's Timeout, for one), plus the token write that follows a
+	// good send. The hold ends early only at the request context's deadline,
+	// forgotPasswordAnswerHeadroom (100 ms) before it — on Lambda the
+	// function's, where an answer written after it is a timeout. A cancelled
+	// context does not end it: on a Go net/http server a client that
+	// half-closes its connection cancels the request context and can still
+	// read the answer, so a cancelled request is held like any other, and a
+	// client that did go away costs the server the rest of the floor. Nothing
+	// here knows of a timeout the context does not carry —
+	// http.Server.WriteTimeout, a proxy's, an API gateway's integration
+	// timeout — so keep the floor well below each of those. A body refused
 	// before the service is reached (400 INVALID_BODY, 413 BODY_TOO_LARGE) is
 	// not held: it depends on no address. Service.ForgotPassword, the library
 	// call, is never held.
+	//
+	// What it costs: every request on the route, an unknown address's
+	// included, lasts at least the floor. Where the runtime counts concurrent
+	// executions — AWS Lambda's does — each held request occupies one for that
+	// long, so the route needs its request rate times the floor in concurrency
+	// and in billed duration, and a burst of anonymous requests can take the
+	// capacity the deployment's other routes share. A rate limiter keyed on
+	// the address in the body does not bound that, since every new address
+	// has a budget of its own; a limit per client, or capacity reserved for
+	// the function, in front of the route does.
+	//
+	// What it does not hide: the status. A store write that fails after a good
+	// send answers 500, and only a known address gets that far (the
+	// reference's answer, kept). Nor does it reach /magic-link/send and
+	// /sms/send, whose known and unknown addresses differ in time the same way.
 	//
 	// Zero — the default — is off, the behaviour this field predates. A
 	// negative value is refused. WithForgotPasswordMinResponseTime sets it.

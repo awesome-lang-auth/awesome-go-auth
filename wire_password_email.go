@@ -318,7 +318,11 @@ func DecodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 // The HTTP surface is also where Config.ForgotPasswordMinResponseTime holds
 // the answer: every return below, the store failure's included, waits until
 // the floor has passed since this call began (holdForgotPasswordAnswer), so
-// the time a known address's delivery takes no longer sets it apart.
+// the time a known address's delivery takes no longer sets it apart. The wait
+// does not end when ctx is cancelled — a client that half-closes its
+// connection cancels the request context on a Go net/http server and can
+// still read the answer — only when the floor has passed, or shortly before
+// ctx's deadline.
 func (a *Auth) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (string, error) {
 	if floor := a.service.cfg.ForgotPasswordMinResponseTime; floor > 0 {
 		defer a.service.holdForgotPasswordAnswer(ctx, a.service.now().Add(floor))
@@ -350,7 +354,13 @@ const forgotPasswordAnswerHeadroom = 100 * time.Millisecond
 // Config.ForgotPasswordMinResponseTime — and no later than
 // forgotPasswordAnswerHeadroom before ctx's deadline; it returns at once when
 // that moment has passed, which is the case of a branch that already took
-// longer than the floor, and when ctx is done.
+// longer than the floor.
+//
+// ctx is read for its deadline only. A cancellation does not end the wait:
+// ending it there would answer a client that half-closed its connection — which
+// cancels the request context on a Go net/http server, and still reads the
+// answer — after the work alone, which is the difference the floor exists to
+// hide. A client that did go away costs the server the rest of the floor.
 func (s *Service) holdForgotPasswordAnswer(ctx context.Context, until time.Time) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if latest := deadline.Add(-forgotPasswordAnswerHeadroom); latest.Before(until) {
@@ -358,18 +368,7 @@ func (s *Service) holdForgotPasswordAnswer(ctx context.Context, until time.Time)
 		}
 	}
 	if wait := until.Sub(s.now()); wait > 0 {
-		s.sleep(ctx, wait)
-	}
-}
-
-// sleepContext waits d, or until ctx is done, whichever comes first. It is
-// Service.sleep unless a test replaces it.
-func sleepContext(ctx context.Context, d time.Duration) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-ctx.Done():
+		s.sleep(wait)
 	}
 }
 

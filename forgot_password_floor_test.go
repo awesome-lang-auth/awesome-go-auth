@@ -12,7 +12,8 @@ import (
 // HTTP surface of /forgot-password answers no sooner than the floor after the
 // request reached it, whichever branch the request took — a known address
 // whose mail went out, an unknown one, one an invitation reserves, a failed
-// delivery, a failed store — and never later than shortly before the request
+// delivery, a failed store — and whether or not the request context was
+// cancelled on the way, and never later than shortly before the request
 // context's deadline.
 //
 // The clock is the service's own (Service.now) and the wait is recorded, not
@@ -41,7 +42,7 @@ func (f *floorFixture) advance(d time.Duration) {
 	f.now = f.now.Add(d)
 }
 
-func (f *floorFixture) sleep(_ context.Context, d time.Duration) {
+func (f *floorFixture) sleep(d time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pads = append(f.pads, d)
@@ -212,19 +213,45 @@ func TestForgotPasswordFloorIsValidated(t *testing.T) {
 	}
 }
 
-// TestSleepContextEndsWithTheContext: the wait the service uses by default
-// returns when the context ends, so a client that went away is not held.
-func TestSleepContextEndsWithTheContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	start := time.Now()
-	sleepContext(ctx, 10*time.Second)
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("a cancelled context still waited %v", elapsed)
+// TestForgotPasswordFloorHoldsACancelledRequest: a request whose context is
+// cancelled is held to the floor like any other. On a Go net/http server a
+// client that half-closes its connection cancels the request context and can
+// still read the answer, so ending the hold there would hand it the time the
+// work took — the difference the floor hides. The cancellation comes before
+// the call, and in the middle of a known address's send. The clock and the
+// wait are the real ones here, since the wait itself is what is under test;
+// only the lower bound is asserted, which the timer guarantees.
+func TestForgotPasswordFloorHoldsACancelledRequest(t *testing.T) {
+	const floor = 150 * time.Millisecond
+	spy := &passwordEmailSpy{}
+	a := newPasswordEmailAuth(t, spy, WithForgotPasswordMinResponseTime(floor))
+	if _, _, err := a.Register(context.Background(), RegisterInput{Email: "known@example.com", Password: "password1", TenantID: "t1"}); err != nil {
+		t.Fatalf("register: %v", err)
 	}
-	start = time.Now()
-	sleepContext(context.Background(), 20*time.Millisecond)
-	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
-		t.Errorf("waited %v, want at least 20ms", elapsed)
+	for _, tc := range []struct {
+		name, email string
+		midSend     bool
+	}{
+		{"an unknown address, cancelled before the call", "nobody@example.com", false},
+		{"a known address, cancelled before the call", "known@example.com", false},
+		{"a known address, cancelled in the middle of the send", "known@example.com", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			spy.inspect = nil
+			if tc.midSend {
+				spy.inspect = cancel
+			} else {
+				cancel()
+			}
+			start := time.Now()
+			if _, err := a.ForgotPassword(ctx, ForgotPasswordInput{Email: tc.email, TenantID: "t1"}); err != nil {
+				t.Fatalf("forgot password: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed < floor {
+				t.Errorf("answered after %v, before the %v floor", elapsed, floor)
+			}
+		})
 	}
 }

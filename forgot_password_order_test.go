@@ -187,3 +187,105 @@ func TestForgotPasswordStoreFailureAfterTheSend(t *testing.T) {
 		t.Errorf("log lines = %q, want one saying the mailed link will not work, without the address", logged)
 	}
 }
+
+// ctxResetTokenStore is a MemoryUserStore whose reset-token write honours the
+// context, as a store behind a network call does: a cancelled context fails
+// the write.
+type ctxResetTokenStore struct{ *MemoryUserStore }
+
+func (s ctxResetTokenStore) UpdateResetToken(ctx context.Context, userID, tenantID, hash string, expiry time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.MemoryUserStore.UpdateResetToken(ctx, userID, tenantID, hash, expiry)
+}
+
+// ctxInvitationStore is a MemoryInvitationStore whose read of an account's
+// invitations honours the context in the same way.
+type ctxInvitationStore struct{ *MemoryInvitationStore }
+
+func (s ctxInvitationStore) PendingInvitationsForUser(ctx context.Context, userID string) ([]Invitation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.MemoryInvitationStore.PendingInvitationsForUser(ctx, userID)
+}
+
+// TestForgotPasswordACallerThatLeavesCannotSplitTheSendFromTheStore: a
+// caller that goes away once the address has named an account — on a Go
+// net/http server, a client that half-closes its connection, which cancels
+// the request context and can still read the answer — changes nothing. The
+// sender runs under a live context and the token it mailed is stored, so the
+// mailed link works; and neither the store write nor the invitation check
+// fails for the cancellation, which would answer an error only a known
+// address can get. The request's deadline still bounds the work.
+func TestForgotPasswordACallerThatLeavesCannotSplitTheSendFromTheStore(t *testing.T) {
+	t.Run("cancelled in the middle of the send", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var mailed string
+		var seen error
+		a := newPasswordEmailAuth(t, nil,
+			WithUserStore(ctxResetTokenStore{NewMemoryUserStore()}),
+			WithPasswordResetSender(func(sctx context.Context, d PasswordResetDelivery) error {
+				mailed = d.Token
+				cancel() // the client hangs up while the relay is still answering
+				seen = sctx.Err()
+				return sctx.Err() // what a sender that honours its context answers
+			}))
+		if _, _, err := a.Register(context.Background(), RegisterInput{Email: "leaves@example.com", Password: "password1", TenantID: "t1"}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if _, err := a.ForgotPassword(ctx, ForgotPasswordInput{Email: "leaves@example.com", TenantID: "t1"}); err != nil {
+			t.Fatalf("forgot password: %v; a client going away must not turn a known address into an error", err)
+		}
+		if seen != nil {
+			t.Errorf("the sender saw its context end (%v) when the caller went away", seen)
+		}
+		if err := a.ResetPassword(context.Background(), ResetPasswordInput{Token: mailed, NewPassword: "newpassword1"}); err != nil {
+			t.Errorf("the link mailed to a caller that went away: %v; it must have been stored", err)
+		}
+	})
+
+	t.Run("cancelled before the account was read further", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		a := newPasswordEmailAuth(t, &passwordEmailSpy{},
+			WithUserStore(ctxResetTokenStore{NewMemoryUserStore()}),
+			WithInvitationStore(ctxInvitationStore{NewMemoryInvitationStore()}))
+		if _, _, err := a.Register(context.Background(), RegisterInput{Email: "known@example.com", Password: "password1", TenantID: "t1"}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if _, err := a.Service().InviteUser(context.Background(), InviteUserInput{Email: "invited@example.com", TenantID: "t1"}); err != nil {
+			t.Fatalf("invite: %v", err)
+		}
+		// The memory store's lookup ignores the context, so both addresses
+		// name an account; what follows the lookup honours it.
+		for _, email := range []string{"known@example.com", "invited@example.com", "nobody@example.com"} {
+			if _, err := a.ForgotPassword(ctx, ForgotPasswordInput{Email: email, TenantID: "t1"}); err != nil {
+				t.Errorf("%s: %v; a cancelled request must answer as any other", email, err)
+			}
+		}
+	})
+
+	t.Run("the deadline still applies", func(t *testing.T) {
+		deadline := time.Now().Add(time.Minute)
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		var got time.Time
+		var had bool
+		a := newPasswordEmailAuth(t, nil, WithPasswordResetSender(func(sctx context.Context, _ PasswordResetDelivery) error {
+			got, had = sctx.Deadline()
+			return nil
+		}))
+		if _, _, err := a.Register(context.Background(), RegisterInput{Email: "deadline@example.com", Password: "password1", TenantID: "t1"}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if _, err := a.ForgotPassword(ctx, ForgotPasswordInput{Email: "deadline@example.com", TenantID: "t1"}); err != nil {
+			t.Fatalf("forgot password: %v", err)
+		}
+		if !had || !got.Equal(deadline) {
+			t.Errorf("the sender's deadline = %v (%v), want the request's %v", got, had, deadline)
+		}
+	})
+}

@@ -229,6 +229,9 @@ func testForgotPassword(t *testing.T, mount Mounter) {
 		unknown := env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{"email": "nobody@example.com", "tenantId": "t1"}))
 		assertSuccessBody(t, unknown)
 	})
+
+	// A client that half-closes its connection; see forgot_password_conn.go.
+	t.Run("over a real connection", func(t *testing.T) { testForgotPasswordOverAConnection(t, mount) })
 }
 
 func testResetPassword(t *testing.T, mount Mounter) {
