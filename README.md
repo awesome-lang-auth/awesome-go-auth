@@ -191,6 +191,9 @@ revision the whole contract was extracted from.
   the earlier one keeps working; and a store write that fails after a good send
   answers the `500` above with a mailed link that will not work, which is logged
   (`auth: a password reset was delivered but its token could not be stored, …`).
+  Only a delivered request replaces the account's link now: asking again cuts
+  off a link mailed before only when the new mail goes out, and otherwise that
+  link stays valid until it is used or expires.
 
 ### The public credential routes refuse a body over 16 KiB before anything reads it
 
@@ -220,13 +223,23 @@ revision the whole contract was extracted from.
   arrived, up to what the platform in front of it allows, and a rate limiter
   that decodes the body to find the address it limits read it first. The
   reference's bound is its host's parser, and there is no host layer here to
-  leave it to. 16 KiB is far over anything the routes read and far under what a
-  relay further on may be asked to take.
+  leave it to. 16 KiB is far over anything the routes read.
 - **Mounting a handler yourself**: The adapters apply the bound to the routes
   they mount. `auth.CredentialRouteBodyLimit` is the same check as net/http
   middleware, and `auth.LimitCredentialRouteBody` as a function for other
   routers: a host that mounts one of these handlers by hand wraps it to keep the
   bound.
+- **What it does not bound**: The delivery a sender builds from the request: a
+  body within the bound can still carry an `emailLang` of several kilobytes,
+  which a delivery webhook relays JSON-encoded, `<`, `>` and `&` escaped to six
+  bytes each. `Config.EmailLangs` bounds that. Nor the other routes. The ten are
+  the public routes that hand their body to a sender or spend a credential a
+  mail or a text delivered; `/register`, `/login`, `/refresh`, `/logout`, the
+  `/2fa` routes, the IdP's token endpoint and the admin console's `/login` read
+  a stranger's body too but do neither, and the mail routes behind a session or
+  the admin guard have an authenticated caller. None of them is bounded by the
+  adapters; a deployment that wants every body bounded puts a limit in front of
+  the mount (`http.MaxBytesHandler`).
 
 ### The 2FA step-up token is typed, not an access token
 

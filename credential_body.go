@@ -21,11 +21,29 @@ import (
 // deployments decodes the body to find the address it limits, and so before any
 // account is looked up: the answer to an over-large body cannot depend on who
 // it names. It is registered as the deviation credential-route-bodies-are-bounded.
+//
+// The bound limits what the server reads, not what a sender relays. A body
+// within it can still carry an emailLang of several kilobytes, which a delivery
+// webhook forwards JSON-encoded — '<', '>' and '&' escaped to six bytes each —
+// to a receiver that may refuse it for its size. Config.EmailLangs is the
+// control for that: set, only a configured language reaches a sender.
+//
+// It covers these ten routes and no others: the public routes that hand their
+// body to a sender or spend a credential a mail or a text delivered. The rest
+// of the public surface — POST <prefix>/register, /login, /refresh, /logout,
+// the /2fa routes, the IdP's token endpoint and the admin console's /login —
+// reads a stranger's body too but does neither, and is not bounded here; nor
+// are the mail routes behind a session or the admin guard
+// (/send-verification-email, /change-email/request, the admin invitation),
+// whose caller is authenticated and whose language EmailLangs bounds. A
+// deployment that wants every body bounded puts a limit in front of the mount:
+// net/http's http.MaxBytesHandler, or CredentialRouteBodyLimit itself.
 
 // CredentialRouteMaxBodyBytes is the largest body the public credential routes
 // accept: 16 KiB, well over anything those routes read — the longest is a
-// password, which bcrypt caps at 72 bytes — and far under what a parser or a
-// relay further on is asked to take.
+// password, which bcrypt caps at 72 bytes — and under what a parser further on
+// is asked to take. It bounds the request, not the delivery a sender builds
+// from it; see the file comment.
 const CredentialRouteMaxBodyBytes = 16 << 10
 
 // CodeBodyTooLarge is the code of the answer to a body over the bound. It has

@@ -508,22 +508,50 @@ the request reached `Auth.ForgotPassword`, on every branch alike:
 
 - **Set it above the slow branch's worst case.** A branch that already took
   longer than `d` is not held further, so the floor hides the difference only
-  when it covers the sender's own timeout (a `DeliveryWebhook`'s `Timeout`, 5
-  seconds unless set) plus the lookup. A floor between the typical and the worst
-  delivery time hides the typical case and not the outliers.
-- **It never runs past the request.** The hold ends 100 ms before the request
-  context's deadline — on Lambda the function's own, where an answer written
-  after it is a timeout — and at once when the context is cancelled, a client
-  that went away included.
+  when it covers the lookup, the sender's own timeout (a `DeliveryWebhook`'s
+  `Timeout`, 5 seconds unless set) and the token write that follows a good
+  send. A floor between the typical and the worst delivery time hides the
+  typical case and not the outliers.
+- **It ends early only at the request's deadline.** The hold ends 100 ms before
+  the request context's deadline — on Lambda the function's own, where an
+  answer written after it is a timeout. It does **not** end when the context is
+  cancelled: on a Go `net/http` server a client that half-closes its connection
+  cancels the request context and can still read the answer, so ending the hold
+  there would hand it the time the work took. A client that did go away costs
+  the server the rest of the floor.
+- **Keep it below every timeout the context does not carry.** Nothing here knows
+  of `http.Server.WriteTimeout`, a proxy's timeout or an API gateway's
+  integration timeout; a floor at or above one of them turns every answer into
+  that timeout.
 - **What it does not hold:** a body refused before the service is reached
   (`400 INVALID_BODY`, `413 BODY_TOO_LARGE`), which depends on no address, and
   `Service.ForgotPassword`, the library call, which is not the HTTP surface.
-- **What it costs:** every request on the route lasts at least `d`, so a
-  deployment that counts concurrent executions or connection time pays for the
-  floor on unknown addresses too.
+- **What it costs:** every request on the route, an unknown address's included,
+  lasts at least `d`. Where the runtime counts concurrent executions — AWS
+  Lambda's does — each held request occupies one for that long, so the route
+  needs its request rate times `d` in concurrency and in billed duration (20
+  requests a second held 6 seconds is about 120 concurrent executions), and a
+  burst of anonymous requests can take the capacity the deployment's other
+  routes share. A rate limiter keyed on the address in the body does not bound
+  that, since every new address has a budget of its own: put a limit per client
+  (or reserved capacity for the function) in front of the route.
+- **What it does not hide:** the status — a store write that fails after a good
+  send answers `500`, and only a known address gets that far (the reference's
+  answer, kept) — and the other routes that send to an address a stranger
+  names: `/magic-link/send` and `/sms/send` differ in time between known and
+  unknown addresses the same way, and have no floor.
 
 Zero — the default — is off, as before the option existed; a negative value
 makes `New` fail.
+
+Independently of the floor, once the address has named an account the rest of
+the request — the invitation check, the send, the store — runs to its end even
+if the client goes away: `Service.ForgotPassword` runs it under the request
+context without its cancellation, bounded by the context's deadline when there
+is one. A client that hangs up mid-send can therefore neither leave a mailed
+link unstored nor turn a store that honours its context into a `500` that only
+a known address gets. A sender needs a timeout of its own for the same reason
+(`DeliveryWebhook` has one): nothing cancels it when the client leaves.
 
 ### `TwoFactorAppName` and the TOTP parameters
 
@@ -2118,6 +2146,19 @@ one that errors after the message did leave (a timeout on the answer) leaves tha
 message's link unusable, the earlier one intact. With no sender configured the
 token is stored at once, for a caller of `Service.ForgotPassword` that delivers the
 returned token itself.
+
+Three consequences for whoever writes a reset sender:
+
+- **The token is not valid while the sender runs.** It becomes valid once the
+  sender has returned `nil`, so a sender or a test harness that spends it from
+  inside the call gets `ErrInvalidToken`.
+- **Only a delivered request replaces a link.** Asking again cuts off the link
+  mailed before only when the new mail goes out; after a failed delivery the
+  earlier link stays valid until it is used or expires (`ResetTokenTTL`).
+- **Nothing cancels the send when the client goes away.** The send and the store
+  run under the request context without its cancellation, bounded by its
+  deadline when there is one, so a sender needs a timeout of its own
+  (`DeliveryWebhook` has one).
 
 ### Built-in senders
 
@@ -4003,6 +4044,20 @@ bound to its host's `express.json()` (100 kB by default); see the deviation
 when wrapped in `auth.CredentialRouteBodyLimit` (net/http) or preceded by
 `auth.LimitCredentialRouteBody(w, r)`, which reports whether the request may go
 on and has written the answer when it may not.
+
+The bound limits what the server reads, not what a sender relays: a body within
+it can still carry an `emailLang` of several kilobytes, which a delivery webhook
+forwards JSON-encoded (`<`, `>` and `&` escaped to six bytes each) to a receiver
+that may refuse it for its size. `Config.EmailLangs` is the control for the
+relayed language. The bound covers the ten routes above and no others — the
+public routes that hand their body to a sender or spend a credential a mail or a
+text delivered. The rest of the public surface (`/register`, `/login`,
+`/refresh`, `/logout`, the `/2fa` routes, the IdP's token endpoint and the admin
+console's `/login`) reads a stranger's body too but does neither, and the mail
+routes behind a session or the admin guard (`/send-verification-email`,
+`/change-email/request`, the admin invitation) have an authenticated caller. A
+deployment that wants every body bounded puts a limit in front of the mount,
+such as `http.MaxBytesHandler`.
 
 ### `HTTPConfig.RateLimiter` — the rate-limiter slot
 

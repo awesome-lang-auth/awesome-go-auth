@@ -51,7 +51,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   middleware), which a host that mounts one of these handlers by hand wraps it
   in to keep the bound. Registered as the deviation
   `credential-route-bodies-are-bounded`: the reference leaves the bound to its
-  host's `express.json()`, 100 kB by default.
+  host's `express.json()`, 100 kB by default. The bound limits what the server
+  reads, not what a sender relays: a body within it can still carry an
+  `emailLang` of several kilobytes, which a delivery webhook forwards
+  JSON-encoded and up to six times longer; `Config.EmailLangs` bounds that.
+  The ten are the public routes that hand their body to a sender or spend a
+  credential a mail or a text delivered: the other public routes (`/register`,
+  `/login`, `/refresh`, `/logout`, the `/2fa` routes, the IdP's token endpoint,
+  the admin console's `/login`) and the mail routes behind a session or the
+  admin guard are not bounded, and a deployment that wants them bounded puts a
+  limit in front of the mount.
 - **`POST <prefix>/forgot-password` can answer in the same time for every
   address: `Config.ForgotPasswordMinResponseTime`
   (`WithForgotPasswordMinResponseTime(d)`), off by default.** The route already
@@ -63,13 +72,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   floor has passed since the request reached it: a mail sent, an unknown or
   reserved address, a failed send, a failed store (the `500`) alike. A branch
   that already took longer is not held further, so the floor hides the
-  difference only when it is above the sender's worst case (its timeout plus the
-  lookup). The hold ends 100 ms before the request context's deadline — on AWS
-  Lambda the function's, where an answer written later is a timeout — and at
-  once when the context is cancelled. A body refused before the service is
-  reached (`400`, `413`) is not held, and neither is `Service.ForgotPassword`.
-  Sending asynchronously instead is no option for a runtime that freezes once the
-  answer is written. Zero is off, as before; a negative value makes `New` fail.
+  difference only when it is above the slow branch's worst case: the lookup,
+  the sender's timeout and the token write. The hold ends 100 ms before the
+  request context's deadline — on AWS Lambda the function's, where an answer
+  written later is a timeout — and not when the context is cancelled: on a Go
+  `net/http` server a client that half-closes its connection cancels the
+  request context and can still read the answer, so a cancelled request is
+  held like any other. Keep the floor below every timeout the context does not
+  carry (`http.Server.WriteTimeout`, a proxy's, an API gateway's). A body
+  refused before the service is reached (`400`, `413`) is not held, and
+  neither is `Service.ForgotPassword`. Sending asynchronously instead is no
+  option for a runtime that freezes once the answer is written. What it costs:
+  every request lasts at least the floor, so on a runtime that counts
+  concurrent executions the route needs its request rate times the floor in
+  concurrency and billed duration, which a limiter keyed on the address does
+  not bound; put a per-client limit or reserved capacity in front. What it does
+  not hide: the `500` of a failed store, which only a known address reaches,
+  and the same time difference on `/magic-link/send` and `/sms/send`. Zero is
+  off, as before; a negative value makes `New` fail.
+
+### Changed
+- **`POST <prefix>/forgot-password`, `/reset-password`, `/magic-link/send`,
+  `/magic-link/verify`, `/sms/send`, `/sms/verify`, `/change-email/confirm`,
+  `/invitations/accept`, `/link-request` and `/link-verify` answer a body over
+  16 KiB with `413 BODY_TOO_LARGE`**, on every adapter and with no option to
+  turn it off; see Security. A client sending a larger body to one of them got
+  the route's usual answer before.
+- **`Service.ForgotPassword` sends before it stores, and finishes what it
+  started.** A direct caller sees the token stored only once
+  `Config.SendPasswordReset` has returned `nil`, so the token cannot be spent
+  from inside the sender; a failed send stores nothing and leaves the earlier
+  token in place. And once the address has named an account, the invitation
+  check, the send and the store run under the caller's context without its
+  cancellation — bounded by its deadline, when it has one — so cancelling the
+  context no longer stops a send that has begun. A sender needs a timeout of
+  its own (`DeliveryWebhook` has one). See Fixed.
 
 ### Fixed
 - **`POST <prefix>/forgot-password`: a refused or failed delivery no longer
@@ -91,8 +128,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after a good send answers the `500` a store failure always answered, with a
   mailed link that will not work — logged as `auth: a password reset was
   delivered but its token could not be stored, …`, without the address. The
-  two authenticated routes keep the reference's store-then-send order. The
+  token becomes valid only once the sender has returned `nil`, so a sender or
+  test harness that spends it from inside the call gets `ErrInvalidToken`; and
+  only a delivered request replaces a link now, so asking again cuts off a
+  link mailed before only when the new mail goes out. The two authenticated
+  routes keep the reference's store-then-send order. The
   `forgot-password-succeeds-on-delivery-failure` entry now says so.
+- **`POST <prefix>/forgot-password`: a client that goes away mid-request no
+  longer changes what the route does.** On a Go `net/http` server a client that
+  half-closes its connection cancels the request context while it can still
+  read the answer. Hanging up while the sender ran cut a delivery webhook's
+  call short — no mail, or a mail whose answer was lost and whose token, under
+  the new order, would never be stored — and a store that honours its context
+  could fail the write and answer `500`, a status only a known address
+  reaches. Once the address has named an account, the invitation check, the
+  send and the store now run under the request context without its
+  cancellation, bounded by its deadline: the mail goes out and its token is
+  stored whether or not the client stays.
 
 ## [0.15.0] - 2026-11-21
 
