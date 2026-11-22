@@ -60,11 +60,14 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 		return nil, errors.New("auth: stores are required")
 	}
 	// The option promises that a reset ends the account's sessions, and only a
-	// store that can list them by user can keep that promise. Refusing here is
-	// the alternative to a reset that answers success and revokes nothing.
+	// store that can revoke them all at once, or list them by user, can keep
+	// that promise. Refusing here is the alternative to a reset that answers
+	// success and revokes nothing.
 	if cfg.RevokeSessionsOnPasswordReset {
-		if _, ok := sessions.(SessionAdminStore); !ok {
-			return nil, errors.New("auth: RevokeSessionsOnPasswordReset needs a session store that implements SessionAdminStore (ListSessionsForUser and RevokeSessionByID), and this one does not")
+		_, bulk := sessions.(UserSessionRevoker)
+		_, admin := sessions.(SessionAdminStore)
+		if !bulk && !admin {
+			return nil, errors.New("auth: RevokeSessionsOnPasswordReset needs a session store that implements UserSessionRevoker (RevokeSessionsForUser) or SessionAdminStore (ListSessionsForUser and RevokeSessionByID), and this one implements neither")
 		}
 	}
 	svc := &Service{
@@ -773,10 +776,19 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // revokeSessionsAfterReset revokes every live session user holds: the half of
 // ResetPassword that Config.RevokeSessionsOnPasswordReset adds.
 //
-// A session already revoked is left alone — revoking it again would relabel
-// the earlier revocation on a store that records why — and so is one whose
-// listed expiry has passed, which can neither refresh nor pass the all-calls
-// check; one listed with no expiry at all is revoked. One the
+// A store that implements UserSessionRevoker is asked to do it in one call,
+// whose contract is that every session is revoked; its failure is the reset's,
+// as below. Otherwise the account's sessions are listed
+// (SessionAdminStore.ListSessionsForUser) and revoked one by one, which is
+// exactly as complete as the listing: a store whose listing refuses past a cap
+// fails every reset of an account over it, with nothing revoked, and one that
+// lists from an eventually consistent index may leave out a session opened just
+// before the reset. Such a store implements UserSessionRevoker.
+//
+// On the listing path, a session already revoked is left alone — revoking it
+// again would relabel the earlier revocation on a store that records why — and
+// so is one whose listed expiry has passed, which can neither refresh nor pass
+// the all-calls check; one listed with no expiry at all is revoked. One the
 // store no longer has when its turn comes (ErrSessionNotFound) is gone, which
 // is what was wanted. Every other session is tried even after one fails, so a
 // store that refuses one revocation still ends all the others.
@@ -789,9 +801,16 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // and the line written through Config.Logger is where an operator reads which
 // account and what failed.
 func (s *Service) revokeSessionsAfterReset(ctx context.Context, user User) error {
+	if bulk, ok := s.sessions.(UserSessionRevoker); ok {
+		if err := bulk.RevokeSessionsForUser(ctx, user.ID, user.TenantID); err != nil {
+			s.logf("auth: password reset for user %q: the password was changed, but its sessions could not be revoked and may still work: %v", user.ID, err)
+			return fmt.Errorf("auth: password reset: revoke sessions: %v", err)
+		}
+		return nil
+	}
 	store, ok := s.sessions.(SessionAdminStore)
 	if !ok {
-		// NewService refuses the option without SessionAdminStore, so this is
+		// NewService refuses the option without either interface, so this is
 		// a Service assembled some other way; fail as the store failing would.
 		return errors.New("auth: password reset: the session store cannot list sessions, so none was revoked")
 	}

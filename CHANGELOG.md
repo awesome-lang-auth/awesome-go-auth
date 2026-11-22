@@ -48,9 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   revocation; a store that consumes it at lookup needs a new link. The store's
   error is formatted, not wrapped, so no session store can turn the answer into
   `400 Invalid reset token` for a reset that has changed the password.
-  `NewService` (and so `New`) refuses the option on a session store without
-  `SessionAdminStore`. Registered as the deviation
-  `reset-password-can-revoke-sessions`.
+  `NewService` (and so `New`) refuses the option on a session store that
+  implements neither `SessionAdminStore` nor `UserSessionRevoker`. Registered
+  as the deviation `reset-password-can-revoke-sessions`. Not ended by it: a
+  step-up token minted before the reset, which still completes its challenge
+  for `TempTokenTTL` (5 minutes by default) for whoever holds the second
+  factor; an enrolment token is bound to the password and stops working.
+- **`UserSessionRevoker`, an optional session-store interface:
+  `RevokeSessionsForUser(ctx, userID, tenantID)` revokes every session an
+  account holds in one call.** The reset's revocation prefers it to listing
+  the account's sessions and revoking them one by one, which is only as
+  complete as the listing: a store whose listing refuses past a cap failed
+  every reset of an account over it with nothing revoked, and one that lists
+  from an eventually consistent index could miss a session opened just before
+  the reset. The contract is the effect — every session the account held when
+  the call began is revoked — so a store may page with no cap or record a
+  per-account revocation time. `MemorySessionStore` does not need it: its
+  listing is complete.
 
 ### Security
 - **The public credential routes refuse a body over 16 KiB, before anything

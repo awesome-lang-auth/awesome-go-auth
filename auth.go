@@ -297,8 +297,9 @@ func WithIssueSessionOnRegister(enabled bool) Option {
 // sessions alive. On, refresh tokens are refused at once and access tokens
 // already issued live out AccessTokenTTL unless SessionCheckOn is "allcalls";
 // a revocation the store refuses fails the reset with the generic 500. The
-// session store must implement SessionAdminStore, or New refuses the option.
-// See Config.RevokeSessionsOnPasswordReset.
+// session store must implement UserSessionRevoker or SessionAdminStore, or New
+// refuses the option. A step-up token minted before the reset still completes
+// its challenge for TempTokenTTL. See Config.RevokeSessionsOnPasswordReset.
 func WithRevokeSessionsOnPasswordReset(enabled bool) Option {
 	return func(b *authBuilder) error {
 		b.cfg.RevokeSessionsOnPasswordReset = enabled

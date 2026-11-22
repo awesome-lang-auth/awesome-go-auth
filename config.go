@@ -164,11 +164,12 @@ type Config struct {
 	IssueSessionOnRegister bool
 	// RevokeSessionsOnPasswordReset decides whether a successful POST
 	// <prefix>/reset-password — and Service.ResetPassword — also ends every
-	// session the account holds: when true, once the new password is stored,
-	// each session the SessionStore lists for the account
-	// (SessionAdminStore.ListSessionsForUser, under the account's tenant)
-	// that is neither revoked nor expired is revoked
-	// (SessionAdminStore.RevokeSessionByID), before the token is cleared.
+	// session the account holds: when true, once the new password is stored
+	// and before the token is cleared, the session store revokes them — in one
+	// call when it implements UserSessionRevoker, and otherwise by listing the
+	// account's sessions under its tenant (SessionAdminStore.ListSessionsForUser)
+	// and revoking each one that is neither revoked nor expired
+	// (SessionAdminStore.RevokeSessionByID).
 	//
 	// What that ends, and when:
 	//
@@ -183,6 +184,14 @@ type Config struct {
 	//   - The reset itself opens no session, either way; the person signs in
 	//     with the new password.
 	//
+	// What it does not end: a step-up token — the tempToken of a 2FA
+	// challenge — minted before the reset. Whoever passed the password step
+	// shortly before the reset and holds the second factor can still complete
+	// that challenge for TempTokenTTL (5 minutes by default) and get a session
+	// the reset never saw; a shorter TempTokenTTL narrows the window. An
+	// enrolment token (EnrolOnLogin) is bound to the password it was minted
+	// under, and stops working at the reset.
+	//
 	// A revocation the store refuses fails the reset: the generic 500, with a
 	// line through Config.Logger naming the user and the store's error. The
 	// password has been changed by then and the sessions the store did revoke
@@ -192,9 +201,15 @@ type Config struct {
 	// reset and the revocation again; a store that consumes it at lookup needs
 	// a new link, which does the same.
 	//
-	// The option needs a session store that implements SessionAdminStore, and
-	// NewService refuses it on one that does not, rather than accept a promise
-	// it could not keep. MemorySessionStore implements it.
+	// The option needs a session store that implements UserSessionRevoker or
+	// SessionAdminStore, and NewService refuses it on one that implements
+	// neither, rather than accept a promise it could not keep.
+	// MemorySessionStore implements SessionAdminStore. The listing path is
+	// exactly as complete as the listing: a store whose listing refuses past a
+	// cap fails every reset of an account over it with nothing revoked, and
+	// one that lists from an eventually consistent index can miss a session
+	// opened just before the reset. Such a store implements UserSessionRevoker,
+	// whose contract is that every session is revoked.
 	//
 	// False — the zero value, and what DefaultConfig leaves — is the
 	// reference's answer: a reset leaves every session alive (registered as

@@ -474,8 +474,9 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"`SessionCheckOn` is `allcalls`, under which it is refused at once with the same " +
 					"code. The answer is the same `200`, and the reset opens no session. A revocation " +
 					"the session store refuses fails the reset with the generic `500`, the password " +
-					"already changed, and `NewService` refuses the option on a session store without " +
-					"`SessionAdminStore`.",
+					"already changed, and `NewService` refuses the option on a session store that " +
+					"implements neither `SessionAdminStore` nor `UserSessionRevoker`, the one-call " +
+					"revocation it prefers.",
 				Reference: "Sets the password and clears the token and nothing else: no session is " +
 					"revoked and no cookie cleared, so every refresh token issued before the reset keeps " +
 					"working.",

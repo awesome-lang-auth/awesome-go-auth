@@ -312,8 +312,9 @@ func TestResetPasswordRevocationErrorsAreOpaque(t *testing.T) {
 }
 
 // TestRevokeSessionsOnPasswordResetNeedsASessionAdminStore: the option is
-// refused at construction on a session store that cannot list an account's
-// sessions, rather than accepted and silently left undone.
+// refused at construction on a session store that can neither list an
+// account's sessions (SessionAdminStore) nor revoke them in one call
+// (UserSessionRevoker), rather than accepted and silently left undone.
 func TestRevokeSessionsOnPasswordResetNeedsASessionAdminStore(t *testing.T) {
 	cfg := testConfig("resetsessions123456789012345678901")
 	cfg.RevokeSessionsOnPasswordReset = true
@@ -334,5 +335,215 @@ func TestRevokeSessionsOnPasswordResetNeedsASessionAdminStore(t *testing.T) {
 	}
 	if !a.Service().cfg.RevokeSessionsOnPasswordReset {
 		t.Error("WithRevokeSessionsOnPasswordReset(true) did not set the field")
+	}
+}
+
+// failingListing is a session store whose listing fails, as one that refuses
+// past a cap does (awesome-lambda-auth's DynamoDB store answers
+// ErrResultTooLarge past its per-user maximum, revoked sessions counted).
+type failingListing struct{ *recordingSessionStore }
+
+var errListingTooLarge = errors.New("session listing: result set exceeds the configured cap")
+
+func (failingListing) ListSessionsForUser(context.Context, string, string) ([]Session, error) {
+	return nil, errListingTooLarge
+}
+
+// TestResetPasswordFailsWhenTheListingFails: on the listing path a listing
+// that fails revokes nothing, so the reset answers the generic 500 — the
+// password changed, which the log line says, naming the user — and leaves the
+// token, so that on a store that keeps it the same link completes the reset
+// once the listing works again.
+func TestResetPasswordFailsWhenTheListingFails(t *testing.T) {
+	cfg := testConfig("resetsessions123456789012345678901")
+	cfg.RevokeSessionsOnPasswordReset = true
+	var logged []string
+	cfg.Logger = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	inner := &recordingSessionStore{MemorySessionStore: NewMemorySessionStore(), refuse: map[string]error{}}
+	svc, err := NewService(cfg, NewMemoryUserStore(), failingListing{inner})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	ctx := context.Background()
+	user, tokens := registerUser(t, svc, "overcap@example.com", "t1")
+	token := mintResetToken(t, svc, "overcap@example.com")
+
+	err = svc.ResetPassword(ctx, ResetPasswordInput{Token: token, NewPassword: "newpassword1"})
+	if err == nil {
+		t.Fatal("a reset whose listing failed reported success")
+	}
+	if got := ResetPasswordHTTPError(err); got != HTTPErrInternal {
+		t.Errorf("wire answer = %+v, want the generic 500", got)
+	}
+	if got := inner.asked(); len(got) != 0 {
+		t.Errorf("RevokeSessionByID was asked about %q with no listing", got)
+	}
+	if _, err := svc.Refresh(ctx, tokens.RefreshToken); err != nil {
+		t.Errorf("precondition: with nothing listed the session still works, got %v", err)
+	}
+	login(t, svc, "overcap@example.com", "newpassword1") // the password did change
+	var line string
+	for _, l := range logged {
+		if strings.Contains(l, "could not be listed") {
+			line = l
+		}
+	}
+	if line == "" || !strings.Contains(line, user.ID) || !strings.Contains(line, errListingTooLarge.Error()) {
+		t.Errorf("log lines = %q, want one naming the user and the listing's error", logged)
+	}
+	if storedUser(t, svc, user.ID).ResetTokenHash != hashToken(token) {
+		t.Error("the token was cleared by a reset that failed")
+	}
+}
+
+// bulkRevokingStore is a recordingSessionStore that also implements
+// UserSessionRevoker, recording its calls, and notes whether the listing was
+// read at all.
+type bulkRevokingStore struct {
+	*recordingSessionStore
+	mu      sync.Mutex
+	calls   []string
+	listed  bool
+	bulkErr error
+}
+
+func (s *bulkRevokingStore) RevokeSessionsForUser(ctx context.Context, userID, tenantID string) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, userID+"/"+tenantID)
+	bulkErr := s.bulkErr
+	s.mu.Unlock()
+	if bulkErr != nil {
+		return bulkErr
+	}
+	return revokeAllInMemory(ctx, s.MemorySessionStore, userID, tenantID)
+}
+
+func (s *bulkRevokingStore) ListSessionsForUser(ctx context.Context, userID, tenantID string) ([]Session, error) {
+	s.mu.Lock()
+	s.listed = true
+	s.mu.Unlock()
+	return s.recordingSessionStore.ListSessionsForUser(ctx, userID, tenantID)
+}
+
+// revokeAllInMemory is a RevokeSessionsForUser over a MemorySessionStore,
+// for the test stores below.
+func revokeAllInMemory(ctx context.Context, store *MemorySessionStore, userID, tenantID string) error {
+	sessions, err := store.ListSessionsForUser(ctx, userID, tenantID)
+	if err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		if session.RevokedAt == nil {
+			if err := store.RevokeSessionByID(ctx, session.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func newBulkService(t *testing.T, store SessionStore, logged *[]string) *Service {
+	t.Helper()
+	cfg := testConfig("resetsessions123456789012345678901")
+	cfg.RevokeSessionsOnPasswordReset = true
+	cfg.Logger = func(format string, args ...any) { *logged = append(*logged, fmt.Sprintf(format, args...)) }
+	svc, err := NewService(cfg, NewMemoryUserStore(), store)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	return svc
+}
+
+// TestResetPasswordPrefersTheBulkRevocation: a store that implements
+// UserSessionRevoker is asked once, for the account and its tenant, and the
+// listing path is not taken — not the listing, not a revocation by id.
+func TestResetPasswordPrefersTheBulkRevocation(t *testing.T) {
+	store := &bulkRevokingStore{recordingSessionStore: &recordingSessionStore{MemorySessionStore: NewMemorySessionStore(), refuse: map[string]error{}}}
+	var logged []string
+	svc := newBulkService(t, store, &logged)
+	ctx := context.Background()
+	user, first := registerUser(t, svc, "bulk@example.com", "t1")
+	second := login(t, svc, "bulk@example.com", "password1")
+	_, bystander := registerUser(t, svc, "bystander@example.com", "t1")
+	token := mintResetToken(t, svc, "bulk@example.com")
+
+	if err := svc.ResetPassword(ctx, ResetPasswordInput{Token: token, NewPassword: "newpassword1"}); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if want := user.ID + "/t1"; len(store.calls) != 1 || store.calls[0] != want {
+		t.Errorf("RevokeSessionsForUser calls = %q, want exactly [%q]", store.calls, want)
+	}
+	if store.listed || len(store.asked()) != 0 {
+		t.Errorf("the listing path ran too: listed %v, revoked by id %q", store.listed, store.asked())
+	}
+	for name, tokens := range map[string]AuthTokens{"the registration's": first, "a later login's": second} {
+		if _, err := svc.Refresh(ctx, tokens.RefreshToken); !errors.Is(err, ErrSessionRevoked) {
+			t.Errorf("refresh with %s session after the reset: err = %v, want ErrSessionRevoked", name, err)
+		}
+	}
+	if _, err := svc.Refresh(ctx, bystander.RefreshToken); err != nil {
+		t.Errorf("another account's session was touched: %v", err)
+	}
+}
+
+// TestResetPasswordFailsWhenTheBulkRevocationFails: the bulk call failing is a
+// reset that may have left a session working, answered as the listing path
+// answers it — the generic 500, a log line naming the user, the token kept.
+func TestResetPasswordFailsWhenTheBulkRevocationFails(t *testing.T) {
+	store := &bulkRevokingStore{
+		recordingSessionStore: &recordingSessionStore{MemorySessionStore: NewMemorySessionStore(), refuse: map[string]error{}},
+		bulkErr:               fmt.Errorf("store: %w", ErrInvalidToken), // a sentinel must not leak into the answer
+	}
+	var logged []string
+	svc := newBulkService(t, store, &logged)
+	user, _ := registerUser(t, svc, "bulkfail@example.com", "t1")
+	token := mintResetToken(t, svc, "bulkfail@example.com")
+
+	err := svc.ResetPassword(context.Background(), ResetPasswordInput{Token: token, NewPassword: "newpassword1"})
+	if err == nil {
+		t.Fatal("a reset whose bulk revocation failed reported success")
+	}
+	if got := ResetPasswordHTTPError(err); got != HTTPErrInternal {
+		t.Errorf("wire answer = %+v, want the generic 500", got)
+	}
+	var line string
+	for _, l := range logged {
+		if strings.Contains(l, "could not be revoked") {
+			line = l
+		}
+	}
+	if line == "" || !strings.Contains(line, user.ID) {
+		t.Errorf("log lines = %q, want one naming the user", logged)
+	}
+	if storedUser(t, svc, user.ID).ResetTokenHash != hashToken(token) {
+		t.Error("the token was cleared by a reset that failed")
+	}
+}
+
+// bulkOnlySessionStore implements SessionStore and UserSessionRevoker and
+// nothing else: no listing, no revocation by id.
+type bulkOnlySessionStore struct {
+	SessionStore
+	inner *MemorySessionStore
+}
+
+func (s bulkOnlySessionStore) RevokeSessionsForUser(ctx context.Context, userID, tenantID string) error {
+	return revokeAllInMemory(ctx, s.inner, userID, tenantID)
+}
+
+// TestRevokeSessionsOnPasswordResetAcceptsABulkRevoker: a session store with
+// UserSessionRevoker and no SessionAdminStore is enough for the option, and
+// the reset revokes through it.
+func TestRevokeSessionsOnPasswordResetAcceptsABulkRevoker(t *testing.T) {
+	inner := NewMemorySessionStore()
+	var logged []string
+	svc := newBulkService(t, bulkOnlySessionStore{SessionStore: inner, inner: inner}, &logged)
+	_, tokens := registerUser(t, svc, "bulkonly@example.com", "t1")
+	token := mintResetToken(t, svc, "bulkonly@example.com")
+	if err := svc.ResetPassword(context.Background(), ResetPasswordInput{Token: token, NewPassword: "newpassword1"}); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if _, err := svc.Refresh(context.Background(), tokens.RefreshToken); !errors.Is(err, ErrSessionRevoked) {
+		t.Errorf("refresh after the reset: err = %v, want ErrSessionRevoked", err)
 	}
 }

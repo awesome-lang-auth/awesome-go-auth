@@ -576,7 +576,9 @@ nothing, and that stays the default.
 | `false` — the default, and the reference's answer | stay alive |
 | `true` | revoked, once the new password is stored and before the token is cleared |
 
-With it on, the service lists the account's sessions under its tenant
+With it on, the session store revokes the account's sessions: in one call when
+it implements `UserSessionRevoker` (`RevokeSessionsForUser`), and otherwise the
+service lists the account's sessions under its tenant
 (`SessionAdminStore.ListSessionsForUser`) and revokes each one that is neither
 revoked nor expired (`SessionAdminStore.RevokeSessionByID`). What that ends:
 
@@ -592,6 +594,14 @@ revoked nor expired (`SessionAdminStore.RevokeSessionByID`). What that ends:
 The reset itself opens no session either way; the person signs in with the new
 password. Another account's sessions are never touched.
 
+What it does not end: **a step-up token minted before the reset.** The
+`tempToken` of a 2FA challenge is not a session, so whoever passed the password
+step shortly before the reset and holds the second factor can still complete the
+challenge for `TempTokenTTL` (5 minutes by default) and get a session the reset
+never saw. A shorter `TempTokenTTL` narrows that window. An enrolment token
+(`EnrolOnLogin`) is bound to the password it was minted under and stops working
+at the reset.
+
 **A revocation that fails fails the reset**, with the generic `500` and a line
 through `Config.Logger` naming the user and the store's error. By then the
 password has changed and the sessions the store did revoke stay revoked, but a
@@ -600,12 +610,20 @@ left as it is: with a store that keeps it until it is cleared, as
 `MemoryUserStore` does, the same link runs the reset and the revocation again;
 with one that consumes it when it is looked up, a new link does.
 
-The session store must implement `SessionAdminStore` (`MemorySessionStore`
-does): `NewService`, and so `New`, refuses the option on one that does not,
-rather than accept a promise it could not keep. A store whose listing is
-eventually consistent may miss a session opened in the moment before the reset;
-none can be opened with the old password after it. `WithRevokeSessionsOnPasswordReset(true)`
-turns it on. Registered as the deviation `reset-password-can-revoke-sessions`.
+The session store must implement `UserSessionRevoker` or `SessionAdminStore`
+(`MemorySessionStore` implements the second): `NewService`, and so `New`,
+refuses the option on one that implements neither, rather than accept a promise
+it could not keep. **The listing path is exactly as complete as the listing.** A
+store whose listing refuses past a cap fails every reset of an account over it,
+with nothing revoked; one that lists from an eventually consistent index can
+miss a session opened in the moment before the reset (none can be opened with
+the old password after it). Such a store implements `UserSessionRevoker`, whose
+contract is the effect — every session the account held when the call began is
+revoked, its refresh token refused and a lookup by id reporting it revoked —
+however the store gets there: paging through every session with no cap, or
+recording a time before which every session of the account counts as revoked.
+`WithRevokeSessionsOnPasswordReset(true)` turns it on. Registered as the
+deviation `reset-password-can-revoke-sessions`.
 
 ### `TwoFactorAppName` and the TOTP parameters
 
@@ -1153,6 +1171,7 @@ type SessionStore interface {
 | `EmailVerificationStore` | `UpdateEmailVerificationToken`, `GetUserByEmailVerificationTokenHash`, `MarkEmailVerified`, `ClearEmailVerificationToken` | SendVerificationEmailToken, VerifyEmail |
 | `EmailChangeStore` | `UpdateEmailChangeToken`, `GetUserByEmailChangeTokenHash`, `ApplyEmailChange`, `ClearEmailChangeToken` | RequestEmailChange, ConfirmEmailChange |
 | `SessionAdminStore` | `ListSessionsForUser`, `RevokeSessionByID`, `DeleteExpiredSessions` | ListSessions, RevokeSessionByID, CleanupExpiredSessions |
+| `UserSessionRevoker` | `RevokeSessionsForUser` | ResetPassword under `RevokeSessionsOnPasswordReset`, in preference to listing — see [RevokeSessionsOnPasswordReset](#revokesessionsonpasswordreset) |
 | `UserMetadataStore` | `GetMetadata`, `UpdateMetadata`, `ClearMetadata` | GetMetadata, UpdateMetadata |
 | `RolesPermissionsStore` | `AddRoleToUser`, `RemoveRoleFromUser`, `GetRolesForUser`, `CreateRole`, `DeleteRole`, `AddPermissionToRole`, `RemovePermissionFromRole`, `GetPermissionsForRole`, `GetPermissionsForUser`, `UserHasPermission` | CreateRole, AssignRole, UserHasPermission |
 | `TenantStore` | `CreateTenant`, `GetTenantByID`, `GetAllTenants`, `UpdateTenant`, `DeleteTenant`, `AssociateUserWithTenant`, `DisassociateUserFromTenant`, `GetTenantsForUser`, `GetUsersForTenant` | CreateTenant, AddUserToTenant |

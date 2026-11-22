@@ -180,6 +180,30 @@ type SessionAdminStore interface {
 	DeleteExpiredSessions(ctx context.Context, now time.Time) (int, error)
 }
 
+// UserSessionRevoker is an optional extension of a SessionStore: one call that
+// revokes every session an account holds. Under
+// Config.RevokeSessionsOnPasswordReset, Service.ResetPassword prefers it to
+// listing the account's sessions (SessionAdminStore.ListSessionsForUser) and
+// revoking them one by one, because that is only as complete as the listing.
+//
+// The contract is the effect, not the means: once RevokeSessionsForUser has
+// returned nil, every session userID held under tenantID when the call began
+// is revoked — its refresh token is refused with ErrSessionRevoked, and a
+// lookup by id reports it revoked — however many there were. A store whose
+// listing is capped or paged, or is read from an eventually consistent index,
+// implements it so that the reset is complete for it: by paging through every
+// session with no cap, or by recording a time before which every session of
+// the account counts as revoked and honouring it wherever a session is read.
+// A session already revoked may keep its earlier revocation. An error means
+// some session may still work, and the reset answers it with the generic 500,
+// as it does a listing that fails.
+//
+// MemorySessionStore does not implement it: its listing is complete and
+// consistent, so the listing path is already exact there.
+type UserSessionRevoker interface {
+	RevokeSessionsForUser(ctx context.Context, userID, tenantID string) error
+}
+
 // UserMetadataStore manages arbitrary key/value user metadata.
 type UserMetadataStore interface {
 	GetMetadata(ctx context.Context, userID string) (map[string]any, error)
