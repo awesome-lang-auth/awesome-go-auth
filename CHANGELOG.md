@@ -115,10 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included. The answers are unchanged — the stand-in comparison's result is
   never read — and so is the API. What stays uneven: a configured
   `PasswordVerifier` adds its own latency to the accounts it is consulted for,
-  as before, and a hash written before `BcryptCost` was raised compares at its
-  own, lower cost. The CPU an unknown address costs is now what a known one
-  always cost, which `HTTPConfig.RateLimiter` bounds alike. See
-  README_DETAILED, "Login cost".
+  as before; a hash written before `BcryptCost` was raised compares at its
+  own, lower cost; and on `POST <admin>/login` the configured root user's
+  address, when a store account holds it too, costs a wrong password two
+  comparisons, because the store account is still tried after the root as in
+  the reference. What it costs: every refused login, an unknown address's
+  included, now runs a full key derivation, and a rate limiter keyed on the
+  address in the body does not bound that — every new address has a budget of
+  its own — so a deployment that limits per address only should add a
+  per-client limit in front of the login routes. See README_DETAILED, "Login
+  cost".
 
 ### Changed
 - **`POST <prefix>/forgot-password`, `/reset-password`, `/magic-link/send`,

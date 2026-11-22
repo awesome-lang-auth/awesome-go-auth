@@ -1280,6 +1280,13 @@ func (g *AdminGuard) shellHandler() http.Handler {
 // (Service.passwordMatches, spendPasswordComparison), exactly as
 // Service.loginPassword does for POST <prefix>/login, so the two login routes
 // of the library cost the same on every path.
+//
+// Every path but one: the root user's address when a store row holds it too.
+// A wrong password is then compared against the root's hash and, as the
+// reference does, against the row's, which costs two comparisons. Skipping the
+// row would cap the cost and stop that row from signing in with its own
+// password, a login the reference allows, so the second comparison stays and
+// the deployment is told to give the root an address no account holds.
 func (g *AdminGuard) adminLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Email    string `json:"email"`

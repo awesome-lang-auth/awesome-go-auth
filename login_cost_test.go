@@ -300,3 +300,57 @@ func TestAdminLoginRunsOneFullComparisonOnEveryPath(t *testing.T) {
 		})
 	}
 }
+
+// TestAdminLoginRootAddressHeldByAStoreAccount pins the one path of POST
+// <admin>/login that costs more than one comparison, and why it is kept: when
+// a store account holds the configured root user's address, a wrong password
+// is compared against the root's hash and then against the account's, as the
+// reference does — the account still signs in to the console with its own
+// password, which capping the route at one comparison would stop. The
+// deployment avoids the case by giving the root an address no account holds.
+func TestAdminLoginRootAddressHeldByAStoreAccount(t *testing.T) {
+	rootHash, err := hashPassword("root password 1", testBcryptCost)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	cases := []struct {
+		name, password string
+		status, cost   int
+	}{
+		{"a wrong password costs two comparisons", "x", http.StatusUnauthorized, 2},
+		{"the account's own password still signs in", "store password 1", http.StatusOK, 2},
+		{"the root's password signs in with one comparison", "root password 1", http.StatusOK, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLoginCostFixture(t)
+			a := &Auth{service: f.svc}
+			cfg := DefaultHTTPConfig()
+			cfg.Admin = AdminOptions{
+				Enabled:      true,
+				AccessPolicy: AdminIsAdminFlag(),
+				RootUser:     &AdminRootUser{Email: "root@example.com", PasswordHash: rootHash},
+			}
+			hash, err := hashPassword("store password 1", testBcryptCost)
+			if err != nil {
+				t.Fatalf("hash: %v", err)
+			}
+			if _, err := f.svc.users.CreateUser(context.Background(), User{ID: "adm_root_row", Email: "root@example.com", PasswordHash: hash}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			f.compared.reset()
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, cfg.AdminPath()+AdminLoginPath,
+				strings.NewReader(`{"email":"root@example.com","password":"`+tc.password+`"}`))
+			req.Header.Set("Content-Type", "application/json")
+			a.AdminGuard(cfg).adminLogin(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.status, rec.Body.String())
+			}
+			if got := f.compared.atCost(testBcryptCost); got != tc.cost {
+				t.Errorf("full-cost bcrypt comparisons = %d, want %d", got, tc.cost)
+			}
+		})
+	}
+}

@@ -842,9 +842,20 @@ What is not equalised, and why:
   unverified address under strict verification is
   `403 EMAIL_NOT_VERIFIED`: those differ in their body, not in their time, and
   only for whoever holds the password.
+- **On `POST <admin>/login`, the configured root user's address when a store
+  account holds it too.** A wrong password is compared against the root's hash
+  and then, as the reference does, against the store account's, so it costs two
+  comparisons where every other refusal costs one. Skipping the second would
+  stop that account from signing in to the console with its own password. Give
+  the root user an address no account holds.
 
-The equalisation costs CPU: an unknown address now costs a refused login what a
-known one always cost, so `HTTPConfig.RateLimiter` bounds both alike.
+The equalisation costs CPU: every refused login now costs a full comparison,
+an unknown address's included. A rate limiter keyed on the address in the body
+does not bound that, because every new address comes with a budget of its own:
+a spray of made-up addresses costs one key derivation each, at the deployment's
+`BcryptCost`, as fast as the requests arrive. Put a limit per client — in
+`HTTPConfig.RateLimiter`, a proxy or a firewall — in front of the login routes
+as well.
 
 ### `DefaultConfig(secret string) Config`
 
