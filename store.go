@@ -29,6 +29,12 @@ type UserAccountStore interface {
 type SessionStore interface {
 	CreateSession(ctx context.Context, session Session) (Session, error)
 	GetSessionByRefreshTokenHash(ctx context.Context, tokenHash string) (Session, error)
+	// UpdateSession writes a session back. Service.Refresh calls it with the
+	// copy it read, rotated, so a store should refuse — with ErrSessionRevoked —
+	// a write that would clear a revocation made since: otherwise a refresh in
+	// flight undoes a logout, an administrator's revocation or a password
+	// reset's. MemorySessionStore does; a store whose write is conditional on
+	// the session not being revoked does the same.
 	UpdateSession(ctx context.Context, session Session) error
 }
 

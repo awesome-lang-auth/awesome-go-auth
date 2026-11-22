@@ -244,6 +244,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellation, bounded by its deadline, as the change-password clear does
   (see Changed). A clear that fails still fails the reset, as before. A store
   that consumes the token when it is looked up was not exposed.
+- **`MemorySessionStore`: a refresh in flight no longer undoes a revocation.**
+  `Service.Refresh` reads the session, then writes it back rotated; a logout,
+  an administrator's revocation or a reset's that landed in between was
+  overwritten by the copy the refresh had read, and the session kept
+  refreshing. `UpdateSession` now refuses a write that would clear a
+  revocation, with `ErrSessionRevoked`, which the refresh answers as
+  `401 SESSION_REVOKED`. The `SessionStore.UpdateSession` doc asks the same
+  of every store.
 
 ## [0.15.0] - 2026-11-21
 
