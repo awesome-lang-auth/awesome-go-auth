@@ -96,6 +96,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not hide: the `500` of a failed store, which only a known address reaches,
   and the same time difference on `/magic-link/send` and `/sms/send`. Zero is
   off, as before; a negative value makes `New` fail.
+- **A refused password login costs one bcrypt comparison whatever the address
+  names.** `POST <prefix>/login` — `Service.Login` and `LoginWithChallenge`,
+  so the IdP's login form and the MCP `auth_login` tool too — ran bcrypt only
+  for an account with a stored hash: an address no account holds was refused
+  right after the lookup, and so was an account without a password (OAuth-only,
+  magic-link-only) or with a migration's marker in the hash column, which bcrypt
+  refuses before any key derivation. The difference is a whole key derivation,
+  tens of milliseconds at the default cost, so the answer's time said which
+  addresses have accounts, though its status and body did not. Each of those
+  paths now compares the password against a stand-in hash first, written at
+  `Config.BcryptCost` (`bcrypt.DefaultCost` when unset) and computed once per
+  `Service` on the first refusal that needs it — not at construction, so a cold
+  start does not pay for it, and that first refusal pays twice, once.
+  `POST <admin>/login` had the same shape, and its doc comment said closing it
+  on one route alone would only move the difference: it now runs one
+  comparison on every path too, the bootstrap secret's constant-time check
+  included. The answers are unchanged — the stand-in comparison's result is
+  never read — and so is the API. What stays uneven: a configured
+  `PasswordVerifier` adds its own latency to the accounts it is consulted for,
+  as before, and a hash written before `BcryptCost` was raised compares at its
+  own, lower cost. The CPU an unknown address costs is now what a known one
+  always cost, which `HTTPConfig.RateLimiter` bounds alike. See
+  README_DETAILED, "Login cost".
 
 ### Changed
 - **`POST <prefix>/forgot-password`, `/reset-password`, `/magic-link/send`,

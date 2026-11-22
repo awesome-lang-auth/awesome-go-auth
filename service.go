@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -24,6 +25,16 @@ type Service struct {
 	// It takes no context on purpose: the wait must not end when the client
 	// goes away. See Auth.ForgotPassword.
 	sleep func(d time.Duration)
+	// compareHash is the comparison the two password logins make —
+	// bcrypt.CompareHashAndPassword, held here so that a test can count the
+	// comparisons a login runs and read their cost off the hash it is handed.
+	// See passwordMatches.
+	compareHash func(hashedPassword, password []byte) error
+	// dummyHash is what passwordMatches compares against when there is no
+	// hash to compare: computed once, on first use, at the deployment's cost.
+	// See dummyPasswordHash.
+	dummyHashOnce sync.Once
+	dummyHash     []byte
 }
 
 type ServiceOption func(*Service)
@@ -49,11 +60,12 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 		return nil, errors.New("auth: stores are required")
 	}
 	svc := &Service{
-		cfg:      cfg,
-		users:    users,
-		sessions: sessions,
-		now:      time.Now,
-		sleep:    time.Sleep,
+		cfg:         cfg,
+		users:       users,
+		sessions:    sessions,
+		now:         time.Now,
+		sleep:       time.Sleep,
+		compareHash: bcrypt.CompareHashAndPassword,
 	}
 	for _, opt := range opts {
 		if opt != nil {

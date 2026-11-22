@@ -121,6 +121,11 @@ func (s *Service) loginPassword(ctx context.Context, in LoginInput) (User, bool,
 	in.Email = normalizeEmail(in.Email)
 	user, err := s.users.GetUserByEmail(ctx, in.Email, in.TenantID)
 	if err != nil {
+		// No account, so no hash: the password is still compared, against the
+		// stand-in, so that this refusal costs what a wrong password costs and
+		// the time it takes does not say the address is unknown. See
+		// passwordMatches.
+		s.spendPasswordComparison(in.Password)
 		return User{}, false, s.loginFailed(ctx, submitted, ErrInvalidCredentials)
 	}
 	// Config.PasswordVerifier, the migration seam, is consulted here and nowhere
@@ -130,8 +135,10 @@ func (s *Service) loginPassword(ctx context.Context, in LoginInput) (User, bool,
 	// store has never heard of is a different job from migrating one it has.
 	//
 	// Everything else does, and that is wider than the imported row the seam was
-	// built for. An empty stored hash is a non-match, not a match (verifyPassword
-	// of anything against "" is a bcrypt error), so every account that never had
+	// built for. An empty stored hash is a non-match, not a match
+	// (passwordMatches refuses anything against "", after a comparison against
+	// the stand-in hash so that the refusal costs what a wrong password costs),
+	// so every account that never had
 	// a password — OAuth-only, magic-link-only — reaches the hook as well, with
 	// whatever plaintext the request carried; the reference refuses those before
 	// it compares anything (local.strategy.ts:23-25). A verifier must therefore
@@ -143,7 +150,7 @@ func (s *Service) loginPassword(ctx context.Context, in LoginInput) (User, bool,
 	// the answer the line above always gave. See password_verifier.go for the
 	// whole seam, including why a failure here is a generic 500 rather than
 	// anything a client could tell apart.
-	if !verifyPassword(in.Password, user.PasswordHash) {
+	if !s.passwordMatches(in.Password, user.PasswordHash) {
 		user, err = s.verifyThroughPasswordVerifier(ctx, user, in.Password)
 		if err != nil {
 			return User{}, false, s.loginFailed(ctx, submitted, err)

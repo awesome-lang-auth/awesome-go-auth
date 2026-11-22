@@ -787,15 +787,15 @@ Two properties the tests pin:
   still stopped depending on the old system; migrating only on a login that
   completes would keep such an account calling it forever.
 
-And one statement of posture that **no test asserts**: timing. The seam adds no
-equalisation and removes none — the login path did not equalise before it (an
-address the store does not hold returns before any bcrypt work, a known one pays
-one bcrypt compare) and does not equalise now. But a configured verifier widens
-that pre-existing gap by its own latency: a known address whose hash does not
-verify now costs the bcrypt compare *plus* whatever the verifier does, which in
-the case this seam exists for is a call to the old provider. A signal that was
-milliseconds of key derivation becomes a network round trip. Equalising what is
-left is the verifier's job, not this library's.
+And one statement of posture that **no test asserts**: the verifier's timing.
+The login itself equalises its bcrypt work — every refused login runs one full
+comparison, an unknown address and an account with no usable hash against a
+stand-in hash (see [Login cost](#login-cost)) — but the seam sits outside that.
+A configured verifier adds its own latency to every account whose hash does not
+verify, and to no unknown address: a known address then costs the comparison
+*plus* whatever the verifier does, which in the case this seam exists for is a
+call to the old provider, a network round trip that says the address has an
+account. Equalising that is the verifier's job, not this library's.
 
 Two requirements on a verifier, then. The example above shows the first; the
 second is the host's to add around whatever call it makes:
@@ -808,6 +808,43 @@ second is the host's to add around whatever call it makes:
 - **Bound and rate-limit whatever call survives the marker.** The hook runs on
   the request goroutine, so a verifier that talks to the network must honour
   `ctx`, cap its own time, and cap how often it goes out.
+
+### Login cost
+
+A refused password login costs the same bcrypt work whatever the address names,
+so the time it takes does not tell an attacker which addresses have accounts.
+This holds on both password logins — `POST /auth/login` (`Service.Login` and
+`LoginWithChallenge`, which the IdP's login form and the MCP `auth_login` tool
+reach too) and the admin console's `POST <admin>/login`:
+
+| The request names | bcrypt work |
+|---|---|
+| an account, with a wrong or a right password | one comparison against its stored hash, at that hash's cost |
+| no account | one comparison against a stand-in hash |
+| an account whose stored value is not a bcrypt hash — `""` for an OAuth-only or magic-link-only account, or a migration's marker | one comparison against the stand-in hash, then `PasswordVerifier` if one is configured |
+| on `POST <admin>/login`: the bootstrap secret's names (`""`, `admin`) | one comparison against the stand-in hash beside the constant-time secret check |
+
+The stand-in hash is written at `Config.BcryptCost` (`bcrypt.DefaultCost` when
+it is unset), the cost every new hash is written at. It is computed once per
+`Service`, on the first refusal that needs it rather than at construction, so a
+cold start does not pay for it; that first refusal pays twice, once. The answers
+themselves are unchanged — the comparison's result is never read.
+
+What is not equalised, and why:
+
+- **A configured `PasswordVerifier`** adds its own latency to the accounts it is
+  consulted for and to no unknown address (see
+  [Password verifier](#password-verifier-migration-seam)).
+- **A hash written at an older cost** is compared at that cost, which differs
+  from the stand-in's until the password is set again: after raising
+  `BcryptCost`, accounts not yet re-hashed answer faster than unknown addresses.
+- **The answer for a right password** is a session or a challenge, and an
+  unverified address under strict verification is
+  `403 EMAIL_NOT_VERIFIED`: those differ in their body, not in their time, and
+  only for whoever holds the password.
+
+The equalisation costs CPU: an unknown address now costs a refused login what a
+known one always cost, so `HTTPConfig.RateLimiter` bounds both alike.
 
 ### `DefaultConfig(secret string) Config`
 
@@ -4246,6 +4283,7 @@ Internal helpers (unexported) available for use within the package:
 | `newID(prefix) (string, error)` | Generates `prefix_<32hex>` ID |
 | `hashPassword(password, cost) (string, error)` | bcrypt at `cost`; a zero cost means `DefaultCost` |
 | `verifyPassword(password, hash) bool` | bcrypt compare |
+| `(*Service).passwordMatches(password, hash) bool` | the logins' compare: one full bcrypt comparison whatever `hash` is, against a stand-in when bcrypt cannot parse it — see [Login cost](#login-cost) |
 | `hashToken(token) string` | SHA-256 hex |
 | `randomToken(byteLen) (string, error)` | Base64URL random bytes |
 | `randomNumericCode(length) (string, error)` | Cryptographic numeric code |
