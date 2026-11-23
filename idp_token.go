@@ -298,6 +298,16 @@ func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, cli
 		idp.logf("auth: idp: token: user %s: %v", meta.UserID, err)
 		return nil, tokenServerError()
 	}
+	// Under Config.RevokeSessionsOnPasswordReset a code is good only while the
+	// password the /authorize login proved is the account's
+	// (AuthCode.Credential), so a code minted before a revoking reset opens no
+	// session after it. One that carries no credential is refused as well —
+	// minted before the option was on, or kept by a store that drops the field —
+	// since nothing then says which password it was minted under.
+	if idp.authSvc.cfg.RevokeSessionsOnPasswordReset &&
+		!idp.authSvc.passwordFingerprintMatches(authCodeCredentialLabel, meta.Credential, user) {
+		return nil, idp.invalidGrant("the authorization code was minted under a password the account no longer has, or carries no credential")
+	}
 	// The session pair, HS256. Which pair /token returns is decision D-15 of
 	// the upstream plan and is not settled here; IssueIdPTokenPair exists for
 	// a host that wants the RS256 pair now. expires_in below is this pair's
@@ -309,6 +319,15 @@ func (idp *IDP) authorizationCodeGrant(ctx context.Context, r *http.Request, cli
 	// token below, which is redeemed here and not at <prefix>/refresh.
 	tokens, sessionID, err := idp.authSvc.issueSession(ctx, user)
 	if err != nil {
+		return nil, tokenServerError()
+	}
+	// A revoking reset that landed between the read above and the session
+	// would not have seen this session, so the account is read again now that
+	// it exists (keepPasswordSession, under the option only).
+	if err := idp.authSvc.keepPasswordSession(ctx, user, sessionID); err != nil {
+		if errors.Is(err, ErrInvalidCredentials) {
+			return nil, idp.invalidGrant("the account's password changed, or the account went, while the code was being redeemed")
+		}
 		return nil, tokenServerError()
 	}
 	idTok, err := idp.buildIDToken(user, client.ClientID, meta.Nonce)

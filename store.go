@@ -29,6 +29,12 @@ type UserAccountStore interface {
 type SessionStore interface {
 	CreateSession(ctx context.Context, session Session) (Session, error)
 	GetSessionByRefreshTokenHash(ctx context.Context, tokenHash string) (Session, error)
+	// UpdateSession writes a session back. Service.Refresh calls it with the
+	// copy it read, rotated, so a store should refuse — with ErrSessionRevoked —
+	// a write that would clear a revocation made since: otherwise a refresh in
+	// flight undoes a logout, an administrator's revocation or a password
+	// reset's. MemorySessionStore does; a store whose write is conditional on
+	// the session not being revoked does the same.
 	UpdateSession(ctx context.Context, session Session) error
 }
 
@@ -172,6 +178,43 @@ type SessionAdminStore interface {
 	ListSessionsForUser(ctx context.Context, userID, tenantID string) ([]Session, error)
 	RevokeSessionByID(ctx context.Context, sessionID string) error
 	DeleteExpiredSessions(ctx context.Context, now time.Time) (int, error)
+}
+
+// UserSessionRevoker is an optional extension of a SessionStore: one call that
+// revokes every session an account holds. Under
+// Config.RevokeSessionsOnPasswordReset, Service.ResetPassword prefers it to
+// listing the account's sessions (SessionAdminStore.ListSessionsForUser) and
+// revoking them one by one, because that is only as complete as the listing.
+//
+// The contract is the effect, not the means: once RevokeSessionsForUser has
+// returned nil, every session of userID under tenantID whose CreateSession had
+// returned when the call began is revoked — its refresh token is refused with
+// ErrSessionRevoked, and a lookup by id reports it revoked — however many
+// there were. A session created after the call began is not the store's to
+// catch: the reset has written the new password before it calls, and a
+// password login reads the account again once its session exists, so one
+// that proved the old password finds the new one and gives its session up
+// (see Config.RevokeSessionsOnPasswordReset).
+//
+// A store whose listing is capped or paged, or is read from an eventually
+// consistent index, implements it so that the reset is complete for it: by
+// paging through every session with no cap, or by recording a time before
+// which every session of the account counts as revoked and honouring it
+// wherever a session is read. Such a time has to order sessions as their
+// creation did. Session.CreatedAt is stamped by the service's clock before
+// CreateSession is called, so a revocation time read from another clock is
+// exact only as far as the two agree: a host clock running ahead lets a
+// session created just before the call count as created after it, and that
+// session was opened before the password write, where the login's second read
+// cannot see it. A store that orders both by a clock or a counter of its own
+// is not exposed to that. A session already revoked may keep its earlier
+// revocation. An error means some session may still work, and the reset
+// answers it with the generic 500, as it does a listing that fails.
+//
+// MemorySessionStore does not implement it: its listing is complete and
+// consistent, so the listing path is already exact there.
+type UserSessionRevoker interface {
+	RevokeSessionsForUser(ctx context.Context, userID, tenantID string) error
 }
 
 // UserMetadataStore manages arbitrary key/value user metadata.
@@ -477,6 +520,16 @@ type AuthCode struct {
 	CodeChallengeMethod string
 	Scope               string
 	ExpiresAt           time.Time
+	// Credential binds the code to the password the /authorize login proved,
+	// under Config.RevokeSessionsOnPasswordReset: an HMAC under Config.Secret
+	// of the account's stored password hash, which reveals nothing about the
+	// hash. /token refuses the code (invalid_grant) when the account's
+	// password has changed since — so a code minted before a revoking reset
+	// opens no session after it — and when Credential is empty. It is empty
+	// with the option off, and /token then reads nothing of it. A store keeps
+	// it as it keeps the other fields: one that drops it makes every code
+	// redeemed under the option fail.
+	Credential string
 }
 
 // AuthCodeStore persists OIDC authorization codes for the IDP.

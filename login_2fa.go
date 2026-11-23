@@ -234,7 +234,7 @@ func (s *Service) LoginWithChallenge(ctx context.Context, in LoginInput) (LoginR
 		}
 		return LoginResult{User: user, Challenge: challenge}, nil
 	}
-	tokens, err := s.completeLocalLogin(ctx, user)
+	tokens, err := s.completeLocalLogin(ctx, user, &in)
 	if err != nil {
 		return zero, err
 	}

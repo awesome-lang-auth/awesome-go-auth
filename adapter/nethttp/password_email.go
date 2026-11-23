@@ -101,8 +101,11 @@ func (a *Adapter) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		auth.WriteHTTPError(w, auth.ResetPasswordHTTPError(err))
 		return
 	}
-	// No session is revoked and no cookie is cleared, exactly as in the
-	// reference: a password reset leaves existing sessions alive.
+	// No cookie is cleared and, by default, no session is revoked, exactly as
+	// in the reference: a password reset leaves existing sessions alive. With
+	// auth.Config.RevokeSessionsOnPasswordReset the service has revoked the
+	// account's sessions before answering, and their refresh tokens get
+	// SESSION_REVOKED from here on.
 	auth.WriteSuccess(w, http.StatusOK, nil)
 }
 

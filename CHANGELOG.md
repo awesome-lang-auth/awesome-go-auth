@@ -26,6 +26,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the built-in `it` and `en` keeps them. Entries that are not language tags
   make `New` fail. The normalisation happens where each delivery is built, so
   it holds for the four adapters and for a direct caller of the service alike.
+- **A password reset can end the account's sessions, behind
+  `Config.RevokeSessionsOnPasswordReset` (`WithRevokeSessionsOnPasswordReset(true)`),
+  off by default.** Off, `POST <prefix>/reset-password` stays the reference's
+  answer: the password changes and every session opened before stays alive,
+  so a reset after a leak ended nothing the leak had opened. On, once the new
+  password is stored and before the token is cleared, `Service.ResetPassword`
+  revokes every session the account holds under its tenant that is neither
+  revoked nor expired, through `SessionAdminStore` (`ListSessionsForUser`,
+  `RevokeSessionByID`); one the store no longer has is skipped. Refresh tokens
+  of those sessions then answer `401 SESSION_REVOKED`, and the OIDC grants that
+  end with their session end with them. Access tokens already issued stay valid
+  until they expire (`AccessTokenTTL`, 15 minutes by default) under
+  `SessionCheckOn` `refresh` or `none`; under `allcalls` they are refused at
+  once. The answer is the same `200` and the reset still opens no session.
+  **A revocation the store refuses fails the reset** with the generic `500` and
+  a `Config.Logger` line naming the user: the password has changed by then, but
+  a `200` would tell the person that a session still usable was gone. The others
+  are revoked all the same, and the token is left as it is, so on a store that
+  keeps it until it is cleared (`MemoryUserStore`) the same link completes the
+  revocation; a store that consumes it at lookup needs a new link. The store's
+  error is formatted, not wrapped, so no session store can turn the answer into
+  `400 Invalid reset token` for a reset that has changed the password.
+  `NewService` (and so `New`) refuses the option on a session store that
+  implements neither `SessionAdminStore` nor `UserSessionRevoker`. The
+  revocation runs without the caller's cancellation, bounded by its deadline,
+  so a client that goes away after the password write cannot stop it.
+  Registered as the deviation `reset-password-can-revoke-sessions`.
+  The option also ends what the old password opens that the revocation cannot
+  find:
+  - **a password login in flight across the reset.** Every login that opens a
+    session on the strength of the password (`Service.Login`,
+    `LoginWithChallenge` — `POST <prefix>/login` and the IdP's `/authorize`
+    form — the IdP's `/token`, and the forced enrolment of `EnrolOnLogin`)
+    reads the account again once its session exists, and if the stored hash
+    is no longer the one it proved, gives the session up and is refused: as a
+    wrong password at login (`identity.auth.login.failed`, no
+    `identity.auth.login.success`), `invalid_grant` at `/token`,
+    `ErrInvalidToken` at the enrolment. A session opened before the
+    revocation began is revoked by it; one opened after it belongs to a login
+    that sees the new password.
+  - **an OIDC authorization code minted before the reset**, through
+    `AuthCode.Credential` (below): `/token` refuses it with `invalid_grant`.
+  - **a console token from `POST <admin>/login`** for a store account, which
+    lived 24 hours with no session behind it: under the option it carries a
+    `cred` claim, the fingerprint of the password its login proved, and the
+    admin guard refuses it once the password is another (`401`, or the login
+    form for a browser).
+
+  Not ended by it: a step-up token minted before the reset, which still
+  completes its challenge for `TempTokenTTL` (5 minutes by default) for
+  whoever holds the second factor; and an access token on the admin console,
+  which accepts one without reading its session under every `SessionCheckOn`,
+  `allcalls` included, until it expires (`AccessTokenTTL`). Nor a login whose
+  own `PasswordVerifier` migration write lands after the reset's: with or
+  without the option, that write replaces the new password with the old one,
+  and the login keeps its session; the person resets again. An enrolment token
+  is bound to the password and stops working. The option rests on
+  `GetUserByID` seeing a password write that has returned, on a revocation
+  that reaches every session whose creation had returned when it began, and
+  on an `AuthCodeStore` that keeps `AuthCode.Credential`. Turning it on
+  refuses, once, the authorization codes and store-account console tokens
+  minted before it; and a password login is refused if the account's hash
+  changes between its comparison and its session, whatever changed it.
+- **`UserSessionRevoker`, an optional session-store interface:
+  `RevokeSessionsForUser(ctx, userID, tenantID)` revokes every session an
+  account holds in one call.** The reset's revocation prefers it to listing
+  the account's sessions and revoking them one by one, which is only as
+  complete as the listing: a store whose listing refuses past a cap failed
+  every reset of an account over it with nothing revoked, and one that lists
+  from an eventually consistent index could miss a session opened just before
+  the reset. The contract is the effect — every session whose creation had
+  returned when the call began is revoked; one created later belongs to a
+  login that re-reads the account — so a store may page with no cap or record
+  a per-account revocation time, ordered as the sessions' creation was
+  (`Session.CreatedAt` comes from the service's clock). `MemorySessionStore`
+  does not need it: its listing is complete.
+- **`AuthCode.Credential`.** Under `RevokeSessionsOnPasswordReset`,
+  `/authorize` stores an HMAC under `Config.Secret` of the password hash its
+  login proved, and `/token` refuses a code whose credential is empty or no
+  longer the account's. An `AuthCodeStore` that maps fields one by one must
+  keep it before the option is turned on; with the option off it is empty and
+  never read.
 
 ### Security
 - **The public credential routes refuse a body over 16 KiB, before anything
@@ -219,6 +301,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellation, bounded by its deadline, as the change-password clear does
   (see Changed). A clear that fails still fails the reset, as before. A store
   that consumes the token when it is looked up was not exposed.
+- **`MemorySessionStore`: a refresh in flight no longer undoes a revocation.**
+  `Service.Refresh` reads the session, then writes it back rotated; a logout,
+  an administrator's revocation or a reset's that landed in between was
+  overwritten by the copy the refresh had read, and the session kept
+  refreshing. `UpdateSession` now refuses a write that would clear a
+  revocation, with `ErrSessionRevoked`, which the refresh answers as
+  `401 SESSION_REVOKED`. The `SessionStore.UpdateSession` doc asks the same
+  of every store.
 
 ## [0.15.0] - 2026-11-21
 

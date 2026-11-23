@@ -488,12 +488,20 @@ func (s *MemorySessionStore) GetSessionByID(_ context.Context, sessionID string)
 	return session, nil
 }
 
+// UpdateSession writes session over the stored one with the same id. It
+// refuses, with ErrSessionRevoked, a write that would clear a revocation:
+// Service.Refresh reads a session and writes it back rotated, and a logout, an
+// administrator's revocation or a password reset's that lands in between must
+// not be undone by the copy it read.
 func (s *MemorySessionStore) UpdateSession(_ context.Context, session Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, ok := s.byID[session.ID]
 	if !ok {
 		return ErrSessionNotFound
+	}
+	if current.RevokedAt != nil && session.RevokedAt == nil {
+		return ErrSessionRevoked
 	}
 	if current.RefreshTokenHash != session.RefreshTokenHash {
 		delete(s.byTokenHashed, current.RefreshTokenHash)

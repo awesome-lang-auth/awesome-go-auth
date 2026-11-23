@@ -162,7 +162,110 @@ type Config struct {
 	// answers the plain 201 and the account logs in through the login's own
 	// gates.
 	IssueSessionOnRegister bool
-	Require2FA             bool
+	// RevokeSessionsOnPasswordReset decides whether a successful POST
+	// <prefix>/reset-password — and Service.ResetPassword — also ends every
+	// session the account holds: when true, once the new password is stored
+	// and before the token is cleared, the session store revokes them — in one
+	// call when it implements UserSessionRevoker, and otherwise by listing the
+	// account's sessions under its tenant (SessionAdminStore.ListSessionsForUser)
+	// and revoking each one that is neither revoked nor expired
+	// (SessionAdminStore.RevokeSessionByID).
+	//
+	// What that ends, and when:
+	//
+	//   - A refresh token of those sessions is refused at once: POST
+	//     <prefix>/refresh answers 401 SESSION_REVOKED, on which the family's
+	//     browser clients log out.
+	//   - An access token already issued stays valid until it expires —
+	//     AccessTokenTTL, 15 minutes by default — under SessionCheckOn
+	//     "refresh" or "none", because those modes do not read the session on
+	//     a protected request. Under "allcalls" every protected request does,
+	//     and answers 401 SESSION_REVOKED at once.
+	//   - The reset itself opens no session, either way; the person signs in
+	//     with the new password.
+	//
+	// The option also ends what the old password opens that the revocation
+	// cannot find:
+	//
+	//   - A password login in flight: one that proved the old password before
+	//     the reset and opens its session after the revocation has looked. A
+	//     login that opens a session on the strength of the password —
+	//     Service.Login and LoginWithChallenge (POST <prefix>/login, and the
+	//     IDP's /authorize form), the IDP's /token, and the forced enrolment of
+	//     EnrolOnLogin — reads the account again once its session exists, and
+	//     if the stored password hash is no longer the one it proved, it gives
+	//     the session up and is refused: as a wrong password at login,
+	//     invalid_grant at /token, ErrInvalidToken at the enrolment.
+	//   - An OIDC authorization code minted before the reset: it carries the
+	//     fingerprint of the password its /authorize login proved
+	//     (AuthCode.Credential), and /token refuses it with invalid_grant once
+	//     the account's password is another.
+	//   - The console token POST <admin>/login mints for a store account: it
+	//     carries the same kind of fingerprint, and the admin guard, which
+	//     reads the account on every console request, refuses it once the
+	//     password is another, as it refuses an expired one.
+	//   - An enrolment token (EnrolOnLogin), which is bound to the password it
+	//     was minted under (its cred claim).
+	//
+	// What it does not end:
+	//
+	//   - A step-up token — the tempToken of a 2FA challenge — minted before
+	//     the reset. Whoever passed the password step shortly before the reset
+	//     and holds the second factor can still complete that challenge for
+	//     TempTokenTTL (5 minutes by default) and get a session the reset never
+	//     saw; a shorter TempTokenTTL narrows the window.
+	//   - An access token on the admin console. The console accepts an
+	//     ordinary access token whenever it verifies tokens with the secret
+	//     access tokens are signed with — AdminOptions.JWTSecret unset, which
+	//     falls back to Secret — and reads no session behind it, under every
+	//     SessionCheckOn, "allcalls" included; so one issued before the reset
+	//     opens the console until it expires (AccessTokenTTL).
+	//   - A login whose own PasswordVerifier migration write lands after the
+	//     reset's. With or without the option, that write replaces the new
+	//     password with the old one; the login, which reads back the hash it
+	//     wrote, keeps its session, and the person resets again.
+	//
+	// That much rests on what the stores keep. UserStore.GetUserByID returns
+	// the account's PasswordHash and sees a password write that has returned
+	// (a read from a lagging replica does not). The revocation reaches every
+	// session whose creation had returned when it began — UserSessionRevoker's
+	// contract, or a complete and consistent listing. An AuthCodeStore keeps
+	// AuthCode.Credential; one that drops it makes every code fail at /token.
+	//
+	// Turning the option on refuses, once, what was minted before it with
+	// nothing to check: an authorization code not yet redeemed, and a store
+	// account's console token, whose holder signs in again. And a password
+	// login is refused if the account's password hash changes in the moment
+	// between its comparison and its session, whatever changed it: a reset, a
+	// POST <prefix>/change-password, or a concurrent PasswordVerifier
+	// migration of the same account.
+	//
+	// A revocation the store refuses fails the reset: the generic 500, with a
+	// line through Config.Logger naming the user and the store's error. The
+	// password has been changed by then and the sessions the store did revoke
+	// stay revoked, but answering success would tell the person that a session
+	// still usable is gone. The token is left as it is: a store that keeps it
+	// until ClearResetToken, as MemoryUserStore does, lets the same link run the
+	// reset and the revocation again; a store that consumes it at lookup needs
+	// a new link, which does the same.
+	//
+	// The option needs a session store that implements UserSessionRevoker or
+	// SessionAdminStore, and NewService refuses it on one that implements
+	// neither, rather than accept a promise it could not keep.
+	// MemorySessionStore implements SessionAdminStore. The listing path is
+	// exactly as complete as the listing: a store whose listing refuses past a
+	// cap fails every reset of an account over it with nothing revoked, and
+	// one that lists from an eventually consistent index can miss a session
+	// opened just before the reset, which then lives on. Such a store
+	// implements UserSessionRevoker, whose contract is that every session
+	// whose creation had returned when the call began is revoked.
+	//
+	// False — the zero value, and what DefaultConfig leaves — is the
+	// reference's answer: a reset leaves every session alive (registered as
+	// reset-password-can-revoke-sessions). WithRevokeSessionsOnPasswordReset
+	// sets it.
+	RevokeSessionsOnPasswordReset bool
+	Require2FA                    bool
 	// EnrolOnLogin lets an account that must present a second factor and has
 	// none enrol one at login, and opens its session when it does: the
 	// tempToken of the 403 2FA_SETUP_REQUIRED answer POST <prefix>/login gives

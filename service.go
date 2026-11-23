@@ -59,6 +59,17 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 	if users == nil || sessions == nil {
 		return nil, errors.New("auth: stores are required")
 	}
+	// The option promises that a reset ends the account's sessions, and only a
+	// store that can revoke them all at once, or list them by user, can keep
+	// that promise. Refusing here is the alternative to a reset that answers
+	// success and revokes nothing.
+	if cfg.RevokeSessionsOnPasswordReset {
+		_, bulk := sessions.(UserSessionRevoker)
+		_, admin := sessions.(SessionAdminStore)
+		if !bulk && !admin {
+			return nil, errors.New("auth: RevokeSessionsOnPasswordReset needs a session store that implements UserSessionRevoker (RevokeSessionsForUser) or SessionAdminStore (ListSessionsForUser and RevokeSessionByID), and this one implements neither")
+		}
+	}
 	svc := &Service{
 		cfg:         cfg,
 		users:       users,
@@ -179,7 +190,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTok
 	}
 	// The login's own tail: the same session row and the same
 	// identity.auth.login.success with method "local" a password login raises.
-	tokens, err := s.completeLocalLogin(ctx, created)
+	tokens, err := s.completeLocalLogin(ctx, created, nil)
 	if err != nil {
 		return User{}, zeroTokens, err
 	}
@@ -230,7 +241,7 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (User, AuthTokens, e
 	if secondFactor {
 		return User{}, zeroTokens, ErrTwoFactorRequired
 	}
-	tokens, err := s.completeLocalLogin(ctx, user)
+	tokens, err := s.completeLocalLogin(ctx, user, &in)
 	if err != nil {
 		return User{}, zeroTokens, err
 	}
@@ -563,10 +574,23 @@ func (s *Service) newSessionTokens(ctx context.Context, user User) (AuthTokens, 
 // the publication lives in the tail they share. One helper rather than two
 // copies is what keeps the dev line's single site single: neither entry point
 // can drift from the other, and no caller can reach both and publish twice.
-func (s *Service) completeLocalLogin(ctx context.Context, user User) (AuthTokens, error) {
+//
+// login is the request of those two password logins. It is nil for Register
+// and an accepted invitation, which end the same way but have just set the
+// password rather than proven it. For a password login the session is kept
+// only once keepPasswordSession has found the proven password still the
+// account's, which it checks under Config.RevokeSessionsOnPasswordReset;
+// otherwise the login is refused as loginPassword refuses one — loginFailed,
+// with the address the request carried — and no success is raised.
+func (s *Service) completeLocalLogin(ctx context.Context, user User, login *LoginInput) (AuthTokens, error) {
 	tokens, sessionID, err := s.issueSession(ctx, user)
 	if err != nil {
 		return AuthTokens{}, err
+	}
+	if login != nil {
+		if err := s.keepPasswordSession(ctx, user, sessionID); err != nil {
+			return AuthTokens{}, s.loginFailed(ctx, login.Email, err)
+		}
 	}
 	s.publish(ctx, func() Event {
 		return Event{
@@ -577,6 +601,84 @@ func (s *Service) completeLocalLogin(ctx context.Context, user User) (AuthTokens
 		}
 	})
 	return tokens, nil
+}
+
+// keepPasswordSession decides, under Config.RevokeSessionsOnPasswordReset,
+// whether a session just opened on the strength of a password may be handed
+// out: only when the account, read again now that the session exists, still
+// holds the password hash the caller proved — proven.PasswordHash, the stored
+// hash the password verified against, or the one Config.PasswordVerifier's
+// migration wrote in its place.
+//
+// It is what closes a revoking reset to a login already in flight.
+// ResetPassword writes the new password and only then revokes the account's
+// sessions, and a password login reads the account, compares the password —
+// bcrypt, the slow step — and only then opens its session. A session opened
+// after the revocation had looked was never seen by it, but the login that
+// opened it reads the account here, after the password write, and finds the
+// new hash; a session opened before the revocation began is one the
+// revocation ends. Either way nothing opened with the old password outlives
+// the reset. That holds on two things the stores owe: GetUserByID sees a
+// password write that has returned (a read from a lagging replica does not),
+// and the revocation reaches every session whose creation had returned when
+// it began, which is UserSessionRevoker's contract and a consistent listing's.
+//
+// A password that has changed, and an account the store no longer has, are
+// ErrInvalidCredentials, a wrong password's answer. A read that fails is an
+// opaque error, the generic 500, and never a credential refusal. Either way
+// the session is given up first (giveUpSession).
+//
+// With the option off it reads nothing and returns nil: a reset revokes no
+// session there, so a login has nothing to fall behind.
+func (s *Service) keepPasswordSession(ctx context.Context, proven User, sessionID string) error {
+	if !s.cfg.RevokeSessionsOnPasswordReset {
+		return nil
+	}
+	current, err := s.users.GetUserByID(ctx, proven.ID, proven.TenantID)
+	switch {
+	case err == nil && current.PasswordHash == proven.PasswordHash:
+		return nil
+	case err == nil:
+		s.logf("auth: login for user %q: the password changed between the comparison and the session, as a reset does; the session is given up and the login refused", proven.ID)
+		err = ErrInvalidCredentials
+	case errors.Is(err, ErrUserNotFound):
+		err = ErrInvalidCredentials
+	default:
+		s.logf("auth: login for user %q: the account could not be read again once its session was open, so the session is given up and the login refused: %v", proven.ID, err)
+		err = fmt.Errorf("auth: login: read the account again: %v", err)
+	}
+	s.giveUpSession(ctx, proven, sessionID)
+	return err
+}
+
+// giveUpSession revokes a session whose tokens a refused login never handed
+// out. Nothing can use it, since nobody holds its tokens; it is revoked so that
+// the account's sessions are listed as they are. The revocation runs without
+// ctx's cancellation, bounded by its deadline (withoutCancel), and a failure
+// is logged and goes no further.
+func (s *Service) giveUpSession(ctx context.Context, user User, sessionID string) {
+	ctx, cancel := withoutCancel(ctx)
+	defer cancel()
+	if err := s.revokeSession(ctx, sessionID, user.ID, user.TenantID); err != nil && !errors.Is(err, ErrSessionNotFound) {
+		s.logf("auth: session %s of user %q, opened by a login that was then refused, could not be revoked; its tokens were never handed out: %v", sessionID, user.ID, err)
+	}
+}
+
+// passwordFingerprint binds a credential that carries no session to the
+// password it was obtained with, under Config.RevokeSessionsOnPasswordReset:
+// an HMAC under Config.Secret of user's stored password hash, the construction
+// enrolmentCredential uses. It reveals nothing about the hash, and any change
+// to the password changes it. label names the credential — an authorization
+// code, a console token — so that a value minted for one is never another's.
+func (s *Service) passwordFingerprint(label string, user User) string {
+	return sign(label+"\x00"+user.PasswordHash, s.cfg.Secret)
+}
+
+// passwordFingerprintMatches reports whether credential is the fingerprint
+// under label of the password user holds now. An empty credential never
+// matches: nothing then says which password it was minted under.
+func (s *Service) passwordFingerprintMatches(label, credential string, user User) bool {
+	return credential != "" && secureEqual(credential, s.passwordFingerprint(label, user))
 }
 
 // sessionIDOf recovers the session id from an access token this service has
@@ -702,7 +804,9 @@ func withoutCancel(ctx context.Context) (context.Context, context.CancelFunc) {
 }
 
 // ResetPassword sets a new password with a token ForgotPassword minted, and
-// clears the token.
+// clears the token. Under Config.RevokeSessionsOnPasswordReset it also revokes
+// every live session the account holds, after the password is written and
+// before the token is cleared; see revokeSessionsAfterReset.
 //
 // A token for an account an invitation still reserves is refused as an invalid
 // one, whatever minted it. ForgotPassword mints none for such an account, but
@@ -741,6 +845,18 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 	if err := ps.UpdatePassword(ctx, user.ID, user.TenantID, pwHash); err != nil {
 		return err
 	}
+	// Before the token is cleared, so that a store keeping the token until then
+	// lets the same link run both again. After the write, because the write is
+	// what a password login already in flight is checked against: one that
+	// proved the old password and opens its session after the revocation has
+	// looked reads the account again once that session exists, finds this
+	// password and gives the session up (keepPasswordSession). The revocation
+	// itself ends only the sessions whose creation had returned when it began.
+	if s.cfg.RevokeSessionsOnPasswordReset {
+		if err := s.revokeSessionsAfterReset(ctx, user); err != nil {
+			return err
+		}
+	}
 	// Nothing is published here, deliberately. POST /reset-password changes a
 	// password exactly as POST /change-password does and raises no event in
 	// either tree, where the authenticated route raises
@@ -750,6 +866,83 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 	// step that turns a port into a fork, and the conformance test in
 	// event_publication_test.go has no site for it.
 	return s.clearSpentResetToken(ctx, ps, user)
+}
+
+// revokeSessionsAfterReset revokes every live session user holds: the half of
+// ResetPassword that Config.RevokeSessionsOnPasswordReset adds.
+//
+// A store that implements UserSessionRevoker is asked to do it in one call,
+// whose contract is that every session is revoked; its failure is the reset's,
+// as below. Otherwise the account's sessions are listed
+// (SessionAdminStore.ListSessionsForUser) and revoked one by one, which is
+// exactly as complete as the listing: a store whose listing refuses past a cap
+// fails every reset of an account over it, with nothing revoked, and one that
+// lists from an eventually consistent index may leave out a session opened just
+// before the reset. Such a store implements UserSessionRevoker.
+//
+// On the listing path, a session already revoked is left alone — revoking it
+// again would relabel the earlier revocation on a store that records why — and
+// so is one whose listed expiry has passed, which can neither refresh nor pass
+// the all-calls check; one listed with no expiry at all is revoked. One the
+// store no longer has when its turn comes (ErrSessionNotFound) is gone, which
+// is what was wanted. Every other session is tried even after one fails, so a
+// store that refuses one revocation still ends all the others.
+//
+// The error it returns is deliberately opaque — the store's errors are
+// formatted, not wrapped — because it reaches ResetPasswordHTTPError, whose
+// sentinels name the token and the password: a session store whose error
+// wrapped ErrInvalidToken would otherwise answer "Invalid reset token" for a
+// reset that has already changed the password. It maps to the generic 500,
+// and the line written through Config.Logger is where an operator reads which
+// account and what failed.
+//
+// It runs without ctx's cancellation, bounded by ctx's deadline
+// (withoutCancel). The password has been written by then, and a caller that
+// goes away — on a Go net/http server, a client that half-closes its
+// connection cancels the request context — would otherwise stop the
+// revocation of a store that honours its context, leaving every session alive
+// behind a 500 nobody reads.
+func (s *Service) revokeSessionsAfterReset(ctx context.Context, user User) error {
+	ctx, cancel := withoutCancel(ctx)
+	defer cancel()
+	if bulk, ok := s.sessions.(UserSessionRevoker); ok {
+		if err := bulk.RevokeSessionsForUser(ctx, user.ID, user.TenantID); err != nil {
+			s.logf("auth: password reset for user %q: the password was changed, but its sessions could not be revoked and may still work: %v", user.ID, err)
+			return fmt.Errorf("auth: password reset: revoke sessions: %v", err)
+		}
+		return nil
+	}
+	store, ok := s.sessions.(SessionAdminStore)
+	if !ok {
+		// NewService refuses the option without either interface, so this is
+		// a Service assembled some other way; fail as the store failing would.
+		return errors.New("auth: password reset: the session store cannot list sessions, so none was revoked")
+	}
+	sessions, err := store.ListSessionsForUser(ctx, user.ID, user.TenantID)
+	if err != nil {
+		s.logf("auth: password reset for user %q: the password was changed, but its sessions could not be listed and none was revoked: %v", user.ID, err)
+		return fmt.Errorf("auth: password reset: list sessions: %v", err)
+	}
+	now := s.now()
+	var failed []error
+	for _, session := range sessions {
+		// An expiry the listing does not carry is not one in the past: skipping
+		// on it would let a store that lists sessions without their expiry
+		// answer every reset with all of them alive.
+		expired := !session.ExpiresAt.IsZero() && now.After(session.ExpiresAt.Add(s.cfg.ClockSkew))
+		if session.RevokedAt != nil || expired {
+			continue
+		}
+		if err := store.RevokeSessionByID(ctx, session.ID); err != nil && !errors.Is(err, ErrSessionNotFound) {
+			failed = append(failed, fmt.Errorf("session %s: %v", session.ID, err))
+		}
+	}
+	if len(failed) > 0 {
+		joined := errors.Join(failed...)
+		s.logf("auth: password reset for user %q: the password was changed, but %d session(s) could not be revoked and still work: %v", user.ID, len(failed), joined)
+		return fmt.Errorf("auth: password reset: revoke sessions: %v", joined)
+	}
+	return nil
 }
 
 // ChangePassword replaces a user's password, or sets the first one of an

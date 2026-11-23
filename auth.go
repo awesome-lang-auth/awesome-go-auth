@@ -286,6 +286,31 @@ func WithIssueSessionOnRegister(enabled bool) Option {
 	}
 }
 
+// WithRevokeSessionsOnPasswordReset sets Config.RevokeSessionsOnPasswordReset:
+// whether a successful POST <prefix>/reset-password also revokes every live
+// session of the account, so that a password reset after a leak ends what the
+// leak opened, short of the tokens that live out their own expiry.
+//
+//	auth.WithRevokeSessionsOnPasswordReset(true)
+//
+// Off by default, the reference's answer: a reset leaves the account's
+// sessions alive. On, refresh tokens are refused at once; a password login in
+// flight across the reset keeps no session; an authorization code and a
+// console token obtained with the old password stop working; a revocation the
+// store refuses fails the reset with the generic 500. The session store must
+// implement UserSessionRevoker or SessionAdminStore, or New refuses the
+// option. What outlives the reset: access tokens already issued, for
+// AccessTokenTTL — unless SessionCheckOn is "allcalls", and on the admin
+// console whatever it is — and a step-up token minted before it, which still
+// completes its challenge for TempTokenTTL. See
+// Config.RevokeSessionsOnPasswordReset.
+func WithRevokeSessionsOnPasswordReset(enabled bool) Option {
+	return func(b *authBuilder) error {
+		b.cfg.RevokeSessionsOnPasswordReset = enabled
+		return nil
+	}
+}
+
 // WithTwoFactorAppName sets Config.TwoFactorAppName: the issuer an
 // authenticator app shows for a TOTP enrolment made through POST
 // <prefix>/2fa/setup. It is the reference's `twoFactor.appName`.

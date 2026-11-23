@@ -677,27 +677,7 @@ func (g *AdminGuard) authorise(w http.ResponseWriter, r *http.Request) (context.
 
 	// ── 2. Unauthenticated → redirect, marker, or 401 (:307-332) ─────────────
 	if !ok {
-		if !strings.Contains(r.Header.Get("Accept"), "text/html") {
-			writeAdminError(w, http.StatusUnauthorized, "Unauthorized")
-			return ctx, adminRefused
-		}
-		if loginPath := strings.TrimSpace(g.cfg.Admin.LoginPath); loginPath != "" {
-			// `${loginPath}?redirect=${encodeURIComponent(req.baseUrl + req.path)}`
-			// (:312-314). The redirect target is this router's own mount and the
-			// router-relative path, both known to the mount rather than read off
-			// the request line, so nothing a caller sends reaches the Location
-			// header.
-			target := loginPath + "?redirect=" +
-				url.QueryEscape(g.cfg.AdminPath()+adminRouterPath(r, g.cfg))
-			w.Header().Set("Location", target)
-			w.WriteHeader(http.StatusFound)
-			return ctx, adminRefused
-		}
-		if r.Method == http.MethodGet {
-			return ctx, adminNeedsLoginForm
-		}
-		writeAdminError(w, http.StatusUnauthorized, "Unauthorized")
-		return ctx, adminRefused
+		return g.unauthenticated(ctx, w, r)
 	}
 
 	// ── 3. Resolve the principal (:335-359) ──────────────────────────────────
@@ -734,6 +714,13 @@ func (g *AdminGuard) authorise(w http.ResponseWriter, r *http.Request) (context.
 		return ctx, adminRefused
 	}
 
+	// A console token minted under a password the account no longer has, under
+	// Config.RevokeSessionsOnPasswordReset, is answered as an expired one is:
+	// the browser gets the login form. See consoleCredentialHolds.
+	if !g.consoleCredentialHolds(claims, user) {
+		return g.unauthenticated(ctx, w, r)
+	}
+
 	// ── 4. Evaluate the policy (:362-388) ────────────────────────────────────
 	granted, capabilityMissing := g.evaluate(ctx, user)
 	if capabilityMissing {
@@ -749,6 +736,69 @@ func (g *AdminGuard) authorise(w http.ResponseWriter, r *http.Request) (context.
 		return ctx, adminRefused
 	}
 	return contextWithAdminUser(ctx, user), adminGranted
+}
+
+// unauthenticated answers a request that carries no credential the guard
+// accepts (:307-332): 401 to anything that does not accept HTML; for a
+// browser, a redirect to AdminOptions.LoginPath when one is configured, and
+// otherwise the marker that has the shell serve its login form to a GET.
+func (g *AdminGuard) unauthenticated(ctx context.Context, w http.ResponseWriter, r *http.Request) (context.Context, adminOutcome) {
+	if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		writeAdminError(w, http.StatusUnauthorized, "Unauthorized")
+		return ctx, adminRefused
+	}
+	if loginPath := strings.TrimSpace(g.cfg.Admin.LoginPath); loginPath != "" {
+		// `${loginPath}?redirect=${encodeURIComponent(req.baseUrl + req.path)}`
+		// (:312-314). The redirect target is this router's own mount and the
+		// router-relative path, both known to the mount rather than read off
+		// the request line, so nothing a caller sends reaches the Location
+		// header.
+		target := loginPath + "?redirect=" +
+			url.QueryEscape(g.cfg.AdminPath()+adminRouterPath(r, g.cfg))
+		w.Header().Set("Location", target)
+		w.WriteHeader(http.StatusFound)
+		return ctx, adminRefused
+	}
+	if r.Method == http.MethodGet {
+		return ctx, adminNeedsLoginForm
+	}
+	writeAdminError(w, http.StatusUnauthorized, "Unauthorized")
+	return ctx, adminRefused
+}
+
+// adminTokenCredentialLabel is the passwordFingerprint label of the console
+// token's cred claim.
+const adminTokenCredentialLabel = "awesome-go-auth/admin-token-credential/v1"
+
+// consoleCredential is the cred claim of the token POST <admin>/login mints
+// for user, a store account whose password the login has just proven: that
+// password's fingerprint under Config.RevokeSessionsOnPasswordReset, and
+// empty — no claim at all — with the option off.
+func (g *AdminGuard) consoleCredential(user User) string {
+	if !g.auth.service.cfg.RevokeSessionsOnPasswordReset {
+		return ""
+	}
+	return g.auth.service.passwordFingerprint(adminTokenCredentialLabel, user)
+}
+
+// consoleCredentialHolds reports whether the token behind claims still stands
+// for user, the account it names as read on this request.
+//
+// With Config.RevokeSessionsOnPasswordReset off it always does, as before.
+// Under the option a token typed adminTokenType stands only while its cred
+// claim is the fingerprint of the password the account has now: the token is
+// stateless and lives 24 hours, no session of the account backs it, so this
+// is what ends one obtained with a leaked password when the password is reset
+// — and, since it reads the password itself, when it is changed in any other
+// way. A token with no claim, minted before the option was on, stands for
+// nothing either. The root and bootstrap tokens never reach here (they name
+// no stored account), and an access token carries no claim and is not
+// checked: the console honours it until it expires, as it always has.
+func (g *AdminGuard) consoleCredentialHolds(claims adminClaims, user User) bool {
+	if claims.Typ != adminTokenType || !g.auth.service.cfg.RevokeSessionsOnPasswordReset {
+		return true
+	}
+	return g.auth.service.passwordFingerprintMatches(adminTokenCredentialLabel, claims.Cred, user)
 }
 
 // evaluate is the policy switch (:366-382). The second result is the one
@@ -800,7 +850,9 @@ func contextWithAdminUser(ctx context.Context, user User) context.Context {
 // untyped token is every token, the second because parseToken already refuses a
 // token from another issuer and a guard that did not would be the weakest door
 // in the building, and the third because this port's user lookup is
-// tenant-scoped.
+// tenant-scoped. Under Config.RevokeSessionsOnPasswordReset a token for a
+// store account carries cred as well, the fingerprint of the password its
+// login proved (consoleCredential, consoleCredentialHolds).
 type adminClaims struct {
 	Sub    string `json:"sub"`
 	Email  string `json:"email"`
@@ -810,6 +862,7 @@ type adminClaims struct {
 	Iss    string `json:"iss"`
 	Iat    int64  `json:"iat"`
 	Exp    int64  `json:"exp"`
+	Cred   string `json:"cred,omitempty"`
 }
 
 // readToken applies the reference's extraction order — Authorization: Bearer
@@ -1358,7 +1411,7 @@ func (g *AdminGuard) adminLogin(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			compared = true
 			if g.auth.service.passwordMatches(body.Password, user.PasswordHash) {
-				authed = &adminClaims{Sub: user.ID, Email: user.Email, Tid: user.TenantID}
+				authed = &adminClaims{Sub: user.ID, Email: user.Email, Tid: user.TenantID, Cred: g.consoleCredential(user)}
 			}
 		}
 	}

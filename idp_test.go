@@ -249,6 +249,13 @@ func newIDPFixture(t *testing.T, opts ...func(*IDPConfig)) *idpFixture {
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
+	return newIDPFixtureOn(t, svc, opts...)
+}
+
+// newIDPFixtureOn is newIDPFixture over a Service the test built, for a test
+// that needs its own configuration or stores behind the IDP.
+func newIDPFixtureOn(t *testing.T, svc *Service, opts ...func(*IDPConfig)) *idpFixture {
+	t.Helper()
 	user, _, err := svc.Register(context.Background(), RegisterInput{Email: idpTestEmail, Password: idpTestPassword, TenantID: idpTestTenant})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
@@ -281,6 +288,12 @@ func newIDPFixture(t *testing.T, opts ...func(*IDPConfig)) *idpFixture {
 // client and returns the code from the redirect.
 func (f *idpFixture) authorize(t *testing.T, client IDPClient, extra url.Values) string {
 	t.Helper()
+	return f.authorizeWithPassword(t, client, idpTestPassword, extra)
+}
+
+// authorizeWithPassword is authorize with the password the form carries.
+func (f *idpFixture) authorizeWithPassword(t *testing.T, client IDPClient, password string, extra url.Values) string {
+	t.Helper()
 	q := url.Values{
 		"client_id":    {client.ClientID},
 		"redirect_uri": {client.RedirectURIs[0]},
@@ -290,7 +303,7 @@ func (f *idpFixture) authorize(t *testing.T, client IDPClient, extra url.Values)
 	for k, v := range extra {
 		q[k] = v
 	}
-	form := url.Values{"email": {idpTestEmail}, "password": {idpTestPassword}, "tenant_id": {idpTestTenant}}
+	form := url.Values{"email": {idpTestEmail}, "password": {password}, "tenant_id": {idpTestTenant}}
 	resp, err := f.client.PostForm(f.srv.URL+"/oidc/authorize?"+q.Encode(), form)
 	if err != nil {
 		t.Fatalf("POST /authorize: %v", err)
