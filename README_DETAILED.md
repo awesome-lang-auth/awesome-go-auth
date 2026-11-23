@@ -822,6 +822,7 @@ reach too) and the admin console's `POST <admin>/login`:
 | an account, with a wrong or a right password | one comparison against its stored hash, at that hash's cost |
 | no account | one comparison against a stand-in hash |
 | an account whose stored value is not a bcrypt hash — `""` for an OAuth-only or magic-link-only account, or a migration's marker | one comparison against the stand-in hash, then `PasswordVerifier` if one is configured |
+| on `POST <admin>/login`: the configured root user's address (`AdminRootUser.Email`) | one comparison against `AdminRootUser.PasswordHash`, at the cost that hash was generated at |
 | on `POST <admin>/login`: the bootstrap secret's names (`""`, `admin`) | one comparison against the stand-in hash beside the constant-time secret check |
 
 The stand-in hash is written at `Config.BcryptCost` (`bcrypt.DefaultCost` when
@@ -838,6 +839,14 @@ What is not equalised, and why:
 - **A hash written at an older cost** is compared at that cost, which differs
   from the stand-in's until the password is set again: after raising
   `BcryptCost`, accounts not yet re-hashed answer faster than unknown addresses.
+- **On `POST <admin>/login`, the configured root user's hash** is compared at
+  the cost it was generated at, which the operator chose and the library never
+  rewrites, while a refused address no account holds costs the stand-in at
+  `Config.BcryptCost`. A root hash made at cost 12 under a `BcryptCost` of 10
+  refuses a wrong password about four times (2²) slower than an unknown
+  address, and one made at a lower cost refuses it faster: either way the time
+  names the console's most privileged address. Generate the root user's hash at
+  `Config.BcryptCost` (`bcrypt.DefaultCost`, 10, when it is unset).
 - **The answer for a right password** is a session or a challenge, and an
   unverified address under strict verification is
   `403 EMAIL_NOT_VERIFIED`: those differ in their body, not in their time, and

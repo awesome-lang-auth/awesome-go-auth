@@ -187,6 +187,12 @@ func AdminPredicate(fn AdminPolicyFunc) *AdminAccessPolicy {
 // a token carrying isRoot, which is the one claim that skips the store lookup
 // and the policy alike — so this pair is the most privileged credential the
 // console has, and it is as strong as the hash and the JWT secret together.
+//
+// Generate PasswordHash at Config.BcryptCost. POST <admin>/login compares a
+// password for Email against it at the cost it was generated at, which the
+// library never rewrites, and a password for an address no account holds
+// against a stand-in hash at Config.BcryptCost; at any other cost the time a
+// refusal takes says which address is the root's.
 type AdminRootUser struct {
 	Email        string
 	PasswordHash string
@@ -1281,12 +1287,15 @@ func (g *AdminGuard) shellHandler() http.Handler {
 // Service.loginPassword does for POST <prefix>/login, so the two login routes
 // of the library cost the same on every path.
 //
-// Every path but one: the root user's address when a store row holds it too.
-// A wrong password is then compared against the root's hash and, as the
-// reference does, against the row's, which costs two comparisons. Skipping the
-// row would cap the cost and stop that row from signing in with its own
-// password, a login the reference allows, so the second comparison stays and
-// the deployment is told to give the root an address no account holds.
+// Every path but two, both on the root user's address. Its hash comes from
+// configuration and is compared at the cost it was generated at, not at
+// Config.BcryptCost, the stand-in's, so the deployment is told to generate it
+// at that cost (AdminRootUser). And when a store row holds the address too, a
+// wrong password is compared against the root's hash and, as the reference
+// does, against the row's, which costs two comparisons. Skipping the row would
+// cap the cost and stop that row from signing in with its own password, a
+// login the reference allows, so the second comparison stays and the
+// deployment is told to give the root an address no account holds.
 func (g *AdminGuard) adminLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Email    string `json:"email"`
