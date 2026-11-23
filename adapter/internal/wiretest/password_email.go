@@ -321,6 +321,30 @@ func testChangePassword(t *testing.T, mount Mounter) {
 		AssertStatus(t, me, http.StatusOK)
 	})
 
+	// Port-only (change-password-ends-the-reset-link): the reference leaves the
+	// reset token as it was, so a link mailed before the change still sets a
+	// password after it. Here the change clears it.
+	t.Run("ends a reset link minted before the change (port-only)", func(t *testing.T) {
+		env, store := storeEnv(t, mount, auth.DefaultHTTPConfig())
+		user, tokens := env.Seed("changereset@example.com")
+		// Minted through the service: no route hands a reset token back.
+		token, err := env.Auth.Service().ForgotPassword(context.Background(), auth.ForgotPasswordInput{Email: "changereset@example.com", TenantID: "t1"})
+		if err != nil {
+			t.Fatalf("mint reset token: %v", err)
+		}
+
+		req := env.Request(http.MethodPost, "/change-password", map[string]string{"currentPassword": "password1", "newPassword": "newpassword1"})
+		assertSuccessBody(t, env.Do(bearer(req, tokens)))
+		if stored := storedUser(t, store, user); stored.ResetTokenHash != "" || stored.ResetTokenExpiresAt != nil {
+			t.Error("the reset token survived the password change")
+		}
+
+		stale := env.Do(env.Request(http.MethodPost, "/reset-password", map[string]string{"token": token, "password": "takeover123"}))
+		AssertError(t, stale, http.StatusBadRequest, "Invalid reset token", "")
+		fresh := env.Do(env.Request(http.MethodPost, "/login", map[string]string{"email": "changereset@example.com", "password": "newpassword1", "tenantId": "t1"}))
+		AssertStatus(t, fresh, http.StatusOK)
+	})
+
 	// The passwordless fall-through, and the reason this route exists for an
 	// OAuth-only account: with no stored password the current-password comparison
 	// is skipped entirely and newPassword alone sets the initial password

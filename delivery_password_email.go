@@ -149,8 +149,9 @@ type EmailChangeDelivery struct {
 // or a test harness, that spends it from inside the call gets
 // ErrInvalidToken, and the token becomes valid once the sender has returned
 // nil. Only a delivered request replaces an outstanding link: one whose
-// delivery failed leaves the earlier link working until it is used, expires
-// or a delivered request replaces it.
+// delivery failed leaves the earlier link working until it is used, expires,
+// a delivered request replaces it or the password is changed
+// (Service.ChangePassword clears it).
 //
 // ctx is not cancelled when the request's client goes away: once the address
 // has named an account the send and the store run to the end, bounded by the

@@ -42,6 +42,11 @@ type UserPasswordStore interface {
 	UpdatePassword(ctx context.Context, userID, tenantID, passwordHash string) error
 	UpdateResetToken(ctx context.Context, userID, tenantID, tokenHash string, expiry time.Time) error
 	GetUserByResetTokenHash(ctx context.Context, tokenHash string) (User, error)
+	// ClearResetToken removes the account's reset token. Service.ResetPassword
+	// calls it once the token is spent, and Service.ChangePassword after every
+	// password change whether or not a token is outstanding, so it must succeed
+	// as a no-op for an account that holds none: an error there does not fail
+	// the change, but it is logged on every one.
 	ClearResetToken(ctx context.Context, userID, tenantID string) error
 }
 

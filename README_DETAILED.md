@@ -2154,7 +2154,11 @@ Three consequences for whoever writes a reset sender:
   inside the call gets `ErrInvalidToken`.
 - **Only a delivered request replaces a link.** Asking again cuts off the link
   mailed before only when the new mail goes out; after a failed delivery the
-  earlier link stays valid until it is used or expires (`ResetTokenTTL`).
+  earlier link stays valid until it is used, expires (`ResetTokenTTL`) or the
+  password is changed: `POST /auth/change-password` clears the account's reset
+  token once the new password is stored (the deviation
+  `change-password-ends-the-reset-link`), whether or not a mail can be
+  delivered. A clear that fails is logged and does not fail the change.
 - **Nothing cancels the send when the client goes away.** The send and the store
   run under the request context without its cancellation, bounded by its
   deadline when there is one, so a sender needs a timeout of its own

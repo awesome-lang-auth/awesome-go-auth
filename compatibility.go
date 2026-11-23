@@ -173,9 +173,30 @@ func CompatibilityNotes() APICompatibilityNotes {
 							"(`auth: a password reset was delivered but its token could not be stored, " +
 							"…`). Only a delivered request replaces the account's link now: asking " +
 							"again cuts off a link mailed before only when the new mail goes out, and " +
-							"otherwise that link stays valid until it is used or expires.",
+							"otherwise that link stays valid until it is used, expires or the password " +
+							"is changed (`change-password-ends-the-reset-link`).",
 					},
 				},
+			},
+			{
+				ID:      "change-password-ends-the-reset-link",
+				Title:   "`change-password` ends an outstanding reset link",
+				Surface: "`POST <prefix>/change-password`",
+				Behaviour: "Once the new password is stored, the account's reset token is cleared, so a " +
+					"reset link mailed before the change answers `400 {\"error\": \"Invalid reset " +
+					"token\"}` on `POST <prefix>/reset-password` from then on. The change itself answers " +
+					"as before: a clear that fails is logged and does not fail it, and the link then " +
+					"lives out `Config.ResetTokenTTL`.",
+				Reference: "Changes the password and leaves the account's reset token as it was: a reset " +
+					"link mailed before the change still sets a new password after it, until it expires.",
+				Citations: []string{"auth.router.ts:904-932"},
+				Why: "This port stores a reset token only once its mail went out " +
+					"(`forgot-password-succeeds-on-delivery-failure`), so a request whose delivery " +
+					"fails no longer replaces the account's link. Asking again was the one way to cut " +
+					"off a link a person believes leaked, and it now works only when the new mail " +
+					"goes out; changing the password works whether or not a mail can be delivered. A " +
+					"reset link exists to choose a new password, and once one has been chosen a link " +
+					"minted before it has nothing left to do but take the account back.",
 			},
 			{
 				ID:    "credential-route-bodies-are-bounded",

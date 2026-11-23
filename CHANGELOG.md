@@ -107,6 +107,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellation — bounded by its deadline, when it has one — so cancelling the
   context no longer stops a send that has begun. A sender needs a timeout of
   its own (`DeliveryWebhook` has one). See Fixed.
+- **`POST <prefix>/change-password` ends an outstanding reset link.** Once the
+  new password is stored, `Service.ChangePassword` clears the account's reset
+  token (`UserPasswordStore.ClearResetToken`), so a link mailed before the
+  change answers `400 {"error":"Invalid reset token"}` on `/reset-password`
+  from then on; before, it still set a password until it expired. Since a
+  failed delivery no longer replaces the account's link (see Fixed), asking
+  again cuts a link off only when the new mail goes out; changing the
+  password cuts it off whether or not a mail can be delivered. The clear runs
+  without the caller's cancellation, and one that fails is logged
+  (`auth: the password of user "…" was changed, but its reset token could not
+  be cleared, …`) and does not fail the change, which answers as before.
+  `ClearResetToken` is now called on every change, whether or not a token is
+  outstanding, so a store must treat a clear with nothing to clear as a no-op
+  (`MemoryUserStore` does); one that errors there logs that line on every
+  change. Registered as the deviation `change-password-ends-the-reset-link`:
+  the reference leaves the reset token as it was.
 
 ### Fixed
 - **`POST <prefix>/forgot-password`: a refused or failed delivery no longer
@@ -119,21 +135,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now sends first and stores the token only once `Config.SendPasswordReset`
   returned `nil` (at once when no sender is configured, as before, so a caller
   delivering the returned token itself is unaffected). A failed send stores
-  nothing: the earlier link keeps working until it expires or a delivered one
-  replaces it, and the route still answers `200 {"success":true}` for every
-  address. This works with any `UserPasswordStore`, a replace-on-issue one
-  included — nothing changes in the store contract. What the order costs: a
-  sender that reports a failure after the message did leave (a timeout on its
-  answer) leaves that message's link unusable, and a store write that fails
-  after a good send answers the `500` a store failure always answered, with a
-  mailed link that will not work — logged as `auth: a password reset was
-  delivered but its token could not be stored, …`, without the address. The
+  nothing: the earlier link keeps working until it expires, a delivered one
+  replaces it or the password is changed (see Changed), and the route still
+  answers `200 {"success":true}` for every address. This works with any
+  `UserPasswordStore`, a replace-on-issue one included — the order changes
+  nothing in the store contract. What the order costs: a sender that reports a
+  failure after the message did leave (a timeout on its answer) leaves that
+  message's link unusable, and a store write that fails after a good send
+  answers the `500` a store failure always answered, with a mailed link that
+  will not work — logged as `auth: a password reset was delivered but its
+  token could not be stored, …`, without the address. The
   token becomes valid only once the sender has returned `nil`, so a sender or
   test harness that spends it from inside the call gets `ErrInvalidToken`; and
   only a delivered request replaces a link now, so asking again cuts off a
-  link mailed before only when the new mail goes out. The two authenticated
-  routes keep the reference's store-then-send order. The
-  `forgot-password-succeeds-on-delivery-failure` entry now says so.
+  link mailed before only when the new mail goes out (changing the password
+  cuts it off in any case). The two authenticated routes keep the reference's
+  store-then-send order. The `forgot-password-succeeds-on-delivery-failure`
+  entry now says so.
 - **`POST <prefix>/forgot-password`: a client that goes away mid-request no
   longer changes what the route does.** On a Go `net/http` server a client that
   half-closes its connection cancels the request context while it can still

@@ -605,11 +605,12 @@ func (s *Service) sessionIDOf(tokens AuthTokens) string {
 // refused or lost — a relay's cap, a gateway that is down — killed the link
 // the person had been mailed before, for a mail nobody received, and enough
 // such requests kept an account out of the reset altogether. Now a failed send
-// stores nothing, and the earlier link keeps working until it expires or a
-// delivered one replaces it. What the order costs is narrower: a sender that
-// reports a failure after the mail did go out (a timeout) leaves that mail's
-// link unusable, and so does a store write that fails after a good send, which
-// is reported as the store failure it is and logged.
+// stores nothing, and the earlier link keeps working until it expires, a
+// delivered one replaces it or the password is changed (ChangePassword clears
+// it). What the order costs is narrower: a sender that reports a failure after
+// the mail did go out (a timeout) leaves that mail's link unusable, and so does
+// a store write that fails after a good send, which is reported as the store
+// failure it is and logged.
 //
 // Once the address has named an account, the rest — the invitation check, the
 // send, the store — runs under ctx without its cancellation (withoutCancel),
@@ -761,6 +762,17 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // ask for it before calling here (#30). The decision reads the stored hash, so
 // the UserStore must return PasswordHash from GetUserByID; a store that leaves
 // it out makes every account look passwordless.
+//
+// Once the new password is written, the account's reset token is cleared
+// (ClearResetToken), which the reference does not do: a reset link mailed
+// before the change no longer sets a password after it (the
+// change-password-ends-the-reset-link deviation). ForgotPassword stores a
+// token only once its mail went out, so asking again no longer cuts off a link
+// whose mail could not be delivered; changing the password does, whether or
+// not a mail can be delivered. The clear runs without the caller's
+// cancellation, since the password it follows has already changed, and a
+// failed clear does not fail the change: it is logged, and the link lives out
+// Config.ResetTokenTTL.
 func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) error {
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
@@ -793,6 +805,7 @@ func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) er
 	if err := ps.UpdatePassword(ctx, user.ID, user.TenantID, pwHash); err != nil {
 		return err
 	}
+	s.clearResetTokenAfterChange(ctx, ps, user)
 	// node-auth auth.router.ts:1030, straight after the store write and before
 	// the 200. The user id and nothing else: the dev line puts neither the
 	// address nor any indication of what the password was on the payload.
@@ -800,6 +813,20 @@ func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) er
 		return Event{Name: EventUserPasswordChanged, UserID: user.ID}
 	})
 	return nil
+}
+
+// clearResetTokenAfterChange clears the reset token of an account whose
+// password ChangePassword has just written; see its doc comment. The password
+// has changed by now, so neither the caller going away nor the store failing
+// may turn the change into an error: the clear runs without ctx's
+// cancellation, and a failure is logged — naming the user, as the route is
+// authenticated — and otherwise ignored.
+func (s *Service) clearResetTokenAfterChange(ctx context.Context, ps UserPasswordStore, user User) {
+	ctx, cancel := withoutCancel(ctx)
+	defer cancel()
+	if err := ps.ClearResetToken(ctx, user.ID, user.TenantID); err != nil {
+		s.logf("auth: the password of user %q was changed, but its reset token could not be cleared, so a reset link mailed before the change works until it expires: %v", user.ID, err)
+	}
 }
 
 // SendMagicLink mints a magic link, stores its hash and delivers it through
