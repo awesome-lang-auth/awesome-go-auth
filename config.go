@@ -220,6 +220,10 @@ type Config struct {
 	//     falls back to Secret — and reads no session behind it, under every
 	//     SessionCheckOn, "allcalls" included; so one issued before the reset
 	//     opens the console until it expires (AccessTokenTTL).
+	//   - A login whose own PasswordVerifier migration write lands after the
+	//     reset's. With or without the option, that write replaces the new
+	//     password with the old one; the login, which reads back the hash it
+	//     wrote, keeps its session, and the person resets again.
 	//
 	// That much rests on what the stores keep. UserStore.GetUserByID returns
 	// the account's PasswordHash and sees a password write that has returned

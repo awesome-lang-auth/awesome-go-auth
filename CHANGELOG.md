@@ -78,7 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completes its challenge for `TempTokenTTL` (5 minutes by default) for
   whoever holds the second factor; and an access token on the admin console,
   which accepts one without reading its session under every `SessionCheckOn`,
-  `allcalls` included, until it expires (`AccessTokenTTL`). An enrolment token
+  `allcalls` included, until it expires (`AccessTokenTTL`). Nor a login whose
+  own `PasswordVerifier` migration write lands after the reset's: with or
+  without the option, that write replaces the new password with the old one,
+  and the login keeps its session; the person resets again. An enrolment token
   is bound to the password and stops working. The option rests on
   `GetUserByID` seeing a password write that has returned, on a revocation
   that reaches every session whose creation had returned when it began, and

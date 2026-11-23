@@ -631,6 +631,10 @@ What it does not end:
   with (`AdminOptions.JWTSecret` unset falls back to `Config.Secret`), and reads
   no session behind it under any `SessionCheckOn`, `allcalls` included — so one
   issued before the reset opens the console until it expires (`AccessTokenTTL`).
+- **A login whose own `PasswordVerifier` migration write lands after the
+  reset's.** With or without the option, that write replaces the new password
+  with the old one; the login, which reads back the hash it wrote, keeps its
+  session, and the person resets again.
 
 **What the stores owe.** `UserStore.GetUserByID` returns the account's
 `PasswordHash` and sees a password write that has returned — a read from a
