@@ -2168,7 +2168,11 @@ Three consequences for whoever writes a reset sender:
   password is changed: `POST /auth/change-password` clears the account's reset
   token once the new password is stored (the deviation
   `change-password-ends-the-reset-link`), whether or not a mail can be
-  delivered. A clear that fails is logged and does not fail the change.
+  delivered. A clear that fails is logged and does not fail the change. The
+  clear ends the token stored when it runs: a request whose mail is still with
+  the sender when the password changes stores its token afterwards, and that
+  link works like any other. The window is the sender's answer time, and the
+  link goes to the account's own address.
 - **Nothing cancels the send when the client goes away.** The send and the store
   run under the request context without its cancellation, bounded by its
   deadline when there is one (on the route, 100 ms before it), so a sender

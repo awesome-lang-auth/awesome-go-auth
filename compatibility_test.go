@@ -107,9 +107,11 @@ var wantDeviationIDs = []string{
 var wantClaims = map[string][]string{
 	"forgot-password-succeeds-on-delivery-failure": {"200", "500", "enumeration", "stores nothing", "earlier link"},
 	// The answer the stale link gets, that a failed clear does not fail the
-	// change, and the deviation that makes the clear worth having.
+	// change, the deviation that makes the clear worth having — and the one
+	// link the clear cannot end, a request whose mail is still out.
 	"change-password-ends-the-reset-link": {
 		"Invalid reset token", "Config.ResetTokenTTL", "does not fail", "forgot-password-succeeds-on-delivery-failure",
+		"still with the sender",
 	},
 	// The status and code, the bound, both ways a body is measured, that the
 	// rate limiter has not run, that the answer does not depend on the address

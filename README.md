@@ -202,7 +202,7 @@ revision the whole contract was extracted from.
 
 - **Surface**: `POST <prefix>/change-password`.
 - **This port**: Once the new password is stored, the account's reset token is
-  cleared, so a reset link mailed before the change answers
+  cleared, so a reset link whose token was stored before the change answers
   `400 {"error": "Invalid reset token"}` on `POST <prefix>/reset-password` from
   then on. The change itself answers as before: a clear that fails is logged and
   does not fail it, and the link then lives out `Config.ResetTokenTTL`.
@@ -217,6 +217,15 @@ revision the whole contract was extracted from.
   delivered. A reset link exists to choose a new password, and once one has been
   chosen a link minted before it has nothing left to do but take the account
   back.
+- **A request still being mailed**: The clear ends the token that is stored when
+  it runs, and a `forgot-password` request stores its token only once its send
+  has returned. A request whose mail is still with the sender when the password
+  changes therefore stores its token after the clear, and that link works like
+  any other — until it is used, expires, a delivered request replaces it or the
+  password changes again. The window is the sender's answer time, and the link
+  goes to the account's own address, whose holder can ask for a new link after
+  the change anyway. Closing it would take a token write conditional on the
+  password being unchanged, which `UserPasswordStore` does not offer.
 
 ### The public credential routes refuse a body over 16 KiB before anything reads it
 

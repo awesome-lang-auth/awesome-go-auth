@@ -118,13 +118,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own (`DeliveryWebhook` has one). See Fixed.
 - **`POST <prefix>/change-password` ends an outstanding reset link.** Once the
   new password is stored, `Service.ChangePassword` clears the account's reset
-  token (`UserPasswordStore.ClearResetToken`), so a link mailed before the
-  change answers `400 {"error":"Invalid reset token"}` on `/reset-password`
-  from then on; before, it still set a password until it expired. Since a
-  failed delivery no longer replaces the account's link (see Fixed), asking
-  again cuts a link off only when the new mail goes out; changing the
-  password cuts it off whether or not a mail can be delivered. The clear runs
-  without the caller's cancellation, and one that fails is logged
+  token (`UserPasswordStore.ClearResetToken`), so a link whose token was
+  stored before the change answers `400 {"error":"Invalid reset token"}` on
+  `/reset-password` from then on; before, it still set a password until it
+  expired. Since a failed delivery no longer replaces the account's link (see
+  Fixed), asking again cuts a link off only when the new mail goes out;
+  changing the password cuts it off whether or not a mail can be delivered.
+  One link outlives the change: a `/forgot-password` request whose mail is
+  still with the sender when the password changes stores its token after the
+  clear, and that link works like any other. It goes to the account's own
+  address, whose holder can ask for a new link after the change anyway;
+  closing that window would take a token write conditional on the password,
+  which `UserPasswordStore` does not offer. The clear runs without the
+  caller's cancellation, and one that fails is logged
   (`auth: the password of user "…" was changed, but its reset token could not
   be cleared, …`) and does not fail the change, which answers as before.
   `ClearResetToken` is now called on every change, whether or not a token is

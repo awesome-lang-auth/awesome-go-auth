@@ -183,10 +183,10 @@ func CompatibilityNotes() APICompatibilityNotes {
 				Title:   "`change-password` ends an outstanding reset link",
 				Surface: "`POST <prefix>/change-password`",
 				Behaviour: "Once the new password is stored, the account's reset token is cleared, so a " +
-					"reset link mailed before the change answers `400 {\"error\": \"Invalid reset " +
-					"token\"}` on `POST <prefix>/reset-password` from then on. The change itself answers " +
-					"as before: a clear that fails is logged and does not fail it, and the link then " +
-					"lives out `Config.ResetTokenTTL`.",
+					"reset link whose token was stored before the change answers `400 {\"error\": " +
+					"\"Invalid reset token\"}` on `POST <prefix>/reset-password` from then on. The change " +
+					"itself answers as before: a clear that fails is logged and does not fail it, and the " +
+					"link then lives out `Config.ResetTokenTTL`.",
 				Reference: "Changes the password and leaves the account's reset token as it was: a reset " +
 					"link mailed before the change still sets a new password after it, until it expires.",
 				Citations: []string{"auth.router.ts:904-932"},
@@ -197,6 +197,20 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"goes out; changing the password works whether or not a mail can be delivered. A " +
 					"reset link exists to choose a new password, and once one has been chosen a link " +
 					"minted before it has nothing left to do but take the account back.",
+				Notes: []DeviationNote{
+					{
+						Label: "A request still being mailed",
+						Text: "The clear ends the token that is stored when it runs, and a " +
+							"`forgot-password` request stores its token only once its send has returned. " +
+							"A request whose mail is still with the sender when the password changes " +
+							"therefore stores its token after the clear, and that link works like any " +
+							"other — until it is used, expires, a delivered request replaces it or the " +
+							"password changes again. The window is the sender's answer time, and the link " +
+							"goes to the account's own address, whose holder can ask for a new link after " +
+							"the change anyway. Closing it would take a token write conditional on the " +
+							"password being unchanged, which `UserPasswordStore` does not offer.",
+					},
+				},
 			},
 			{
 				ID:    "credential-route-bodies-are-bounded",

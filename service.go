@@ -610,7 +610,9 @@ func (s *Service) sessionIDOf(tokens AuthTokens) string {
 // it). What the order costs is narrower: a sender that reports a failure after
 // the mail did go out (a timeout) leaves that mail's link unusable, and so does
 // a store write that fails after a good send, which is reported as the store
-// failure it is and logged.
+// failure it is and logged. And a password change that lands while the mail
+// is with the sender does not end this request's link, whose token is stored
+// after the change's clear (see ChangePassword).
 //
 // Once the address has named an account, the rest — the invitation check, the
 // send, the store — runs under ctx without its cancellation (withoutCancel),
@@ -771,8 +773,8 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // it out makes every account look passwordless.
 //
 // Once the new password is written, the account's reset token is cleared
-// (ClearResetToken), which the reference does not do: a reset link mailed
-// before the change no longer sets a password after it (the
+// (ClearResetToken), which the reference does not do: a reset link whose
+// token was stored before the change no longer sets a password after it (the
 // change-password-ends-the-reset-link deviation). ForgotPassword stores a
 // token only once its mail went out, so asking again no longer cuts off a link
 // whose mail could not be delivered; changing the password does, whether or
@@ -780,6 +782,15 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // cancellation, since the password it follows has already changed, and a
 // failed clear does not fail the change: it is logged, and the link lives out
 // Config.ResetTokenTTL.
+//
+// The same order leaves one link the change does not end: a ForgotPassword
+// whose mail is still with the sender when the change lands stores its token
+// after the clear, and that link works like any other until it is used,
+// expires, a delivered request replaces it or the password changes again. The
+// window is the sender's answer time, and the link goes to the account's own
+// address, whose holder can ask for a new one after the change anyway.
+// Closing it would take a token write conditional on the password being
+// unchanged, which UserPasswordStore does not offer.
 func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) error {
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {

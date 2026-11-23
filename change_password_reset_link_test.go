@@ -11,10 +11,12 @@ import (
 
 // Tests for the change-password-ends-the-reset-link deviation: once
 // Service.ChangePassword has written the new password it clears the account's
-// reset token, so a link mailed before the change no longer sets a password
-// after it. ForgotPassword stores a token only once its mail went out, so
-// asking again no longer cuts off a link whose mail could not be delivered;
-// changing the password does.
+// reset token, so a link whose token was stored before the change no longer
+// sets a password after it. ForgotPassword stores a token only once its mail
+// went out, so asking again no longer cuts off a link whose mail could not be
+// delivered; changing the password does. A request whose mail is still out
+// when the password changes is the one link the clear cannot end
+// (TestChangePasswordLeavesALinkStillBeingMailed).
 
 // resetLinkStore is a MemoryUserStore whose two writes on this path can be
 // steered: afterPassword runs once the password is written, and clear, when
@@ -187,5 +189,62 @@ func TestChangePasswordClearKeepsTheDeadline(t *testing.T) {
 	}
 	if !had || !seen.Equal(deadline) {
 		t.Errorf("the clear saw deadline %v (set: %v), want the caller's %v", seen, had, deadline)
+	}
+}
+
+// TestChangePasswordLeavesALinkStillBeingMailed pins the window the
+// change-password-ends-the-reset-link entry names, so that the docs cannot
+// drift from it: a ForgotPassword whose mail is still with the sender when
+// the password changes stores its token after the change's clear, and that
+// link sets a password after the change. ForgotPassword stores a token only
+// once its send has returned, and UserPasswordStore has no write conditional
+// on the password. If this starts failing, the window has closed: say so in
+// the entry, the CHANGELOG and ChangePassword's doc.
+func TestChangePasswordLeavesALinkStillBeingMailed(t *testing.T) {
+	ctx := context.Background()
+	store := &resetLinkStore{MemoryUserStore: NewMemoryUserStore()}
+	cfg := DefaultConfig("resetlinkchange12345678901234567")
+	cfg.BcryptCost = testBcryptCost
+	mailed := make(chan string, 1)
+	release := make(chan struct{})
+	cfg.SendPasswordReset = func(_ context.Context, d PasswordResetDelivery) error {
+		mailed <- d.Token // the mail is out; its token is not stored yet
+		<-release
+		return nil
+	}
+	svc, err := NewService(cfg, store, NewMemorySessionStore())
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	user := seedUser(t, svc, "changereset@example.com")
+	hash, err := hashPassword("password1", cfg.BcryptCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MemoryUserStore.UpdatePassword(ctx, user.ID, user.TenantID, hash); err != nil {
+		t.Fatalf("set the password: %v", err)
+	}
+
+	asked := make(chan error, 1)
+	go func() {
+		_, err := svc.ForgotPassword(ctx, ForgotPasswordInput{Email: user.Email, TenantID: user.TenantID})
+		asked <- err
+	}()
+	token := <-mailed
+	if err := svc.ChangePassword(ctx, changePasswordInput(user)); err != nil {
+		close(release)
+		t.Fatalf("change password: %v", err)
+	}
+	close(release)
+	if err := <-asked; err != nil {
+		t.Fatalf("forgot password: %v", err)
+	}
+
+	if err := svc.ResetPassword(ctx, ResetPasswordInput{Token: token, NewPassword: "resetpassword1"}); err != nil {
+		t.Fatalf("the link whose mail was out when the password changed: err = %v, want nil, the documented window; "+
+			"if the window has closed, update the docs that name it", err)
+	}
+	if !verifyPassword("resetpassword1", storedUser(t, svc, user.ID).PasswordHash) {
+		t.Error("the link set no password")
 	}
 }
