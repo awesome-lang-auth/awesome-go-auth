@@ -204,6 +204,36 @@ func TestRevokingResetLeavesNoSessionToALoginInFlight(t *testing.T) {
 	}
 }
 
+// TestPasswordLoginUnderTheOptionKeepsItsSession pins the other half of the
+// re-read: under the option, with no reset anywhere near, both entry points
+// still answer success, hand out a session that refreshes, and raise
+// identity.auth.login.success once and identity.auth.login.failed not at all.
+// A re-read that refused every login would fail every test above for the
+// right reason and this one for the wrong one.
+func TestPasswordLoginUnderTheOptionKeepsItsSession(t *testing.T) {
+	for _, entry := range passwordLogins {
+		t.Run(entry.name, func(t *testing.T) {
+			svc, events := newInFlightService(t, newHoldingSessionStore(), NewMemoryUserStore(), revokeOnReset)
+			registerUser(t, svc, "keepon@example.com", "t1")
+			events.reset()
+
+			tokens, err := entry.login(svc, LoginInput{Email: "keepon@example.com", Password: "password1", TenantID: "t1"})
+			if err != nil {
+				t.Fatalf("login under the option, no reset: %v", err)
+			}
+			if _, err := svc.Refresh(context.Background(), tokens.RefreshToken); err != nil {
+				t.Errorf("its session: %v, want it alive", err)
+			}
+			if got := len(events.named(EventAuthLoginSuccess)); got != 1 {
+				t.Errorf("identity.auth.login.success raised %d times, want 1", got)
+			}
+			if got := events.named(EventAuthLoginFailed); len(got) != 0 {
+				t.Errorf("identity.auth.login.failed raised for a login that succeeded: %+v", got)
+			}
+		})
+	}
+}
+
 // TestInFlightLoginKeepsItsSessionWithTheOptionOff pins the default: with the
 // option off a reset revokes nothing, and the same in-flight login answers
 // success with a session that lives, as it always has.
@@ -372,5 +402,35 @@ func TestRevokingResetLeavesNoSessionToAnEnrolmentInFlight(t *testing.T) {
 	}
 	if got := events.named(EventAuthLoginSuccess); len(got) != 0 {
 		t.Errorf("identity.auth.login.success raised for the refused enrolment: %+v", got)
+	}
+}
+
+// TestForcedEnrolmentUnderTheOptionOpensItsSession pins the enrolment's
+// success under the option: with no reset in between, the completion's re-read
+// finds the password the token was minted under, and the session it opens is
+// handed out and refreshes.
+func TestForcedEnrolmentUnderTheOptionOpensItsSession(t *testing.T) {
+	svc, events := newInFlightService(t, newHoldingSessionStore(), NewMemoryUserStore(), revokeOnReset, func(c *Config) {
+		c.Require2FA = true
+		c.EnrolOnLogin = true
+		c.SendMagicLink, c.SendSMSCode = nil, nil
+	})
+	ctx := context.Background()
+	_, enrolment := setupChallenge(t, svc, "enrolon@example.com")
+	setup, err := svc.NewForcedTOTPEnrolment(ctx, enrolment)
+	if err != nil {
+		t.Fatalf("NewForcedTOTPEnrolment: %v", err)
+	}
+	events.reset()
+
+	_, tokens, err := svc.CompleteTOTPEnrolment(ctx, enrolment, setup.Secret, codeFor(t, setup.Secret, time.Now()))
+	if err != nil {
+		t.Fatalf("forced enrolment under the option, no reset: %v", err)
+	}
+	if _, err := svc.Refresh(ctx, tokens.RefreshToken); err != nil {
+		t.Errorf("the enrolment's session: %v, want it alive", err)
+	}
+	if got := len(events.named(EventAuthLoginSuccess)); got != 1 {
+		t.Errorf("identity.auth.login.success raised %d times, want 1", got)
 	}
 }
