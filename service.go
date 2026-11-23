@@ -694,6 +694,11 @@ func withoutCancel(ctx context.Context) (context.Context, context.CancelFunc) {
 // and then handed back because the acceptance failed — would otherwise set a
 // password the invitation can no longer replace on an address still
 // unverified. See reservedByInvitation.
+//
+// Once the new password is written, the token is cleared without ctx's
+// cancellation, bounded by its deadline (clearSpentResetToken): a caller that
+// goes away then cannot leave the spent link able to set the password again.
+// A clear that fails still fails the reset, though the password has changed.
 func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) error {
 	if len(in.NewPassword) < s.cfg.MinPasswordLen {
 		return ErrWeakPassword
@@ -728,7 +733,7 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 	// asymmetry is the reference's; adding the obvious publication here is the
 	// step that turns a port into a fork, and the conformance test in
 	// event_publication_test.go has no site for it.
-	return ps.ClearResetToken(ctx, user.ID, user.TenantID)
+	return s.clearSpentResetToken(ctx, ps, user)
 }
 
 // ChangePassword replaces a user's password, or sets the first one of an
@@ -827,6 +832,19 @@ func (s *Service) clearResetTokenAfterChange(ctx context.Context, ps UserPasswor
 	if err := ps.ClearResetToken(ctx, user.ID, user.TenantID); err != nil {
 		s.logf("auth: the password of user %q was changed, but its reset token could not be cleared, so a reset link mailed before the change works until it expires: %v", user.ID, err)
 	}
+}
+
+// clearSpentResetToken clears the token ResetPassword has just set a password
+// with. The password has changed by then, so the clear runs without ctx's
+// cancellation, bounded by its deadline, as clearResetTokenAfterChange does:
+// on a Go net/http server a client that half-closes its connection cancels the
+// request context, and a clear cut short there — by a store that honours its
+// context — left the spent link able to set the password again until it
+// expired. Its error is still the reset's, as it was before.
+func (s *Service) clearSpentResetToken(ctx context.Context, ps UserPasswordStore, user User) error {
+	ctx, cancel := withoutCancel(ctx)
+	defer cancel()
+	return ps.ClearResetToken(ctx, user.ID, user.TenantID)
 }
 
 // SendMagicLink mints a magic link, stores its hash and delivers it through

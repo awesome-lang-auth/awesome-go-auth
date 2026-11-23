@@ -166,6 +166,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send and the store now run under the request context without its
   cancellation, bounded by its deadline: the mail goes out and its token is
   stored whether or not the client stays.
+- **`POST <prefix>/reset-password`: a client that goes away once the new
+  password is written no longer leaves the spent link working.** The reset
+  cleared the token under the request context, so a client that half-closed
+  its connection right after the password write made a store that honours its
+  context skip the clear: the reset answered `500` with the password already
+  changed, and the same link set a password again until it expired.
+  `Service.ResetPassword` now clears the token without the caller's
+  cancellation, bounded by its deadline, as the change-password clear does
+  (see Changed). A clear that fails still fails the reset, as before. A store
+  that consumes the token when it is looked up was not exposed.
 
 ## [0.15.0] - 2026-11-21
 
