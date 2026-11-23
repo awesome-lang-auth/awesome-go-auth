@@ -38,7 +38,7 @@ func halfClosedForgot(t *testing.T, srv *httptest.Server, env *Env, email string
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	body := fmt.Sprintf(`{"email":%q,"tenantId":%q}`, email, testTenant)
 	request := fmt.Sprintf("POST %s/forgot-password HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
 		env.Config.Prefix(), len(body), body)
@@ -63,7 +63,7 @@ func halfClosedForgot(t *testing.T, srv *httptest.Server, env *Env, email string
 	if err != nil {
 		t.Fatalf("read the answer: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	elapsed := time.Since(start)
 	var decoded map[string]any
 	raw, _ := io.ReadAll(resp.Body)
