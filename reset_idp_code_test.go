@@ -104,7 +104,7 @@ func redeemCode(f *idpFixture, code string) (int, map[string]any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var body map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return resp.StatusCode, nil, err
