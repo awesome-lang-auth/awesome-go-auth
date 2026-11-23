@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Under Config.RevokeSessionsOnPasswordReset, a password login that verified
@@ -321,5 +322,55 @@ func TestPasswordLoginUnderTheOptionKeepsAMigratedHash(t *testing.T) {
 	}
 	if storedUser(t, svc, "usr_legacy").PasswordHash == "legacy:marker" {
 		t.Error("precondition: the login did not migrate the hash")
+	}
+}
+
+// TestRevokingResetLeavesNoSessionToAnEnrolmentInFlight is the same window on
+// the one other path that opens a session on the strength of the password:
+// the forced enrolment of EnrolOnLogin. Its token is bound to the password,
+// but the binding is checked before the factor is stored and the session
+// opened, and a reset that lands in between used to leave that session alive.
+// Now the completion reads the account again once its session exists, gives
+// the session up and answers ErrInvalidToken, as a token minted under another
+// password is answered.
+func TestRevokingResetLeavesNoSessionToAnEnrolmentInFlight(t *testing.T) {
+	store := newHoldingSessionStore()
+	svc, events := newInFlightService(t, store, NewMemoryUserStore(), revokeOnReset, func(c *Config) {
+		c.Require2FA = true
+		c.EnrolOnLogin = true
+		c.SendMagicLink, c.SendSMSCode = nil, nil
+	})
+	ctx := context.Background()
+	user, enrolment := setupChallenge(t, svc, "enrolinflight@example.com")
+	setup, err := svc.NewForcedTOTPEnrolment(ctx, enrolment)
+	if err != nil {
+		t.Fatalf("NewForcedTOTPEnrolment: %v", err)
+	}
+	token := mintResetToken(t, svc, "enrolinflight@example.com")
+	events.reset()
+
+	tokens, err := inFlightLogin(t, svc, store, token, func() (AuthTokens, error) {
+		_, tokens, err := svc.CompleteTOTPEnrolment(ctx, enrolment, setup.Secret, codeFor(t, setup.Secret, time.Now()))
+		return tokens, err
+	})
+
+	if !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("enrolment in flight across the reset -> err = %v, want ErrInvalidToken", err)
+	}
+	if tokens != (AuthTokens{}) {
+		t.Errorf("enrolment in flight across the reset handed out tokens")
+		if _, err := svc.Refresh(ctx, tokens.RefreshToken); err == nil {
+			t.Errorf("the session that enrolment opened after the reset still refreshes")
+		}
+	}
+	sessions, err := store.ListSessionsForUser(ctx, user.ID, "t1")
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].RevokedAt == nil {
+		t.Errorf("sessions = %+v, want the one the enrolment opened, revoked", sessions)
+	}
+	if got := events.named(EventAuthLoginSuccess); len(got) != 0 {
+		t.Errorf("identity.auth.login.success raised for the refused enrolment: %+v", got)
 	}
 }

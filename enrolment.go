@@ -218,6 +218,10 @@ func (s *Service) NewForcedTOTPEnrolment(ctx context.Context, enrolmentToken str
 // A session that fails to open leaves the factor enrolled, which is the only
 // order there is: the secret has to be stored before the account counts as
 // holding a factor. The user then signs in with the password and the code.
+// Under Config.RevokeSessionsOnPasswordReset that includes a session given up
+// because the account's password changed after the token was verified — a
+// reset that landed while the enrolment was in flight — which is answered
+// ErrInvalidToken (keepPasswordSession).
 func (s *Service) CompleteTOTPEnrolment(ctx context.Context, enrolmentToken, secret, code string) (User, AuthTokens, error) {
 	user, claims, err := s.verifyEnrolmentToken(ctx, enrolmentToken)
 	if err != nil {
@@ -234,6 +238,16 @@ func (s *Service) CompleteTOTPEnrolment(ctx context.Context, enrolmentToken, sec
 	user.TOTPSecret = minted
 	tokens, sessionID, err := s.issueSession(ctx, user)
 	if err != nil {
+		return User{}, AuthTokens{}, err
+	}
+	// The token's cred claim was checked against the password before the
+	// session existed, and a revoking reset that landed in between would not
+	// have seen this session (keepPasswordSession). A password changed by then
+	// is answered as a token minted under another password is.
+	if err := s.keepPasswordSession(ctx, user, sessionID); err != nil {
+		if errors.Is(err, ErrInvalidCredentials) {
+			err = ErrInvalidToken
+		}
 		return User{}, AuthTokens{}, err
 	}
 	// The tail POST /2fa/verify ends with (node-auth auth.router.ts:968): the
