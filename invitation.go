@@ -994,7 +994,7 @@ func (s *Service) AcceptInvitation(ctx context.Context, in AcceptInvitationInput
 		return result, nil
 	}
 	if s.registerIssuesSession(activated) {
-		tokens, err := s.completeLocalLogin(ctx, activated)
+		tokens, err := s.completeLocalLogin(ctx, activated, nil)
 		if err != nil {
 			// The account is active and its password set: answering an error
 			// now would send the invitee back to a token that is spent. The

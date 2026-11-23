@@ -190,7 +190,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (User, AuthTok
 	}
 	// The login's own tail: the same session row and the same
 	// identity.auth.login.success with method "local" a password login raises.
-	tokens, err := s.completeLocalLogin(ctx, created)
+	tokens, err := s.completeLocalLogin(ctx, created, nil)
 	if err != nil {
 		return User{}, zeroTokens, err
 	}
@@ -241,7 +241,7 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (User, AuthTokens, e
 	if secondFactor {
 		return User{}, zeroTokens, ErrTwoFactorRequired
 	}
-	tokens, err := s.completeLocalLogin(ctx, user)
+	tokens, err := s.completeLocalLogin(ctx, user, &in)
 	if err != nil {
 		return User{}, zeroTokens, err
 	}
@@ -574,10 +574,23 @@ func (s *Service) newSessionTokens(ctx context.Context, user User) (AuthTokens, 
 // the publication lives in the tail they share. One helper rather than two
 // copies is what keeps the dev line's single site single: neither entry point
 // can drift from the other, and no caller can reach both and publish twice.
-func (s *Service) completeLocalLogin(ctx context.Context, user User) (AuthTokens, error) {
+//
+// login is the request of those two password logins. It is nil for Register
+// and an accepted invitation, which end the same way but have just set the
+// password rather than proven it. For a password login the session is kept
+// only once keepPasswordSession has found the proven password still the
+// account's, which it checks under Config.RevokeSessionsOnPasswordReset;
+// otherwise the login is refused as loginPassword refuses one — loginFailed,
+// with the address the request carried — and no success is raised.
+func (s *Service) completeLocalLogin(ctx context.Context, user User, login *LoginInput) (AuthTokens, error) {
 	tokens, sessionID, err := s.issueSession(ctx, user)
 	if err != nil {
 		return AuthTokens{}, err
+	}
+	if login != nil {
+		if err := s.keepPasswordSession(ctx, user, sessionID); err != nil {
+			return AuthTokens{}, s.loginFailed(ctx, login.Email, err)
+		}
 	}
 	s.publish(ctx, func() Event {
 		return Event{
@@ -588,6 +601,80 @@ func (s *Service) completeLocalLogin(ctx context.Context, user User) (AuthTokens
 		}
 	})
 	return tokens, nil
+}
+
+// keepPasswordSession decides, under Config.RevokeSessionsOnPasswordReset,
+// whether a session just opened on the strength of a password may be handed
+// out: only when the account, read again now that the session exists, still
+// holds the password hash the caller proved — proven.PasswordHash, the stored
+// hash the password verified against, or the one Config.PasswordVerifier's
+// migration wrote in its place.
+//
+// It is what closes a revoking reset to a login already in flight.
+// ResetPassword writes the new password and only then revokes the account's
+// sessions, and a password login reads the account, compares the password —
+// bcrypt, the slow step — and only then opens its session. A session opened
+// after the revocation had looked was never seen by it, but the login that
+// opened it reads the account here, after the password write, and finds the
+// new hash; a session opened before the revocation began is one the
+// revocation ends. Either way nothing opened with the old password outlives
+// the reset. That holds on two things the stores owe: GetUserByID sees a
+// password write that has returned (a read from a lagging replica does not),
+// and the revocation reaches every session whose creation had returned when
+// it began, which is UserSessionRevoker's contract and a consistent listing's.
+//
+// A password that has changed, and an account the store no longer has, are
+// ErrInvalidCredentials, a wrong password's answer. A read that fails is an
+// opaque error, the generic 500, and never a credential refusal. Either way
+// the session is given up first (giveUpSession).
+//
+// With the option off it reads nothing and returns nil: a reset revokes no
+// session there, so a login has nothing to fall behind.
+func (s *Service) keepPasswordSession(ctx context.Context, proven User, sessionID string) error {
+	if !s.cfg.RevokeSessionsOnPasswordReset {
+		return nil
+	}
+	current, err := s.users.GetUserByID(ctx, proven.ID, proven.TenantID)
+	switch {
+	case err == nil && current.PasswordHash == proven.PasswordHash:
+		return nil
+	case err == nil:
+		s.logf("auth: login for user %q: the password changed between the comparison and the session, as a reset does; the session is given up and the login refused", proven.ID)
+		err = ErrInvalidCredentials
+	case errors.Is(err, ErrUserNotFound):
+		err = ErrInvalidCredentials
+	default:
+		s.logf("auth: login for user %q: the account could not be read again once its session was open, so the session is given up and the login refused: %v", proven.ID, err)
+		err = fmt.Errorf("auth: login: read the account again: %v", err)
+	}
+	s.giveUpSession(ctx, proven, sessionID)
+	return err
+}
+
+// giveUpSession revokes a session whose tokens a refused login never handed
+// out. Nothing can use it, since nobody holds its tokens; it is revoked so that
+// the account's sessions are listed as they are. The revocation runs without
+// ctx's cancellation, bounded by its deadline (detachedContext), and a failure
+// is logged and goes no further.
+func (s *Service) giveUpSession(ctx context.Context, user User, sessionID string) {
+	ctx, cancel := detachedContext(ctx)
+	defer cancel()
+	if err := s.revokeSession(ctx, sessionID, user.ID, user.TenantID); err != nil && !errors.Is(err, ErrSessionNotFound) {
+		s.logf("auth: session %s of user %q, opened by a login that was then refused, could not be revoked; its tokens were never handed out: %v", sessionID, user.ID, err)
+	}
+}
+
+// detachedContext is ctx without its cancellation, bounded by its deadline
+// when it has one, for the work that follows a write that has already landed:
+// a caller that goes away then — on a Go net/http server, a client that
+// half-closes its connection cancels the request context — must not cut that
+// work short. The CancelFunc releases the deadline's timer.
+func detachedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(detached, deadline)
+	}
+	return detached, func() {}
 }
 
 // sessionIDOf recovers the session id from an access token this service has
