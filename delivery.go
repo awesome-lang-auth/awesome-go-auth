@@ -73,9 +73,11 @@ type MagicLinkDelivery struct {
 	// the service was called directly, in which case that static base applies.
 	LinkBase string `json:"linkBase,omitempty"`
 	// Lang is the request's emailLang body field, passed through untouched
-	// (auth.router.ts:1080, 1104/1114). "it" and "en" select the built-in
-	// template set over MagicLinkMailer.Locale; anything else, the empty string
-	// included, defers to it (resolveLang, mailer.service.ts:255-259).
+	// (auth.router.ts:1080, 1104/1114) unless Config.EmailLangs lists the
+	// deployment's languages, under which it is one of those or empty. "it"
+	// and "en" select the built-in template set over MagicLinkMailer.Locale;
+	// anything else, the empty string included, defers to it (resolveLang,
+	// mailer.service.ts:255-259). The other deliveries' Lang is the same.
 	Lang string `json:"lang,omitempty"`
 }
 

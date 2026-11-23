@@ -75,14 +75,70 @@ type Config struct {
 	// bcrypt.MinCost. A Config that was never told a cost must not silently get
 	// the weakest one. Any other value must lie in
 	// [bcrypt.MinCost, bcrypt.MaxCost]; validate rejects the rest.
-	BcryptCost            int
-	ResetTokenTTL         time.Duration
-	MagicLinkTTL          time.Duration
-	SMSCodeTTL            time.Duration
-	EmailVerificationTTL  time.Duration
-	EmailVerificationMode string
-	EmailChangeTTL        time.Duration
-	TempTokenTTL          time.Duration
+	BcryptCost    int
+	ResetTokenTTL time.Duration
+	// ForgotPasswordMinResponseTime is the least time POST
+	// <prefix>/forgot-password takes to answer, measured from when the request
+	// reaches Auth.ForgotPassword: whichever branch it took — a known address
+	// whose mail was sent, an unknown one, one an invitation reserves, a
+	// delivery that failed, a store that failed — the answer is held until the
+	// floor has passed. It exists because the branches cost differently: a
+	// known address waits for the delivery, a synchronous webhook or mail
+	// relay that can take seconds, and the others answer right after a lookup,
+	// so the time alone says which addresses have accounts though the status
+	// and the body do not. Sending from a goroutine once the answer is written
+	// is no fix where the runtime freezes at that point, as AWS Lambda's does.
+	// A sender that only hands the delivery to a durable queue is one: the
+	// known branch is then short and a small floor covers it, though the token
+	// is then stored once the queue has the delivery, not once the mail is out.
+	//
+	// It hides the difference only where the floor is above the slow branch's
+	// worst case: a branch that already took longer is not held further, so
+	// set it at or above the lookup, plus the sender's own timeout (a
+	// DeliveryWebhook's Timeout, for one), plus the token write that follows a
+	// good send. The hold ends early only at the request context's deadline,
+	// forgotPasswordAnswerHeadroom (100 ms) before it — on Lambda the
+	// function's, where an answer written after it is a timeout. The work
+	// behind the answer, the send and the store included, is bounded by that
+	// same moment, floor or no floor, so no branch answers later: a sender that
+	// honours its context and is still running then is cut off, as a failed
+	// delivery (200, nothing stored), and a store write cut off there answers
+	// the 500 of a failed store. A cancelled context does not end the hold: on
+	// a Go net/http server a client that half-closes its connection cancels
+	// the request context and can still read the answer, so a cancelled
+	// request is held like any other, and a client that did go away costs the
+	// server the rest of the floor. Nothing here knows of a timeout the context
+	// does not carry — http.Server.WriteTimeout, a proxy's, an API gateway's
+	// integration timeout — so keep the floor well below each of those. A body
+	// refused before the service is reached (400 INVALID_BODY,
+	// 413 BODY_TOO_LARGE) is not held: it depends on no address.
+	// Service.ForgotPassword, the library call, is never held, and keeps the
+	// caller's deadline as it is.
+	//
+	// What it costs: every request on the route, an unknown address's
+	// included, lasts at least the floor. Where the runtime counts concurrent
+	// executions — AWS Lambda's does — each held request occupies one for that
+	// long, so the route needs its request rate times the floor in concurrency
+	// and in billed duration, and a burst of anonymous requests can take the
+	// capacity the deployment's other routes share. A rate limiter keyed on
+	// the address in the body does not bound that, since every new address
+	// has a budget of its own; a limit per client, or capacity reserved for
+	// the function, in front of the route does.
+	//
+	// What it does not hide: the status. A store write that fails after a good
+	// send answers 500, and only a known address gets that far (the
+	// reference's answer, kept). Nor does it reach /magic-link/send and
+	// /sms/send, whose known and unknown addresses differ in time the same way.
+	//
+	// Zero — the default — is off, the behaviour this field predates. A
+	// negative value is refused. WithForgotPasswordMinResponseTime sets it.
+	ForgotPasswordMinResponseTime time.Duration
+	MagicLinkTTL                  time.Duration
+	SMSCodeTTL                    time.Duration
+	EmailVerificationTTL          time.Duration
+	EmailVerificationMode         string
+	EmailChangeTTL                time.Duration
+	TempTokenTTL                  time.Duration
 	// IssueSessionOnRegister decides whether POST <prefix>/register — and
 	// Service.Register — also logs the new account in: when true, a successful
 	// registration opens a session exactly as a successful POST <prefix>/login
@@ -296,7 +352,95 @@ type Config struct {
 	// adapters hand the ready-made mailers no per-request base and their static
 	// BaseURL applies, as it did before this field existed. WithSiteURLs sets it.
 	SiteURLs []string
-	Logger   func(format string, args ...any)
+	// EmailLangs lists the languages a mail may be asked for through a
+	// request's emailLang: the languages this deployment's senders render.
+	// Set, the language every mail carries — the four link mails of
+	// forgot-password, send-verification-email, change-email/request and
+	// magic-link/send, the link-request mail, the invitation, and the
+	// email-changed notice a direct caller asks a language for — reaches the
+	// sender as one of these entries or not at all. The value is matched
+	// without regard to case, first whole and then by its primary language
+	// subtag ("IT", "it-IT" and "it_IT" are "it"), and anything else — an
+	// unlisted language, a value that is not a language tag, one longer than
+	// 35 characters — is replaced by "", which every sender reads as the
+	// deployment's default, as it reads a request that sent none. No request
+	// is refused for its language, so no answer depends on it.
+	//
+	// Empty — the zero value — keeps the behaviour this field predates: the
+	// value reaches the sender as it was sent, as the reference passes
+	// emailLang to its mailer (auth.router.ts:779, 788). The library's own
+	// mailers honour "it" and "en" and fall back to their Locale for anything
+	// else (resolveLang), so a deployment on them loses nothing with
+	// []string{"it", "en"}; one with a sender of its own lists what that
+	// sender renders. Each entry must be a language tag — subtags of letters
+	// and digits separated by '-' or '_', the first two to eight letters, at
+	// most 35 characters — or NewService refuses the configuration.
+	// WithEmailLangs sets it.
+	EmailLangs []string
+	Logger     func(format string, args ...any)
+}
+
+// maxLanguageTagLen is the longest language tag EmailLangs accepts or lets
+// through: the length RFC 5646 §4.4.1 asks every implementation to support.
+const maxLanguageTagLen = 35
+
+// isLanguageTag reports whether s has the shape of a language tag: one or more
+// subtags of ASCII letters and digits, separated by '-' or '_' (the POSIX
+// spelling of a locale is common in a request), the first of two to eight
+// letters and each of one to eight characters, at most maxLanguageTagLen in
+// all. It checks the shape and not the registry: "xx" is a tag here, and
+// whether a deployment has templates for it is what EmailLangs says.
+func isLanguageTag(s string) bool {
+	if s == "" || len(s) > maxLanguageTagLen {
+		return false
+	}
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i < len(s) && s[i] != '-' && s[i] != '_' {
+			c := s[i] | 0x20 // ASCII lower case; leaves digits as they are
+			letter := c >= 'a' && c <= 'z'
+			digit := s[i] >= '0' && s[i] <= '9'
+			if !letter && (!digit || start == 0) {
+				return false
+			}
+			continue
+		}
+		n := i - start
+		if n < 1 || n > 8 || (start == 0 && n < 2) {
+			return false
+		}
+		start = i + 1
+	}
+	return true
+}
+
+// emailLang is the language a delivery carries for the emailLang a request
+// sent: under EmailLangs, the matching entry as configured, or "" for the
+// sender's default; with none configured, the value as it was sent. See
+// EmailLangs.
+func (c Config) emailLang(requested string) string {
+	if len(c.EmailLangs) == 0 {
+		return requested
+	}
+	tag := strings.TrimSpace(requested)
+	if !isLanguageTag(tag) {
+		return ""
+	}
+	for _, lang := range c.EmailLangs {
+		if strings.EqualFold(tag, lang) {
+			return lang
+		}
+	}
+	primary := tag
+	if i := strings.IndexAny(tag, "-_"); i >= 0 {
+		primary = tag[:i]
+	}
+	for _, lang := range c.EmailLangs {
+		if strings.EqualFold(primary, lang) {
+			return lang
+		}
+	}
+	return ""
 }
 
 // DefaultConfig returns secure defaults for development and production bootstrap.
@@ -379,6 +523,14 @@ func (c Config) validate() error {
 	}
 	if c.InvitationTTL < 0 {
 		return errors.New("auth: invitation ttl must be > 0, or 0 for the default (72h)")
+	}
+	if c.ForgotPasswordMinResponseTime < 0 {
+		return errors.New("auth: forgot-password minimum response time must be >= 0, and 0 is off")
+	}
+	for _, lang := range c.EmailLangs {
+		if !isLanguageTag(lang) {
+			return fmt.Errorf("auth: email language %q is not a language tag (subtags of letters and digits separated by '-' or '_', at most %d characters)", lang, maxLanguageTagLen)
+		}
 	}
 	return nil
 }

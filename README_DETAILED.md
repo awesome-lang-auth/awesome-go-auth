@@ -409,6 +409,7 @@ type Config struct {
     RefreshTokenTTL       time.Duration                 // default: 30d
     SessionCheckOn        string                        // allcalls|refresh|none (default: refresh)
     ResetTokenTTL         time.Duration                 // default: 1h
+    ForgotPasswordMinResponseTime time.Duration         // default: 0, off; the least time /forgot-password takes to answer — see ForgotPasswordMinResponseTime
     MagicLinkTTL          time.Duration                 // default: 15m
     SMSCodeTTL            time.Duration                 // default: 10m
     EmailVerificationTTL  time.Duration                 // default: 24h
@@ -438,6 +439,7 @@ type Config struct {
     Settings              SettingsStore                 // optional; the admin-flipped runtime settings — see Runtime settings
     Events                *EventBus                     // optional; WithEventBus sets it — see Event Bus
     SiteURLs              []string                      // first = canonical link base; all = origin allowlist — see Delivery
+    EmailLangs            []string                      // optional; the languages emailLang may select, e.g. {"it", "en"} — see Per-request link base and language
     Logger                func(format string, args ...any)
 }
 ```
@@ -482,6 +484,84 @@ log straight in gets the plain `201` and no session — an unverified address un
 `EmailVerificationMode` `strict` (the service logs this once at startup when both
 are configured), or any account under `Require2FA`. A refused registration never
 issues anything. `WithIssueSessionOnRegister(true)` turns it on.
+
+### `ForgotPasswordMinResponseTime`
+
+`POST /auth/forgot-password` answers `200 {"success": true}` for every address,
+but not in the same time: a known address waits for its reset mail to be handed
+to the sender — a synchronous webhook or mail relay, often a second or more —
+while an unknown address, or one an invitation still reserves, is answered right
+after a lookup. The status and the body say nothing; the clock says which
+addresses have accounts. Sending from a goroutine once the answer is written is
+not a fix for a deployment whose runtime freezes at that point, as AWS Lambda's
+does. A sender that only hands the delivery to a durable queue is one: the known
+branch is then short and a small floor covers it, though the token is then
+stored once the queue has the delivery rather than once the mail is out.
+
+`WithForgotPasswordMinResponseTime(d)` holds the answer until `d` has passed since
+the request reached `Auth.ForgotPassword`, on every branch alike:
+
+| Branch | Work before the answer | Held until |
+|---|---|---|
+| known address, mail sent | lookup, send, store | `d` |
+| unknown address | lookup | `d` |
+| an invitation reserves the address | lookup, invitation check | `d` |
+| known address, the send failed (still `200`) | lookup, failed send | `d` |
+| known address, the store failed after the send (`500`) | lookup, send, failed store | `d` |
+
+- **Set it above the slow branch's worst case.** A branch that already took
+  longer than `d` is not held further, so the floor hides the difference only
+  when it covers the lookup, the sender's own timeout (a `DeliveryWebhook`'s
+  `Timeout`, 5 seconds unless set) and the token write that follows a good
+  send. A floor between the typical and the worst delivery time hides the
+  typical case and not the outliers.
+- **It ends early only at the request's deadline.** The hold ends 100 ms before
+  the request context's deadline — on Lambda the function's own, where an
+  answer written after it is a timeout. The work behind the answer ends at the
+  same moment, with or without a floor: a sender that honours its context and
+  is still running then is cut off, as a failed delivery (`200`, nothing
+  stored), and a store write cut off there answers the `500` of a failed
+  store, so no branch is answered at the deadline itself. The hold does
+  **not** end when the context is cancelled: on a Go `net/http` server a
+  client that half-closes its connection cancels the request context and can
+  still read the answer, so ending the hold there would hand it the time the
+  work took. A client that did go away costs the server the rest of the floor.
+- **Keep it below every timeout the context does not carry.** Nothing here knows
+  of `http.Server.WriteTimeout`, a proxy's timeout or an API gateway's
+  integration timeout; a floor at or above one of them turns every answer into
+  that timeout.
+- **What it does not hold:** a body refused before the service is reached
+  (`400 INVALID_BODY`, `413 BODY_TOO_LARGE`), which depends on no address, and
+  `Service.ForgotPassword`, the library call, which is not the HTTP surface.
+- **What it costs:** every request on the route, an unknown address's included,
+  lasts at least `d`. Where the runtime counts concurrent executions — AWS
+  Lambda's does — each held request occupies one for that long, so the route
+  needs its request rate times `d` in concurrency and in billed duration (20
+  requests a second held 6 seconds is about 120 concurrent executions), and a
+  burst of anonymous requests can take the capacity the deployment's other
+  routes share. A rate limiter keyed on the address in the body does not bound
+  that, since every new address has a budget of its own: put a limit per client
+  (or reserved capacity for the function) in front of the route.
+- **What it does not hide:** the status — a store write that fails after a good
+  send answers `500`, and only a known address gets that far (the reference's
+  answer, kept) — and the other routes that send to an address a stranger
+  names: `/magic-link/send` and `/sms/send` differ in time between known and
+  unknown addresses the same way, and have no floor.
+
+Zero — the default — is off, as before the option existed; a negative value
+makes `New` fail.
+
+Independently of the floor, once the address has named an account the rest of
+the request — the invitation check, the send, the store — runs to its end even
+if the client goes away: `Service.ForgotPassword` runs it under the request
+context without its cancellation, bounded by the context's deadline when there
+is one. On the route that deadline is brought forward by the same 100 ms
+(`Auth.ForgotPassword`), so the answer is written before the request's own;
+the library call keeps the caller's deadline as it is. A client that hangs up
+mid-send can therefore neither leave a mailed link unstored nor turn a store
+that honours its context into a `500` that only a known address gets. A sender
+needs a timeout of its own for the same reason (`DeliveryWebhook` has one):
+nothing cancels it when the client leaves.
 
 ### `TwoFactorAppName` and the TOTP parameters
 
@@ -1031,6 +1111,8 @@ Pass to `auth.New(...)`:
 | `WithTemplateStore(TemplateStore)` | Run-time overrides of the built-in mail templates — see [`TemplateStore` interface](#templatestore-interface) |
 | `WithSettingsStore(SettingsStore)` | Global settings an administrator flips at run time; only `require2FA` is acted on — see [Runtime settings](#runtime-settings) |
 | `WithSiteURLs(urls ...string)` | Front-end base URLs: the first is the canonical link base, all are the origin allowlist — see [Per-request link base and language](#per-request-link-base-and-language) |
+| `WithForgotPasswordMinResponseTime(time.Duration)` | The least time `POST /forgot-password` takes to answer, on every branch alike; off by default — see [ForgotPasswordMinResponseTime](#forgotpasswordminresponsetime) |
+| `WithEmailLangs(langs ...string)` | The languages a request's `emailLang` may select; anything else reaches the sender as `""`, its default. Unset, `emailLang` passes through as sent — see [Per-request link base and language](#per-request-link-base-and-language) |
 | `WithLogger(func)` | Logging callback |
 
 Pass to `NewService(...)` as `ServiceOption`:
@@ -2064,6 +2146,38 @@ detail — a transport failure must not describe itself to the caller) and leave
 stored credential in place, which is what the reference does: an undelivered token
 is unguessable and expires on its own.
 
+`PasswordResetSender` is the exception on both counts. `POST /auth/forgot-password`
+answers `200` whatever the sender returns (the deviation
+`forgot-password-succeeds-on-delivery-failure`), and the reset token is stored only
+once the sender has returned `nil`: storing replaces the token the account held, so
+a send that fails stores nothing and the link the person was mailed before keeps
+working. A sender therefore returns `nil` only for a message accepted for delivery;
+one that errors after the message did leave (a timeout on the answer) leaves that
+message's link unusable, the earlier one intact. With no sender configured the
+token is stored at once, for a caller of `Service.ForgotPassword` that delivers the
+returned token itself.
+
+Three consequences for whoever writes a reset sender:
+
+- **The token is not valid while the sender runs.** It becomes valid once the
+  sender has returned `nil`, so a sender or a test harness that spends it from
+  inside the call gets `ErrInvalidToken`.
+- **Only a delivered request replaces a link.** Asking again cuts off the link
+  mailed before only when the new mail goes out; after a failed delivery the
+  earlier link stays valid until it is used, expires (`ResetTokenTTL`) or the
+  password is changed: `POST /auth/change-password` clears the account's reset
+  token once the new password is stored (the deviation
+  `change-password-ends-the-reset-link`), whether or not a mail can be
+  delivered. A clear that fails is logged and does not fail the change. The
+  clear ends the token stored when it runs: a request whose mail is still with
+  the sender when the password changes stores its token afterwards, and that
+  link works like any other. The window is the sender's answer time, and the
+  link goes to the account's own address.
+- **Nothing cancels the send when the client goes away.** The send and the store
+  run under the request context without its cancellation, bounded by its
+  deadline when there is one (on the route, 100 ms before it), so a sender
+  needs a timeout of its own (`DeliveryWebhook` has one).
+
 ### Built-in senders
 
 ```go
@@ -2273,7 +2387,7 @@ has two extra members:
 
 ```go
 LinkBase string // e.g. "https://app.example.com/auth"; "" when no site URL is configured
-Lang     string // the request's emailLang body field, untouched; "" when omitted
+Lang     string // the request's emailLang body field — untouched, or bounded by Config.EmailLangs; "" when omitted
 ```
 
 `LinkBase` is resolved in three steps, each a transcription of the reference:
@@ -2313,8 +2427,32 @@ mailing exactly the links it did. A custom sender reads the two members directly
 
 The service inputs carry the same two members (`ForgotPasswordInput`,
 `EmailVerificationInput`, `ChangeEmailRequestInput`, `MagicLinkSendInput`) and
-copy them onto the delivery untouched; a caller driving the service directly
-supplies them or leaves them empty.
+copy them onto the delivery; a caller driving the service directly supplies them
+or leaves them empty.
+
+**Bounding the language: `Config.EmailLangs`.** By default `Lang` is the body's
+`emailLang` exactly as sent — any string a caller cares to post, up to the body
+limit, as the reference forwards it. `WithEmailLangs("it", "en")` names the
+languages the deployment's senders render, and then every mail that carries a
+request's language — the four above, the `/link-request` mail
+(`LinkTokenDelivery.EmailLang`), the invitation and the email-changed notice —
+reaches its sender as one of them or as `""`:
+
+| `emailLang` sent | `Lang` delivered under `WithEmailLangs("it", "en")` |
+|---|---|
+| `it`, `IT`, ` it ` | `it` |
+| `it-IT`, `it_IT` — a region of a listed language | `it` |
+| `de`, `xx`, `english` — an unlisted language | `""` |
+| `en<script>`, `it--IT`, 36 characters or more — not a language tag | `""` |
+| nothing | `""` |
+
+`""` is what every sender already reads as "the deployment's default" — the
+built-in mailers then use their `Locale` — so no request is refused for its
+language and the answer never depends on it. Entries must themselves be language
+tags (subtags of letters and digits separated by `-` or `_`, at most 35
+characters), or `New` fails. A deployment on the built-in mailers loses nothing
+with `{"it", "en"}`, the languages their templates have; one with its own sender
+lists what that sender renders.
 
 ---
 
@@ -3904,6 +4042,40 @@ each of their routes in the event-context carrier, the rate-limiter slot and
 the CSRF middleware, and adds the access-token middleware where the route needs
 it. A handler method mounted by hand gets none of these, so `Mount` is the
 supported way to serve the routes.
+
+**The public credential routes bound their body.** `POST /forgot-password`,
+`/reset-password`, `/magic-link/send`, `/magic-link/verify`, `/sms/send`,
+`/sms/verify`, `/change-email/confirm`, `/invitations/accept`, `/link-request`
+and `/link-verify` each take a stranger's body with no session in front of it,
+so every adapter puts `auth.CredentialRouteBodyLimit` in front of them,
+outermost — ahead of the rate-limiter slot and the CSRF check. A body over
+`auth.CredentialRouteMaxBodyBytes` (16 KiB) is answered
+`413 {"error": "Request body too large", "code": "BODY_TOO_LARGE"}`
+(`auth.HTTPErrBodyTooLarge`) before anything reads it: a declared
+`Content-Length` over the bound is refused unread, and a body without one is read
+up to the bound and refused there. Nothing has looked an account up by then, so
+the answer is the same for every address, and a limiter that decodes the body to
+find the address it limits never sees more than 16 KiB. A body within the bound
+reaches the limiter and the handler byte for byte. The reference leaves the
+bound to its host's `express.json()` (100 kB by default); see the deviation
+`credential-route-bodies-are-bounded`. A handler mounted by hand keeps the bound
+when wrapped in `auth.CredentialRouteBodyLimit` (net/http) or preceded by
+`auth.LimitCredentialRouteBody(w, r)`, which reports whether the request may go
+on and has written the answer when it may not.
+
+The bound limits what the server reads, not what a sender relays: a body within
+it can still carry an `emailLang` of several kilobytes, which a delivery webhook
+forwards JSON-encoded (`<`, `>` and `&` escaped to six bytes each) to a receiver
+that may refuse it for its size. `Config.EmailLangs` is the control for the
+relayed language. The bound covers the ten routes above and no others — the
+public routes that hand their body to a sender or spend a credential a mail or a
+text delivered. The rest of the public surface (`/register`, `/login`,
+`/refresh`, `/logout`, the `/2fa` routes, the IdP's token endpoint and the admin
+console's `/login`) reads a stranger's body too but does neither, and the mail
+routes behind a session or the admin guard (`/send-verification-email`,
+`/change-email/request`, the admin invitation) have an authenticated caller. A
+deployment that wants every body bounded puts a limit in front of the mount,
+such as `http.MaxBytesHandler`.
 
 ### `HTTPConfig.RateLimiter` — the rate-limiter slot
 

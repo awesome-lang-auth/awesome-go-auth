@@ -63,12 +63,12 @@ func (a *Adapter) unlinkPathGate(next http.Handler) http.Handler {
 // behind the auth middleware: the conflict flow reaches it unauthenticated and
 // proves identity through the pending-link stash instead.
 func (a *Adapter) LinkRequestHandler() http.Handler {
-	return a.guard(http.HandlerFunc(a.linkRequest))
+	return a.credentialGuard(http.HandlerFunc(a.linkRequest))
 }
 
 // LinkVerifyHandler serves POST <prefix>/link-verify.
 func (a *Adapter) LinkVerifyHandler() http.Handler {
-	return a.guard(http.HandlerFunc(a.linkVerify))
+	return a.credentialGuard(http.HandlerFunc(a.linkVerify))
 }
 
 // oauthAuthorize redirects the browser to the provider with a signed state and

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 )
 
 // This file holds the wire conventions for the password-management and
@@ -286,9 +287,10 @@ func DecodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 }
 
 // ForgotPassword delegates to Service.ForgotPassword and then throws away one
-// class of failure: a send that failed after the token was stored. The route
-// answers 200 {"success":true} for it, exactly as it does for an address that does
-// not exist.
+// class of failure: a send that failed, whose token the service therefore never
+// stored. The route answers 200 {"success":true} for it, exactly as it does for
+// an address that does not exist, and the account keeps whatever link it was
+// mailed before.
 //
 // This is a deliberate divergence, and the only one on this route. The
 // reference's send sits inside the route's try block, so a throwing mailer reaches
@@ -303,16 +305,40 @@ func DecodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 //
 // Store failures are NOT swallowed: those still 500, and that oracle *is*
 // reproduced (see ForgotPasswordHTTPError and the suite case that pins it). The
-// difference is that a store that cannot persist a reset token has minted no
-// credential and served no request correctly, while a stored-but-undelivered token
-// is harmless — unguessable, single-use, expiring — so silence costs the caller
-// nothing but a mail that never arrives.
+// difference is that a store that cannot persist a reset token has served no
+// request correctly — since the send now comes first, it may even have mailed a
+// link that will not work, which the service logs — while an undelivered token
+// is never stored at all, so silence costs the caller nothing but a mail that
+// never arrives, and the earlier link still works.
 //
 // Divergence from Service.ForgotPassword is the same arrangement as
 // Auth.ChangePassword's: the Auth methods are the HTTP surface, and a library
 // consumer calling the service directly still learns that delivery failed.
+//
+// The HTTP surface is also where Config.ForgotPasswordMinResponseTime holds
+// the answer: every return below, the store failure's included, waits until
+// the floor has passed since this call began (holdForgotPasswordAnswer), so
+// the time a known address's delivery takes no longer sets it apart. The wait
+// does not end when ctx is cancelled — a client that half-closes its
+// connection cancels the request context on a Go net/http server and can
+// still read the answer — only when the floor has passed, or shortly before
+// ctx's deadline.
+//
+// The work behind the answer ends by that same moment before the deadline,
+// floor or no floor: the service runs under ctx with its deadline brought
+// forward by forgotPasswordAnswerHeadroom (forgotPasswordWorkContext). Its
+// send and store do not end when ctx is cancelled, so with the deadline
+// itself as their bound a send that outlasted the hold would have the answer
+// written at the deadline — on AWS Lambda a timeout, which only a known
+// address can get. A sender that honours its context is cut off there instead,
+// as a failed delivery, and the route answers 200 in time.
 func (a *Auth) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (string, error) {
-	token, err := a.service.ForgotPassword(ctx, in)
+	if floor := a.service.cfg.ForgotPasswordMinResponseTime; floor > 0 {
+		defer a.service.holdForgotPasswordAnswer(ctx, a.service.now().Add(floor))
+	}
+	work, cancel := forgotPasswordWorkContext(ctx)
+	defer cancel()
+	token, err := a.service.ForgotPassword(work, in)
 	if errors.Is(err, ErrDeliveryFailed) {
 		// Logged, because the wire deliberately cannot report it: a deployment
 		// whose mail gateway is down would otherwise see nothing but 200s while no
@@ -327,6 +353,48 @@ func (a *Auth) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (stri
 		return "", nil
 	}
 	return token, err
+}
+
+// forgotPasswordAnswerHeadroom is how long before the request context's
+// deadline a held /forgot-password answer is let go, and the work behind it
+// ends, so that there is still time to write it. On AWS Lambda the context's
+// deadline is the function's, and an answer written after it is a timeout,
+// not a slow answer.
+const forgotPasswordAnswerHeadroom = 100 * time.Millisecond
+
+// forgotPasswordWorkContext is ctx with its deadline, when it has one,
+// brought forward by forgotPasswordAnswerHeadroom: what Auth.ForgotPassword
+// runs the service under, so that the lookup, and the send and the store that
+// a cancelled ctx no longer stops, are over by the time a held answer is let
+// go. A ctx without a deadline is returned as it is. The returned cancel
+// releases the deadline's timer.
+func forgotPasswordWorkContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(ctx, deadline.Add(-forgotPasswordAnswerHeadroom))
+	}
+	return ctx, func() {}
+}
+
+// holdForgotPasswordAnswer waits until until — the start of the request plus
+// Config.ForgotPasswordMinResponseTime — and no later than
+// forgotPasswordAnswerHeadroom before ctx's deadline; it returns at once when
+// that moment has passed, which is the case of a branch that already took
+// longer than the floor.
+//
+// ctx is read for its deadline only. A cancellation does not end the wait:
+// ending it there would answer a client that half-closed its connection — which
+// cancels the request context on a Go net/http server, and still reads the
+// answer — after the work alone, which is the difference the floor exists to
+// hide. A client that did go away costs the server the rest of the floor.
+func (s *Service) holdForgotPasswordAnswer(ctx context.Context, until time.Time) {
+	if deadline, ok := ctx.Deadline(); ok {
+		if latest := deadline.Add(-forgotPasswordAnswerHeadroom); latest.Before(until) {
+			until = latest
+		}
+	}
+	if wait := until.Sub(s.now()); wait > 0 {
+		s.sleep(wait)
+	}
 }
 
 // ResetPassword delegates to Service.ResetPassword.

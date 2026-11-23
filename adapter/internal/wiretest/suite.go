@@ -80,6 +80,7 @@ func Run(t *testing.T, mount Mounter) {
 	t.Run("CredentialEmptyBody", func(t *testing.T) { testCredentialEmptyBody(t, mount) })
 	t.Run("PasswordAndEmail", func(t *testing.T) { testPasswordAndEmail(t, mount) })
 	t.Run("PasswordEmailDelivery", func(t *testing.T) { testPasswordEmailDelivery(t, mount) })
+	t.Run("CredentialBodyLimit", func(t *testing.T) { testCredentialBodyLimit(t, mount) })
 	t.Run("JWKS", func(t *testing.T) { testJWKS(t, mount) })
 	t.Run("OIDC", func(t *testing.T) { testOIDC(t, mount) })
 	t.Run("OIDCToken", func(t *testing.T) { testOIDCToken(t, mount) })

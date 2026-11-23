@@ -164,20 +164,114 @@ revision the whole contract was extracted from.
 - **Surface**: `POST <prefix>/forgot-password`.
 - **This port**: Always `200 {"success": true}` — when the mail was sent, when
   the configured sender returns an error, and when no sender is configured at
-  all. The reset token stays stored in every case. A *store* failure still
+  all. The reset token is stored only once the sender has accepted it (at once
+  when none is configured), so a send that fails stores nothing and the
+  account's earlier link, if it has one, keeps working. A *store* failure still
   answers `500`, which is the reference's behaviour and is kept.
-- **The reference**: The send sits inside the route's `try`, so a throwing
-  mailer reaches `handleError` and answers `500` (`auth.router.ts:787-798`).
+- **The reference**: Stores the new token, which replaces the account's earlier
+  one, and then sends; the send sits inside the route's `try`, so a throwing
+  mailer reaches `handleError` and answers `500` with the earlier link already
+  dead (`auth.router.ts:784`, `auth.router.ts:787-798`).
 - **Why**: That `500` fires only for an address that **exists**, so a broken
   mail gateway turns the one route whose purpose is to reveal nothing about who
   is registered into an account-enumeration oracle. The contract records the
   status as `[UNTESTED]`, and no client can depend on one that appears only when
-  the operator's mailer is down.
+  the operator's mailer is down. Sending before storing is the same route's
+  other failure mode: with the store first, a request whose mail is refused — a
+  relay's cap, a gateway that is down — kills the link the person was mailed
+  before, for a mail nobody received, and enough such requests keep an account
+  out of the reset altogether.
 - **Observing the failure**: Only the HTTP surface swallows it.
   `Auth.ForgotPassword` absorbs `ErrDeliveryFailed` (and nothing else) and logs
   `auth: password reset delivery failed; the route still answered success: …`,
   without naming the address. `Service.ForgotPassword` still returns the error,
   so a direct library caller learns about it.
+- **What sending first costs**: A sender that reports a failure after the mail
+  did leave — a timeout on its answer — leaves that mail's link unusable, while
+  the earlier one keeps working; and a store write that fails after a good send
+  answers the `500` above with a mailed link that will not work, which is logged
+  (`auth: a password reset was delivered but its token could not be stored, …`).
+  Only a delivered request replaces the account's link now: asking again cuts
+  off a link mailed before only when the new mail goes out, and otherwise that
+  link stays valid until it is used, expires or the password is changed
+  (`change-password-ends-the-reset-link`).
+
+### `change-password` ends an outstanding reset link
+
+`change-password-ends-the-reset-link`
+
+- **Surface**: `POST <prefix>/change-password`.
+- **This port**: Once the new password is stored, the account's reset token is
+  cleared, so a reset link whose token was stored before the change answers
+  `400 {"error": "Invalid reset token"}` on `POST <prefix>/reset-password` from
+  then on. The change itself answers as before: a clear that fails is logged and
+  does not fail it, and the link then lives out `Config.ResetTokenTTL`.
+- **The reference**: Changes the password and leaves the account's reset token
+  as it was: a reset link mailed before the change still sets a new password
+  after it, until it expires (`auth.router.ts:904-932`).
+- **Why**: This port stores a reset token only once its mail went out
+  (`forgot-password-succeeds-on-delivery-failure`), so a request whose delivery
+  fails no longer replaces the account's link. Asking again was the one way to
+  cut off a link a person believes leaked, and it now works only when the new
+  mail goes out; changing the password works whether or not a mail can be
+  delivered. A reset link exists to choose a new password, and once one has been
+  chosen a link minted before it has nothing left to do but take the account
+  back.
+- **A request still being mailed**: The clear ends the token that is stored when
+  it runs, and a `forgot-password` request stores its token only once its send
+  has returned. A request whose mail is still with the sender when the password
+  changes therefore stores its token after the clear, and that link works like
+  any other — until it is used, expires, a delivered request replaces it or the
+  password changes again. The window is the sender's answer time, and the link
+  goes to the account's own address, whose holder can ask for a new link after
+  the change anyway. Closing it would take a token write conditional on the
+  password being unchanged, which `UserPasswordStore` does not offer.
+
+### The public credential routes refuse a body over 16 KiB before anything reads it
+
+`credential-route-bodies-are-bounded`
+
+- **Surface**: `POST <prefix>/forgot-password`, `/reset-password`,
+  `/magic-link/send`, `/magic-link/verify`, `/sms/send`, `/sms/verify`,
+  `/change-email/confirm`, `/invitations/accept`, `/link-request` and
+  `/link-verify`.
+- **This port**: A body over 16 KiB (`CredentialRouteMaxBodyBytes`) is answered
+  `413 {"error": "Request body too large", "code": "BODY_TOO_LARGE"}`. A
+  declared `Content-Length` over the bound is refused unread; a body that
+  declares none, or understates it, is read up to one byte past the bound and
+  refused there. The bound sits outermost on each route, ahead of
+  `HTTPConfig.RateLimiter` and the CSRF check, so nothing has run when the
+  answer goes out — no rate limiter decoding the body, no account lookup — and
+  it is the same for every address. A body within the bound is handed on byte
+  for byte and answered as before.
+- **The reference**: Parses no body itself: the host mounts `express.json()` in
+  front of the router, whose default limit is 100 kB, and a larger body is
+  refused there with a `413` (`entity.too.large`) that the host application's
+  error handler writes. The routes read `req.body` as the parser left it
+  (`auth.router.ts:777-798`, `auth.router.ts:801-825`).
+- **Why**: Each of these routes takes a stranger's body with no session in front
+  of it and reads a few short fields from it — an address, a token, a password,
+  a code, a language. Without a bound of its own this port read whatever
+  arrived, up to what the platform in front of it allows, and a rate limiter
+  that decodes the body to find the address it limits read it first. The
+  reference's bound is its host's parser, and there is no host layer here to
+  leave it to. 16 KiB is far over anything the routes read.
+- **Mounting a handler yourself**: The adapters apply the bound to the routes
+  they mount. `auth.CredentialRouteBodyLimit` is the same check as net/http
+  middleware, and `auth.LimitCredentialRouteBody` as a function for other
+  routers: a host that mounts one of these handlers by hand wraps it to keep the
+  bound.
+- **What it does not bound**: The delivery a sender builds from the request: a
+  body within the bound can still carry an `emailLang` of several kilobytes,
+  which a delivery webhook relays JSON-encoded, `<`, `>` and `&` escaped to six
+  bytes each. `Config.EmailLangs` bounds that. Nor the other routes. The ten are
+  the public routes that hand their body to a sender or spend a credential a
+  mail or a text delivered; `/register`, `/login`, `/refresh`, `/logout`, the
+  `/2fa` routes, the IdP's token endpoint and the admin console's `/login` read
+  a stranger's body too but do neither, and the mail routes behind a session or
+  the admin guard have an authenticated caller. None of them is bounded by the
+  adapters; a deployment that wants every body bounded puts a limit in front of
+  the mount (`http.MaxBytesHandler`).
 
 ### The 2FA step-up token is typed, not an access token
 

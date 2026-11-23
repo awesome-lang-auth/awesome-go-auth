@@ -187,6 +187,25 @@ func testForgotPassword(t *testing.T, mount Mounter) {
 		assertSuccessBody(t, rec)
 	})
 
+	// Config.ForgotPasswordMinResponseTime: the answer is held until the floor
+	// has passed, for a known and an unknown address alike, on every adapter.
+	// Only the lower bound is asserted — a timer guarantees it — and the exact
+	// pads per branch are pinned in the root package against a fake clock.
+	t.Run("with ForgotPasswordMinResponseTime no answer comes before the floor", func(t *testing.T) {
+		const floor = 150 * time.Millisecond
+		env := NewEnv(t, mount, auth.DefaultHTTPConfig(), auth.WithForgotPasswordMinResponseTime(floor))
+		env.Seed("forgotfloor@example.com")
+		for _, email := range []string{"forgotfloor@example.com", "nobody@example.com"} {
+			start := time.Now()
+			rec := env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{"email": email, "tenantId": "t1"}))
+			elapsed := time.Since(start)
+			assertSuccessBody(t, rec)
+			if elapsed < floor {
+				t.Errorf("%s answered after %v, before the %v floor", email, elapsed, floor)
+			}
+		}
+	})
+
 	// An absent body is valid; a present but broken one is not. This is the
 	// port's own convention, shared with /register and /login — the reference's
 	// express.json() answers its own 400 for unparseable JSON.
@@ -210,6 +229,9 @@ func testForgotPassword(t *testing.T, mount Mounter) {
 		unknown := env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{"email": "nobody@example.com", "tenantId": "t1"}))
 		assertSuccessBody(t, unknown)
 	})
+
+	// A client that half-closes its connection; see forgot_password_conn.go.
+	t.Run("over a real connection", func(t *testing.T) { testForgotPasswordOverAConnection(t, mount) })
 }
 
 func testResetPassword(t *testing.T, mount Mounter) {
@@ -297,6 +319,30 @@ func testChangePassword(t *testing.T, mount Mounter) {
 		// changed the password still works afterwards.
 		me := env.Do(bearer(httptest.NewRequest(http.MethodGet, env.Config.Prefix()+"/me", nil), tokens))
 		AssertStatus(t, me, http.StatusOK)
+	})
+
+	// Port-only (change-password-ends-the-reset-link): the reference leaves the
+	// reset token as it was, so a link mailed before the change still sets a
+	// password after it. Here the change clears it.
+	t.Run("ends a reset link minted before the change (port-only)", func(t *testing.T) {
+		env, store := storeEnv(t, mount, auth.DefaultHTTPConfig())
+		user, tokens := env.Seed("changereset@example.com")
+		// Minted through the service: no route hands a reset token back.
+		token, err := env.Auth.Service().ForgotPassword(context.Background(), auth.ForgotPasswordInput{Email: "changereset@example.com", TenantID: "t1"})
+		if err != nil {
+			t.Fatalf("mint reset token: %v", err)
+		}
+
+		req := env.Request(http.MethodPost, "/change-password", map[string]string{"currentPassword": "password1", "newPassword": "newpassword1"})
+		assertSuccessBody(t, env.Do(bearer(req, tokens)))
+		if stored := storedUser(t, store, user); stored.ResetTokenHash != "" || stored.ResetTokenExpiresAt != nil {
+			t.Error("the reset token survived the password change")
+		}
+
+		stale := env.Do(env.Request(http.MethodPost, "/reset-password", map[string]string{"token": token, "password": "takeover123"}))
+		AssertError(t, stale, http.StatusBadRequest, "Invalid reset token", "")
+		fresh := env.Do(env.Request(http.MethodPost, "/login", map[string]string{"email": "changereset@example.com", "password": "newpassword1", "tenantId": "t1"}))
+		AssertStatus(t, fresh, http.StatusOK)
 	})
 
 	// The passwordless fall-through, and the reason this route exists for an

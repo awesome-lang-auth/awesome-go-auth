@@ -42,6 +42,10 @@ func MountWithConfig(r chi.Router, a *auth.Auth, cfg auth.HTTPConfig) {
 	evctx := auth.EventContextMiddleware(resolved)
 	limit, csrf := auth.RateLimitMiddleware(resolved), auth.CSRFMiddleware(resolved)
 	guard := func(next http.Handler) http.Handler { return evctx(limit(csrf(next))) }
+	// The public routes that send or spend a one-time credential carry
+	// auth.CredentialRouteBodyLimit in front of guard: a body over 16 KiB is
+	// answered 413 before the rate limiter or the handler reads it. The link
+	// pair gets it from nethttp's LinkRequestHandler and LinkVerifyHandler.
 
 	// IdP mode: the JWKS document, mounted first and bare — no limiter, no CSRF,
 	// no auth — because the reference registers it ahead of every middleware
@@ -185,10 +189,10 @@ func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(h
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/logout", h.Logout)
 	// Passwordless and 2FA. Chi serves the net/http handlers unchanged, so the
 	// only chi-specific part is the registration.
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/magic-link/send", h.MagicLinkSend)
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/magic-link/verify", h.MagicLinkVerify)
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/sms/send", h.SMSSend)
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/sms/verify", h.SMSVerify)
+	r.With(auth.CredentialRouteBodyLimit, guard).MethodFunc(http.MethodPost, prefix+"/magic-link/send", h.MagicLinkSend)
+	r.With(auth.CredentialRouteBodyLimit, guard).MethodFunc(http.MethodPost, prefix+"/magic-link/verify", h.MagicLinkVerify)
+	r.With(auth.CredentialRouteBodyLimit, guard).MethodFunc(http.MethodPost, prefix+"/sms/send", h.SMSSend)
+	r.With(auth.CredentialRouteBodyLimit, guard).MethodFunc(http.MethodPost, prefix+"/sms/verify", h.SMSVerify)
 	// The two enrolment routes sit behind nethttp's EnrolmentGate: the access
 	// middleware when Config.EnrolOnLogin is off, and nothing when it is on,
 	// because the handlers then also accept the enrolment token of a
@@ -199,16 +203,16 @@ func mountCredentialRoutes(r chi.Router, h *nethttpadapter.Adapter, guard func(h
 	r.With(guard).MethodFunc(http.MethodPost, prefix+"/2fa/verify", h.TwoFactorVerify)
 	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+"/2fa/disable", h.TwoFactorDisable)
 	// Password management and email verification (wire-contract §2).
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/forgot-password", h.ForgotPassword)
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/reset-password", h.ResetPassword)
+	r.With(auth.CredentialRouteBodyLimit, guard).MethodFunc(http.MethodPost, prefix+"/forgot-password", h.ForgotPassword)
+	r.With(auth.CredentialRouteBodyLimit, guard).MethodFunc(http.MethodPost, prefix+"/reset-password", h.ResetPassword)
 	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+"/change-password", h.ChangePassword)
 	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+"/send-verification-email", h.SendVerificationEmail)
 	r.With(guard).MethodFunc(http.MethodGet, prefix+"/verify-email", h.VerifyEmail)
 	r.With(guard, h.Middleware()).MethodFunc(http.MethodPost, prefix+"/change-email/request", h.ChangeEmailRequest)
-	r.With(guard).MethodFunc(http.MethodPost, prefix+"/change-email/confirm", h.ChangeEmailConfirm)
+	r.With(auth.CredentialRouteBodyLimit, guard).MethodFunc(http.MethodPost, prefix+"/change-email/confirm", h.ChangeEmailConfirm)
 	// The invitation accept route, served by nethttp's handler: present only
 	// on an Auth with an InvitationStore.
 	if invitations {
-		r.With(guard).MethodFunc(http.MethodPost, prefix+auth.InvitationAcceptRoute, h.AcceptInvitation)
+		r.With(auth.CredentialRouteBodyLimit, guard).MethodFunc(http.MethodPost, prefix+auth.InvitationAcceptRoute, h.AcceptInvitation)
 	}
 }

@@ -19,6 +19,11 @@ type Service struct {
 	rbac     RolesPermissionsStore
 	tenants  TenantStore
 	now      func() time.Time
+	// sleep waits d: time.Sleep, held here beside now so that a test can
+	// record the wait a minimum response time asks for instead of sleeping it.
+	// It takes no context on purpose: the wait must not end when the client
+	// goes away. See Auth.ForgotPassword.
+	sleep func(d time.Duration)
 }
 
 type ServiceOption func(*Service)
@@ -48,6 +53,7 @@ func NewService(cfg Config, users UserStore, sessions SessionStore, opts ...Serv
 		users:    users,
 		sessions: sessions,
 		now:      time.Now,
+		sleep:    time.Sleep,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -587,9 +593,40 @@ func (s *Service) sessionIDOf(tokens AuthTokens) string {
 }
 
 // ForgotPassword mints a password-reset token for the account that holds an
-// address, stores its hash and delivers it through Config.SendPasswordReset.
+// address, delivers it through Config.SendPasswordReset and, once the
+// delivery has succeeded, stores its hash — or at once when no sender is
+// configured, so that a caller delivering the returned token itself still can.
 // An address no account holds is silence: an empty token and no error, so
 // that the route answers it as it answers a known one.
+//
+// The send comes before the store, the reverse of the reference's order
+// (auth.router.ts:784 then :787-792), because storing replaces whatever token
+// the account held: with the store first, a request whose mail was then
+// refused or lost — a relay's cap, a gateway that is down — killed the link
+// the person had been mailed before, for a mail nobody received, and enough
+// such requests kept an account out of the reset altogether. Now a failed send
+// stores nothing, and the earlier link keeps working until it expires, a
+// delivered one replaces it or the password is changed (ChangePassword clears
+// it). What the order costs is narrower: a sender that reports a failure after
+// the mail did go out (a timeout) leaves that mail's link unusable, and so does
+// a store write that fails after a good send, which is reported as the store
+// failure it is and logged. And a password change that lands while the mail
+// is with the sender does not end this request's link, whose token is stored
+// after the change's clear (see ChangePassword).
+//
+// Once the address has named an account, the rest — the invitation check, the
+// send, the store — runs under ctx without its cancellation (withoutCancel),
+// bounded by ctx's deadline when it has one. A caller that goes away mid-way
+// therefore cannot split the send from the store, which would leave a mailed
+// link that was never stored, nor fail the store or the invitation check,
+// which would answer an error that only a known address can get: on a Go
+// net/http server a client that half-closes its connection cancels the
+// request context and can still read the answer. The lookup itself keeps ctx,
+// since it fails alike for every address. A sender that relied on the
+// cancellation to stop now stops at its own timeout or at ctx's deadline, and
+// a direct caller cannot cancel a send once it has begun. Auth.ForgotPassword,
+// the HTTP surface, brings that deadline forward by
+// forgotPasswordAnswerHeadroom, so that the answer is written before it.
 //
 // An account an invitation still reserves (reservedByInvitation) is answered
 // the same way, and nothing is stored or sent: the invitation is how it gets
@@ -603,6 +640,10 @@ func (s *Service) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (s
 	if err != nil {
 		return "", nil
 	}
+	// From here on the request names an account, and nothing the caller does
+	// may change what happens to it; see the doc comment.
+	ctx, cancel := withoutCancel(ctx)
+	defer cancel()
 	reserved, err := s.reservedByInvitation(ctx, user)
 	if err != nil {
 		return "", err
@@ -619,17 +660,33 @@ func (s *Service) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (s
 		return "", err
 	}
 	expiresAt := s.now().Add(s.cfg.ResetTokenTTL)
-	if err := ps.UpdateResetToken(ctx, user.ID, user.TenantID, hashToken(resetToken), expiresAt); err != nil {
-		return "", err
-	}
-	// Store first, then send, as on the passwordless routes and in the reference
-	// (auth.router.ts:784 then :787-792). A delivery failure is reported to the
-	// caller and leaves the token in place; Auth.ForgotPassword is where the HTTP
-	// surface decides not to let it change the answer.
+	// Send first, then store; see the doc comment for why. A delivery failure
+	// is reported to the caller with nothing stored; Auth.ForgotPassword is
+	// where the HTTP surface decides not to let it change the answer.
 	if err := s.deliverPasswordReset(ctx, user, resetToken, expiresAt, in.LinkBase, in.Lang); err != nil {
 		return "", err
 	}
+	if err := ps.UpdateResetToken(ctx, user.ID, user.TenantID, hashToken(resetToken), expiresAt); err != nil {
+		if s.cfg.SendPasswordReset != nil {
+			// The address stays out of the log, as on the delivery failure's
+			// line: the route's job is not to say who is registered.
+			s.logf("auth: a password reset was delivered but its token could not be stored, so the link it carries will not work: %v", err)
+		}
+		return "", err
+	}
 	return resetToken, nil
+}
+
+// withoutCancel is ctx without its cancellation and with its deadline, if it
+// has one: what a step runs under when a caller that goes away must not cut
+// it short. The values ctx carries — the template store, the event context —
+// come along. The returned cancel releases the deadline's timer.
+func withoutCancel(ctx context.Context) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(detached, deadline)
+	}
+	return detached, func() {}
 }
 
 // ResetPassword sets a new password with a token ForgotPassword minted, and
@@ -641,6 +698,11 @@ func (s *Service) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (s
 // and then handed back because the acceptance failed — would otherwise set a
 // password the invitation can no longer replace on an address still
 // unverified. See reservedByInvitation.
+//
+// Once the new password is written, the token is cleared without ctx's
+// cancellation, bounded by its deadline (clearSpentResetToken): a caller that
+// goes away then cannot leave the spent link able to set the password again.
+// A clear that fails still fails the reset, though the password has changed.
 func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) error {
 	if len(in.NewPassword) < s.cfg.MinPasswordLen {
 		return ErrWeakPassword
@@ -675,7 +737,7 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 	// asymmetry is the reference's; adding the obvious publication here is the
 	// step that turns a port into a fork, and the conformance test in
 	// event_publication_test.go has no site for it.
-	return ps.ClearResetToken(ctx, user.ID, user.TenantID)
+	return s.clearSpentResetToken(ctx, ps, user)
 }
 
 // ChangePassword replaces a user's password, or sets the first one of an
@@ -709,6 +771,26 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // ask for it before calling here (#30). The decision reads the stored hash, so
 // the UserStore must return PasswordHash from GetUserByID; a store that leaves
 // it out makes every account look passwordless.
+//
+// Once the new password is written, the account's reset token is cleared
+// (ClearResetToken), which the reference does not do: a reset link whose
+// token was stored before the change no longer sets a password after it (the
+// change-password-ends-the-reset-link deviation). ForgotPassword stores a
+// token only once its mail went out, so asking again no longer cuts off a link
+// whose mail could not be delivered; changing the password does, whether or
+// not a mail can be delivered. The clear runs without the caller's
+// cancellation, since the password it follows has already changed, and a
+// failed clear does not fail the change: it is logged, and the link lives out
+// Config.ResetTokenTTL.
+//
+// The same order leaves one link the change does not end: a ForgotPassword
+// whose mail is still with the sender when the change lands stores its token
+// after the clear, and that link works like any other until it is used,
+// expires, a delivered request replaces it or the password changes again. The
+// window is the sender's answer time, and the link goes to the account's own
+// address, whose holder can ask for a new one after the change anyway.
+// Closing it would take a token write conditional on the password being
+// unchanged, which UserPasswordStore does not offer.
 func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) error {
 	user, err := s.users.GetUserByID(ctx, in.UserID, in.TenantID)
 	if err != nil {
@@ -741,6 +823,7 @@ func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) er
 	if err := ps.UpdatePassword(ctx, user.ID, user.TenantID, pwHash); err != nil {
 		return err
 	}
+	s.clearResetTokenAfterChange(ctx, ps, user)
 	// node-auth auth.router.ts:1030, straight after the store write and before
 	// the 200. The user id and nothing else: the dev line puts neither the
 	// address nor any indication of what the password was on the payload.
@@ -748,6 +831,33 @@ func (s *Service) ChangePassword(ctx context.Context, in ChangePasswordInput) er
 		return Event{Name: EventUserPasswordChanged, UserID: user.ID}
 	})
 	return nil
+}
+
+// clearResetTokenAfterChange clears the reset token of an account whose
+// password ChangePassword has just written; see its doc comment. The password
+// has changed by now, so neither the caller going away nor the store failing
+// may turn the change into an error: the clear runs without ctx's
+// cancellation, and a failure is logged — naming the user, as the route is
+// authenticated — and otherwise ignored.
+func (s *Service) clearResetTokenAfterChange(ctx context.Context, ps UserPasswordStore, user User) {
+	ctx, cancel := withoutCancel(ctx)
+	defer cancel()
+	if err := ps.ClearResetToken(ctx, user.ID, user.TenantID); err != nil {
+		s.logf("auth: the password of user %q was changed, but its reset token could not be cleared, so a reset link mailed before the change works until it expires: %v", user.ID, err)
+	}
+}
+
+// clearSpentResetToken clears the token ResetPassword has just set a password
+// with. The password has changed by then, so the clear runs without ctx's
+// cancellation, bounded by its deadline, as clearResetTokenAfterChange does:
+// on a Go net/http server a client that half-closes its connection cancels the
+// request context, and a clear cut short there — by a store that honours its
+// context — left the spent link able to set the password again until it
+// expired. Its error is still the reset's, as it was before.
+func (s *Service) clearSpentResetToken(ctx context.Context, ps UserPasswordStore, user User) error {
+	ctx, cancel := withoutCancel(ctx)
+	defer cancel()
+	return ps.ClearResetToken(ctx, user.ID, user.TenantID)
 }
 
 // SendMagicLink mints a magic link, stores its hash and delivers it through
@@ -787,9 +897,10 @@ func (s *Service) SendMagicLink(ctx context.Context, in MagicLinkSendInput) (str
 	// unguessable and expires on its own. Sending first would risk the opposite,
 	// a delivered link the store never learned about.
 	//
-	// LinkBase and Lang are the request's, copied through untouched: the
-	// reference hands the strategy its siteUrlOverride and lang as built and as
-	// received (auth.router.ts:1104/1114 → magic-link.strategy.ts:25-29).
+	// LinkBase and Lang are the request's: LinkBase copied through untouched,
+	// as the reference hands the strategy its siteUrlOverride as built
+	// (auth.router.ts:1104/1114 → magic-link.strategy.ts:25-29), and Lang
+	// through Config.EmailLangs, untouched too when it lists no language.
 	if err := s.cfg.SendMagicLink(s.senderContext(ctx), MagicLinkDelivery{
 		UserID:    user.ID,
 		TenantID:  user.TenantID,
@@ -797,7 +908,7 @@ func (s *Service) SendMagicLink(ctx context.Context, in MagicLinkSendInput) (str
 		Token:     magicToken,
 		ExpiresAt: expiresAt,
 		LinkBase:  in.LinkBase,
-		Lang:      in.Lang,
+		Lang:      s.cfg.emailLang(in.Lang),
 	}); err != nil {
 		return "", fmt.Errorf("auth: deliver magic link: %w", err)
 	}

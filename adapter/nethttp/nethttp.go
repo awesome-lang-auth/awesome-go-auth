@@ -221,23 +221,23 @@ func (a *Adapter) mountCredentialRoutes(mux *http.ServeMux, prefix string) {
 	// enrolment token of a 2FA_SETUP_REQUIRED answer
 	// (auth.Auth.TOTPEnrolmentCaller); without it they sit behind the
 	// middleware, as they always did.
-	mux.Handle("POST "+prefix+"/magic-link/send", a.guard(http.HandlerFunc(a.MagicLinkSend)))
-	mux.Handle("POST "+prefix+"/magic-link/verify", a.guard(http.HandlerFunc(a.MagicLinkVerify)))
-	mux.Handle("POST "+prefix+"/sms/send", a.guard(http.HandlerFunc(a.SMSSend)))
-	mux.Handle("POST "+prefix+"/sms/verify", a.guard(http.HandlerFunc(a.SMSVerify)))
+	mux.Handle("POST "+prefix+"/magic-link/send", a.credentialGuard(http.HandlerFunc(a.MagicLinkSend)))
+	mux.Handle("POST "+prefix+"/magic-link/verify", a.credentialGuard(http.HandlerFunc(a.MagicLinkVerify)))
+	mux.Handle("POST "+prefix+"/sms/send", a.credentialGuard(http.HandlerFunc(a.SMSSend)))
+	mux.Handle("POST "+prefix+"/sms/verify", a.credentialGuard(http.HandlerFunc(a.SMSVerify)))
 	mux.Handle("POST "+prefix+"/2fa/setup", a.guard(a.enrolmentGate(http.HandlerFunc(a.TwoFactorSetup))))
 	mux.Handle("POST "+prefix+"/2fa/verify-setup", a.guard(a.enrolmentGate(http.HandlerFunc(a.TwoFactorVerifySetup))))
 	mux.Handle("POST "+prefix+"/2fa/verify", a.guard(http.HandlerFunc(a.TwoFactorVerify)))
 	mux.Handle("POST "+prefix+"/2fa/disable", a.guard(a.Middleware()(http.HandlerFunc(a.TwoFactorDisable))))
 	// Password management and email verification (wire-contract §2). Handlers in
 	// password_email.go.
-	mux.Handle("POST "+prefix+"/forgot-password", a.guard(http.HandlerFunc(a.ForgotPassword)))
-	mux.Handle("POST "+prefix+"/reset-password", a.guard(http.HandlerFunc(a.ResetPassword)))
+	mux.Handle("POST "+prefix+"/forgot-password", a.credentialGuard(http.HandlerFunc(a.ForgotPassword)))
+	mux.Handle("POST "+prefix+"/reset-password", a.credentialGuard(http.HandlerFunc(a.ResetPassword)))
 	mux.Handle("POST "+prefix+"/change-password", a.guard(a.Middleware()(http.HandlerFunc(a.ChangePassword))))
 	mux.Handle("POST "+prefix+"/send-verification-email", a.guard(a.Middleware()(http.HandlerFunc(a.SendVerificationEmail))))
 	mux.Handle("GET "+prefix+"/verify-email", a.guard(http.HandlerFunc(a.VerifyEmail)))
 	mux.Handle("POST "+prefix+"/change-email/request", a.guard(a.Middleware()(http.HandlerFunc(a.ChangeEmailRequest))))
-	mux.Handle("POST "+prefix+"/change-email/confirm", a.guard(http.HandlerFunc(a.ChangeEmailConfirm)))
+	mux.Handle("POST "+prefix+"/change-email/confirm", a.credentialGuard(http.HandlerFunc(a.ChangeEmailConfirm)))
 	// The invitation accept route (invitations.go): a credential route, so it
 	// is here and gone under ResourceServer, but not one of the nineteen —
 	// it exists only on an Auth with an InvitationStore, and
@@ -305,6 +305,14 @@ func (a *Adapter) EnrolmentGate() func(http.Handler) http.Handler {
 
 func (a *Adapter) guard(h http.Handler) http.Handler {
 	return auth.EventContextMiddleware(a.cfg)(auth.RateLimitMiddleware(a.cfg)(auth.CSRFMiddleware(a.cfg)(h)))
+}
+
+// credentialGuard is guard for the public routes that send or spend a
+// one-time credential, with the body bound in front of it:
+// auth.CredentialRouteBodyLimit refuses a body over 16 KiB with 413 before the
+// rate limiter or the handler reads it.
+func (a *Adapter) credentialGuard(h http.Handler) http.Handler {
+	return auth.CredentialRouteBodyLimit(a.guard(h))
 }
 
 type registerRequest struct {

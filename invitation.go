@@ -765,7 +765,7 @@ func (s *Service) deliverInvitation(ctx context.Context, invitation Invitation, 
 		Token:        token,
 		ExpiresAt:    invitation.ExpiresAt,
 		LinkBase:     linkBase,
-		Lang:         lang,
+		Lang:         s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver invitation: %w: %w", ErrDeliveryFailed, err)

@@ -21,6 +21,10 @@ import (
 // that is credential material, the sender on Config rather than behind a
 // UserStore assertion, no sender required by Config.validate, and store-first-
 // then-send so a failed send leaves an unguessable token that expires on its own.
+// /forgot-password is the exception to that last one: it sends first and stores
+// the token only once the send succeeded, because storing replaces the token the
+// account held, and a failed send must not kill the link mailed before it (see
+// Service.ForgotPassword).
 //
 // What differs from magic-link and SMS is what an *unconfigured* deployment sees,
 // and the difference is the reference's, not a simplification:
@@ -46,11 +50,15 @@ import (
 // have no anti-enumeration duty. It is deliberately *not* reproduced on
 // /forgot-password — see ErrDeliveryFailed and Auth.ForgotPassword.
 
-// ErrDeliveryFailed marks a send that failed after the credential was already
-// stored. It is joined to the transport's own error rather than replacing it, so
-// a caller can still read the cause, and it exists for exactly one reason:
-// /forgot-password has to tell a delivery failure apart from a store failure in
-// order to swallow the first and report the second (Auth.ForgotPassword).
+// ErrDeliveryFailed marks a send that failed: on the authenticated routes after
+// the credential was already stored, which leaves it there, and on
+// /forgot-password before it was, which leaves nothing stored and the account's
+// earlier token in force. Its text keeps the first wording so as not to break a
+// match a host already has on it. It is joined to the transport's own error
+// rather than replacing it, so a caller can still read the cause, and it exists
+// for exactly one reason: /forgot-password has to tell a delivery failure apart
+// from a store failure in order to swallow the first and report the second
+// (Auth.ForgotPassword).
 //
 // It maps to no catalog entry of its own. HTTPErrorFor does not know it, so it
 // falls through to the generic 500 — which is what the reference answers for a
@@ -131,6 +139,24 @@ type EmailChangeDelivery struct {
 //
 // An error does NOT fail POST <prefix>/forgot-password: that route answers 200
 // {"success":true} whatever happens. See Auth.ForgotPassword.
+//
+// The token is stored only once the sender returns nil, and storing it is what
+// replaces the token the account held. So nil must mean the message was
+// accepted for delivery, and an error that the message was not — or may not
+// have been: an error after the message did leave (a timeout on the answer)
+// leaves its link unusable, while the account keeps its earlier one. It
+// follows that the token cannot be redeemed while the sender runs: a sender,
+// or a test harness, that spends it from inside the call gets
+// ErrInvalidToken, and the token becomes valid once the sender has returned
+// nil. Only a delivered request replaces an outstanding link: one whose
+// delivery failed leaves the earlier link working until it is used, expires,
+// a delivered request replaces it or the password is changed
+// (Service.ChangePassword clears it).
+//
+// ctx is not cancelled when the request's client goes away: once the address
+// has named an account the send and the store run to the end, bounded by the
+// request's deadline when it has one (see Service.ForgotPassword). A sender
+// therefore needs a timeout of its own, as DeliveryWebhook has.
 type PasswordResetSender func(ctx context.Context, delivery PasswordResetDelivery) error
 
 // EmailVerificationSender delivers an email-verification token. An error fails
@@ -159,9 +185,10 @@ type EmailChangedDelivery struct {
 	OldEmail string `json:"oldEmail"`
 	// NewEmail is the address the account has now (:1057, 1062).
 	NewEmail string `json:"newEmail"`
-	// Lang is ConfirmEmailChangeInput.Lang, copied through untouched. The
-	// routes leave it empty — the reference calls sendEmailChanged with no
-	// language (:1062, 1065) — so EmailChangedMailer renders in its Locale.
+	// Lang is ConfirmEmailChangeInput.Lang, copied through untouched, or
+	// through Config.EmailLangs when it lists languages. The routes leave it
+	// empty — the reference calls sendEmailChanged with no language (:1062,
+	// 1065) — so EmailChangedMailer renders in its Locale.
 	Lang string `json:"lang"`
 }
 
@@ -217,7 +244,9 @@ func EmailChangeConfirmURL(base, token string) string {
 // -----------------------------------------------------------------------------
 
 // deliverPasswordReset, deliverEmailVerification and deliverEmailChange are the
-// three send steps, called after the token hash is stored.
+// three send steps: deliverEmailVerification and deliverEmailChange are called
+// after the token hash is stored, deliverPasswordReset before it (see
+// Service.ForgotPassword).
 //
 // A nil sender returns nil: on these routes an unconfigured deployment sends
 // nothing and still succeeds. A failing sender returns an error joining
@@ -225,9 +254,10 @@ func EmailChangeConfirmURL(base, token string) string {
 // swallow one failure mode without swallowing store failures too.
 //
 // linkBase and lang are the request's, copied from the service input onto the
-// delivery untouched: the service neither resolves nor validates them, exactly
-// as the reference's routes hand `link` and `emailLang` to the sender as built
-// and as received (auth.router.ts:788, 957, 1028).
+// delivery: linkBase untouched, as the reference's routes hand `link` to the
+// sender as built, and lang through Config.EmailLangs, which with no languages
+// configured is untouched too — the reference hands `emailLang` over as received
+// (auth.router.ts:788, 957, 1028) — and with some is one of them or nothing.
 //
 // Every sender is called with senderContext(ctx), which is how Config.Templates
 // reaches a ready-made mailer.
@@ -242,7 +272,7 @@ func (s *Service) deliverPasswordReset(ctx context.Context, user User, token str
 		Token:     token,
 		ExpiresAt: expiresAt,
 		LinkBase:  linkBase,
-		Lang:      lang,
+		Lang:      s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver password reset: %w: %w", ErrDeliveryFailed, err)
@@ -261,7 +291,7 @@ func (s *Service) deliverEmailVerification(ctx context.Context, user User, token
 		Token:     token,
 		ExpiresAt: expiresAt,
 		LinkBase:  linkBase,
-		Lang:      lang,
+		Lang:      s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver email verification: %w: %w", ErrDeliveryFailed, err)
@@ -280,7 +310,7 @@ func (s *Service) deliverEmailChange(ctx context.Context, user User, newEmail, t
 		Token:     token,
 		ExpiresAt: expiresAt,
 		LinkBase:  linkBase,
-		Lang:      lang,
+		Lang:      s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver email change: %w: %w", ErrDeliveryFailed, err)
@@ -300,7 +330,7 @@ func (s *Service) deliverEmailChanged(ctx context.Context, user User, oldEmail, 
 		TenantID: user.TenantID,
 		OldEmail: oldEmail,
 		NewEmail: newEmail,
-		Lang:     lang,
+		Lang:     s.cfg.emailLang(lang),
 	})
 	if err != nil {
 		return fmt.Errorf("auth: deliver email changed: %w: %w", ErrDeliveryFailed, err)

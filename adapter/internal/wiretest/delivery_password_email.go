@@ -23,11 +23,13 @@ import (
 // answer decides whether the sender got the real thing. Nothing here compares
 // against a value the test computed itself.
 //
-// Three behaviours are pinned per sender — the round trip, the store-then-send
-// order, and a stored credential surviving a failed send — plus the answer an
+// Three behaviours are pinned per sender — the round trip, the order of store
+// and send, and what a failed send leaves stored — plus the answer an
 // unconfigured deployment gets, which is a 200 with no mail on all three routes
 // because the reference sends nothing and still succeeds there (auth.router.ts:
-// 787-792, 956-961, 1027-1032).
+// 787-792, 956-961, 1027-1032). The order is the reference's, store then send,
+// on the two authenticated routes, and the reverse on /forgot-password, where
+// a failed send must not replace the link the account was mailed before.
 
 // senderEnv mounts an adapter whose seam carries only the senders the case under
 // test asks for. It starts from NewEnvWithoutDelivery on purpose: these three
@@ -145,6 +147,22 @@ func runLinkResolutionCases(t *testing.T, mount Mounter, probe linkProbe) {
 
 	t.Run("emailLang reaches the sender as given", func(t *testing.T) {
 		check(t, auth.DefaultHTTPConfig(), site, map[string]string{"Origin": app}, "it", app+"/auth", "it")
+	})
+
+	// Config.EmailLangs, off in the case above: on, the sender is handed one of
+	// the configured languages or nothing, whatever the body carried, and the
+	// route answers the same 200 (each probe asserts it).
+	t.Run("with EmailLangs only a configured language reaches the sender", func(t *testing.T) {
+		langs := append(append([]auth.Option(nil), site...), auth.WithEmailLangs("it", "en"))
+		for _, tc := range []struct{ sent, want string }{
+			{"EN", "en"},
+			{"it-IT", "it"},
+			{"de", ""},
+			{"en<script>", ""},
+			{strings.Repeat("a", 4096), ""},
+		} {
+			check(t, auth.DefaultHTTPConfig(), langs, map[string]string{"Origin": app}, tc.sent, app+"/auth", tc.want)
+		}
 	})
 
 	// With no site URL configured the delivery carries no base at all, which is
@@ -273,12 +291,13 @@ func testPasswordResetDelivery(t *testing.T, mount Mounter) {
 		}
 	})
 
-	// Store first, then send. The sender reads the row while the request is still
-	// in flight: the hash has to be there already, because a sender that mails a
-	// token the store has not learned about yet sends a credential that may never
-	// become valid.
-	t.Run("stores the token before it sends it", func(t *testing.T) {
-		var sawHash string
+	// Send first, then store. The sender reads the row while the request is
+	// still in flight: the new hash must not be there yet, because storing it
+	// replaces the token the account held, and a send that then failed would
+	// have killed the link mailed before for a mail nobody received. Once the
+	// send has succeeded the hash is there.
+	t.Run("sends the token before it stores it", func(t *testing.T) {
+		var sawHash, delivered string
 		store := auth.NewMemoryUserStore()
 		env := NewEnvWithoutDelivery(t, mount, auth.DefaultHTTPConfig(),
 			auth.WithUserStore(store),
@@ -288,16 +307,19 @@ func testPasswordResetDelivery(t *testing.T, mount Mounter) {
 					t.Errorf("read back the user from inside the sender: %v", err)
 					return nil
 				}
-				sawHash = stored.ResetTokenHash
+				sawHash, delivered = stored.ResetTokenHash, d.Token
 				return nil
 			}))
-		env.Seed("resetorder@example.com")
+		user, _ := env.Seed("resetorder@example.com")
 
 		assertSuccessBody(t, env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{
 			"email": "resetorder@example.com", "tenantId": testTenant,
 		})))
-		if sawHash == "" {
-			t.Error("the sender was called before the token was stored")
+		if sawHash != "" {
+			t.Error("the token was stored before its delivery succeeded")
+		}
+		if storedUser(t, store, user).ResetTokenHash == "" || delivered == "" {
+			t.Error("the token was not stored once its delivery succeeded")
 		}
 	})
 
@@ -307,18 +329,36 @@ func testPasswordResetDelivery(t *testing.T, mount Mounter) {
 	// would be a 500 only for an address that exists, which is the enumeration
 	// oracle the route exists to deny. The reference does answer 500
 	// (auth.router.ts:796-798) and its own spec marks that an [UNTESTED] oracle;
-	// this is the port's deliberate divergence, and the credential still survives.
+	// this is the port's deliberate divergence. Nor may it change the account:
+	// the failed send stores nothing, so the link mailed before still resets
+	// the password.
 	//
 	// The known/unknown comparison at the end is the assertion that makes the
 	// reason true rather than merely intended: with the same broken sender wired,
 	// the two addresses must be indistinguishable. Do not weaken it to a bare
 	// "status is 200" — a 200 whose body differed would still be an oracle.
-	t.Run("a failing sender still gets 200 and keeps the stored token", func(t *testing.T) {
+	t.Run("a failing sender still gets 200, stores nothing, and the link mailed before still works", func(t *testing.T) {
+		var mailed []string
+		failing := false
 		env, store := senderEnv(t, mount, auth.WithPasswordResetSender(
-			func(context.Context, auth.PasswordResetDelivery) error { return errTransportDown },
+			func(_ context.Context, d auth.PasswordResetDelivery) error {
+				if failing {
+					return errTransportDown
+				}
+				mailed = append(mailed, d.Token)
+				return nil
+			},
 		))
 		user, _ := env.Seed("resetfailed@example.com")
+		assertSuccessBody(t, env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{
+			"email": "resetfailed@example.com", "tenantId": testTenant,
+		})))
+		if len(mailed) != 1 {
+			t.Fatalf("mailed %d resets, want 1", len(mailed))
+		}
+		before := storedUser(t, store, user)
 
+		failing = true
 		rec := env.Do(env.Request(http.MethodPost, "/forgot-password", map[string]string{
 			"email": "resetfailed@example.com", "tenantId": testTenant,
 		}))
@@ -329,10 +369,14 @@ func testPasswordResetDelivery(t *testing.T, mount Mounter) {
 		AssertNoCookie(t, rec, hostRefresh)
 
 		stored := storedUser(t, store, user)
-		if stored.ResetTokenHash == "" {
-			t.Error("the stored token was rolled back; an undelivered token is harmless and stays")
+		if stored.ResetTokenHash != before.ResetTokenHash {
+			t.Error("a failed send replaced the token the account was mailed before")
 		}
 		assertTTL(t, "reset token", stored.ResetTokenExpiresAt, resetTokenTTL)
+		spend := env.Do(env.Request(http.MethodPost, "/reset-password", map[string]string{
+			"token": mailed[0], "password": "afterfailure1",
+		}))
+		assertSuccessBody(t, spend)
 
 		// And the answer is byte-identical to the unknown-address answer, which is
 		// what "no oracle" actually means.

@@ -282,10 +282,10 @@ func (ad *Adapter) mountCredentialRoutes(group gin.IRoutes, prefix string) {
 	// enrolment token of a 2FA_SETUP_REQUIRED answer
 	// (auth.Auth.TOTPEnrolmentCaller); without it they sit behind the
 	// middleware, as they always did.
-	group.POST(prefix+"/magic-link/send", ad.guard(ad.magicLinkSend))
-	group.POST(prefix+"/magic-link/verify", ad.guard(ad.magicLinkVerify))
-	group.POST(prefix+"/sms/send", ad.guard(ad.smsSend))
-	group.POST(prefix+"/sms/verify", ad.guard(ad.smsVerify))
+	group.POST(prefix+"/magic-link/send", ad.credentialGuard(ad.magicLinkSend))
+	group.POST(prefix+"/magic-link/verify", ad.credentialGuard(ad.magicLinkVerify))
+	group.POST(prefix+"/sms/send", ad.credentialGuard(ad.smsSend))
+	group.POST(prefix+"/sms/verify", ad.credentialGuard(ad.smsVerify))
 	if ad.auth.EnrolOnLogin() {
 		group.POST(prefix+"/2fa/setup", ad.guard(ad.twoFactorSetup))
 		group.POST(prefix+"/2fa/verify-setup", ad.guard(ad.twoFactorVerifySetup))
@@ -339,6 +339,21 @@ func (ad *Adapter) guard(h gin.HandlerFunc) gin.HandlerFunc {
 			// gin would otherwise run the rest of the chain on top of it.
 			c.Abort()
 		}
+	}
+}
+
+// credentialGuard is guard for the public routes that send or spend a
+// one-time credential, with the body bound in front of it:
+// auth.LimitCredentialRouteBody refuses a body over 16 KiB with 413 before the
+// rate limiter or the handler reads it, as the net/http adapter's does.
+func (ad *Adapter) credentialGuard(h gin.HandlerFunc) gin.HandlerFunc {
+	guarded := ad.guard(h)
+	return func(c *gin.Context) {
+		if !auth.LimitCredentialRouteBody(c.Writer, c.Request) {
+			c.Abort()
+			return
+		}
+		guarded(c)
 	}
 }
 

@@ -7,6 +7,188 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Config.EmailLangs` (`WithEmailLangs("it", "en")`): the languages a
+  request's `emailLang` may select.** The body field reached every sender
+  exactly as posted — any string, as long as the request body allowed — so a
+  delivery webhook relayed whatever a stranger typed, and a receiver that bounds
+  its own input could refuse the delivery for it. With the option set, the
+  language of every mail that carries one — `forgot-password`,
+  `send-verification-email`, `change-email/request`, `magic-link/send`, the
+  `link-request` mail, the invitation, and the email-changed notice for a direct
+  caller — reaches the sender as one of the configured entries, matched without
+  regard to case and then by its primary language subtag (`IT`, `it-IT` and
+  `it_IT` are `it`), or as `""` for anything else: an unlisted language, a value
+  that is not a language tag, one longer than 35 characters. `""` is what every
+  sender reads as the deployment's default, so no request is refused for its
+  language and no answer depends on it. Unset — the default — `emailLang`
+  passes through as sent, as before, so a sender rendering more languages than
+  the built-in `it` and `en` keeps them. Entries that are not language tags
+  make `New` fail. The normalisation happens where each delivery is built, so
+  it holds for the four adapters and for a direct caller of the service alike.
+
+### Security
+- **The public credential routes refuse a body over 16 KiB, before anything
+  reads it.** `POST <prefix>/forgot-password`, `/reset-password`,
+  `/magic-link/send`, `/magic-link/verify`, `/sms/send`, `/sms/verify`,
+  `/change-email/confirm`, `/invitations/accept`, `/link-request` and
+  `/link-verify` read whatever body arrived, up to whatever the platform in
+  front of them allowed, and a rate limiter that decodes the body to find the
+  address it limits read it first. All four adapters now put
+  `CredentialRouteBodyLimit` in front of these routes, outermost — ahead of
+  `HTTPConfig.RateLimiter` and the CSRF check — and answer a body over
+  `CredentialRouteMaxBodyBytes` (16 KiB) with
+  `413 {"error":"Request body too large","code":"BODY_TOO_LARGE"}`
+  (`HTTPErrBodyTooLarge`, `CodeBodyTooLarge`): a declared `Content-Length` over
+  the bound is refused unread, and a body that declares none, or understates
+  it, is read to one byte past the bound and refused there. No account has been
+  looked up by then, so the answer is the same for every address. A body within
+  the bound is passed on byte for byte and answered as before; nothing those
+  routes read comes near 16 KiB. The served OpenAPI document lists the `413`
+  on the ten routes. New: `CredentialRouteMaxBodyBytes`, `CodeBodyTooLarge`,
+  `HTTPErrBodyTooLarge`, `LimitCredentialRouteBody` (the check, for gin, echo or
+  a host's own router) and `CredentialRouteBodyLimit` (the net/http
+  middleware), which a host that mounts one of these handlers by hand wraps it
+  in to keep the bound. Registered as the deviation
+  `credential-route-bodies-are-bounded`: the reference leaves the bound to its
+  host's `express.json()`, 100 kB by default. The bound limits what the server
+  reads, not what a sender relays: a body within it can still carry an
+  `emailLang` of several kilobytes, which a delivery webhook forwards
+  JSON-encoded and up to six times longer; `Config.EmailLangs` bounds that.
+  The ten are the public routes that hand their body to a sender or spend a
+  credential a mail or a text delivered: the other public routes (`/register`,
+  `/login`, `/refresh`, `/logout`, the `/2fa` routes, the IdP's token endpoint,
+  the admin console's `/login`) and the mail routes behind a session or the
+  admin guard are not bounded, and a deployment that wants them bounded puts a
+  limit in front of the mount.
+- **`POST <prefix>/forgot-password` can answer in the same time for every
+  address: `Config.ForgotPasswordMinResponseTime`
+  (`WithForgotPasswordMinResponseTime(d)`), off by default.** The route already
+  answered every address with the same status and body, but a known address
+  waited for its mail to be handed to the sender — a synchronous webhook or relay,
+  often a second or more — while an unknown address, or one an invitation
+  reserves, was answered right after a lookup, so the time alone told accounts
+  apart. With a floor set, `Auth.ForgotPassword` holds every answer until the
+  floor has passed since the request reached it: a mail sent, an unknown or
+  reserved address, a failed send, a failed store (the `500`) alike. A branch
+  that already took longer is not held further, so the floor hides the
+  difference only when it is above the slow branch's worst case: the lookup,
+  the sender's timeout and the token write. The hold ends 100 ms before the
+  request context's deadline — on AWS Lambda the function's, where an answer
+  written later is a timeout — and the work behind the answer ends then too,
+  with or without a floor: a sender still running at that moment is cut off,
+  as a failed delivery, so a known address is not answered at the deadline
+  itself. The hold does not end when the context is cancelled: on a Go
+  `net/http` server a client that half-closes its connection cancels the
+  request context and can still read the answer, so a cancelled request is
+  held like any other. Keep the floor below every timeout the context does not
+  carry (`http.Server.WriteTimeout`, a proxy's, an API gateway's). A body
+  refused before the service is reached (`400`, `413`) is not held, and
+  neither is `Service.ForgotPassword`. Sending from a goroutine once the
+  answer is written is no option for a runtime that freezes at that point; a
+  sender that only hands the delivery to a durable queue keeps the slow branch
+  short enough for a small floor, though the token is then stored once the
+  queue has the delivery rather than once the mail is out. What it costs:
+  every request lasts at least the floor, so on a runtime that counts
+  concurrent executions the route needs its request rate times the floor in
+  concurrency and billed duration, which a limiter keyed on the address does
+  not bound; put a per-client limit or reserved capacity in front. What it does
+  not hide: the `500` of a failed store, which only a known address reaches,
+  and the same time difference on `/magic-link/send` and `/sms/send`. Zero is
+  off, as before; a negative value makes `New` fail.
+
+### Changed
+- **`POST <prefix>/forgot-password`, `/reset-password`, `/magic-link/send`,
+  `/magic-link/verify`, `/sms/send`, `/sms/verify`, `/change-email/confirm`,
+  `/invitations/accept`, `/link-request` and `/link-verify` answer a body over
+  16 KiB with `413 BODY_TOO_LARGE`**, on every adapter and with no option to
+  turn it off; see Security. A client sending a larger body to one of them got
+  the route's usual answer before.
+- **`Service.ForgotPassword` sends before it stores, and finishes what it
+  started.** A direct caller sees the token stored only once
+  `Config.SendPasswordReset` has returned `nil`, so the token cannot be spent
+  from inside the sender; a failed send stores nothing and leaves the earlier
+  token in place. And once the address has named an account, the invitation
+  check, the send and the store run under the caller's context without its
+  cancellation — bounded by its deadline, when it has one — so cancelling the
+  context no longer stops a send that has begun. On the route,
+  `Auth.ForgotPassword` brings that deadline 100 ms forward, the moment a held
+  answer is let go, so that the answer is written before the request's own
+  deadline; the library call keeps the caller's. A sender needs a timeout of
+  its own (`DeliveryWebhook` has one). See Fixed.
+- **`POST <prefix>/change-password` ends an outstanding reset link.** Once the
+  new password is stored, `Service.ChangePassword` clears the account's reset
+  token (`UserPasswordStore.ClearResetToken`), so a link whose token was
+  stored before the change answers `400 {"error":"Invalid reset token"}` on
+  `/reset-password` from then on; before, it still set a password until it
+  expired. Since a failed delivery no longer replaces the account's link (see
+  Fixed), asking again cuts a link off only when the new mail goes out;
+  changing the password cuts it off whether or not a mail can be delivered.
+  One link outlives the change: a `/forgot-password` request whose mail is
+  still with the sender when the password changes stores its token after the
+  clear, and that link works like any other. It goes to the account's own
+  address, whose holder can ask for a new link after the change anyway;
+  closing that window would take a token write conditional on the password,
+  which `UserPasswordStore` does not offer. The clear runs without the
+  caller's cancellation, and one that fails is logged
+  (`auth: the password of user "…" was changed, but its reset token could not
+  be cleared, …`) and does not fail the change, which answers as before.
+  `ClearResetToken` is now called on every change, whether or not a token is
+  outstanding, so a store must treat a clear with nothing to clear as a no-op
+  (`MemoryUserStore` does); one that errors there logs that line on every
+  change. Registered as the deviation `change-password-ends-the-reset-link`:
+  the reference leaves the reset token as it was.
+
+### Fixed
+- **`POST <prefix>/forgot-password`: a refused or failed delivery no longer
+  kills the link mailed before it.** The route stored the new token — which
+  replaces the account's earlier one — and then sent it, so a request whose
+  mail was then refused or lost (a relay's daily cap, a gateway that is down)
+  left the account with a token nobody had received and the earlier link dead;
+  a handful of such requests, well inside any per-address rate limit, kept an
+  account out of the reset until a mail got through. `Service.ForgotPassword`
+  now sends first and stores the token only once `Config.SendPasswordReset`
+  returned `nil` (at once when no sender is configured, as before, so a caller
+  delivering the returned token itself is unaffected). A failed send stores
+  nothing: the earlier link keeps working until it expires, a delivered one
+  replaces it or the password is changed (see Changed), and the route still
+  answers `200 {"success":true}` for every address. This works with any
+  `UserPasswordStore`, a replace-on-issue one included — the order changes
+  nothing in the store contract. What the order costs: a sender that reports a
+  failure after the message did leave (a timeout on its answer) leaves that
+  message's link unusable, and a store write that fails after a good send
+  answers the `500` a store failure always answered, with a mailed link that
+  will not work — logged as `auth: a password reset was delivered but its
+  token could not be stored, …`, without the address. The
+  token becomes valid only once the sender has returned `nil`, so a sender or
+  test harness that spends it from inside the call gets `ErrInvalidToken`; and
+  only a delivered request replaces a link now, so asking again cuts off a
+  link mailed before only when the new mail goes out (changing the password
+  cuts it off in any case). The two authenticated routes keep the reference's
+  store-then-send order. The `forgot-password-succeeds-on-delivery-failure`
+  entry now says so.
+- **`POST <prefix>/forgot-password`: a client that goes away mid-request no
+  longer changes what the route does.** On a Go `net/http` server a client that
+  half-closes its connection cancels the request context while it can still
+  read the answer. Hanging up while the sender ran cut a delivery webhook's
+  call short — no mail, or a mail whose answer was lost and whose token, under
+  the new order, would never be stored — and a store that honours its context
+  could fail the write and answer `500`, a status only a known address
+  reaches. Once the address has named an account, the invitation check, the
+  send and the store now run under the request context without its
+  cancellation, bounded by its deadline: the mail goes out and its token is
+  stored whether or not the client stays.
+- **`POST <prefix>/reset-password`: a client that goes away once the new
+  password is written no longer leaves the spent link working.** The reset
+  cleared the token under the request context, so a client that half-closed
+  its connection right after the password write made a store that honours its
+  context skip the clear: the reset answered `500` with the password already
+  changed, and the same link set a password again until it expired.
+  `Service.ResetPassword` now clears the token without the caller's
+  cancellation, bounded by its deadline, as the change-password clear does
+  (see Changed). A clear that fails still fails the reset, as before. A store
+  that consumes the token when it is looked up was not exposed.
+
 ## [0.15.0] - 2026-11-21
 
 Staff invitations for invite-only realms (#106): an administrator, or a back
