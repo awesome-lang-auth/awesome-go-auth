@@ -93,11 +93,14 @@ func (s *Service) mustEnrolSecondFactor(user User) bool {
 }
 
 // issueEnrolmentToken mints the token a 2FA_SETUP_REQUIRED answer carries. Its
-// lifetime is Config.TempTokenTTL, the step-up token's, 5 minutes by default.
+// lifetime is Config.EnrolmentTokenTTL when that is set, and otherwise
+// Config.TempTokenTTL, the step-up token's, 5 minutes by default; the token's
+// exp carries it, so a client reads the window off exp - iat. No other token
+// is minted with EnrolmentTokenTTL: the step-up token keeps TempTokenTTL.
 // It carries the cred claim, written after the hook merge like the session
 // claims, so no hook can forge or drop it.
 func (s *Service) issueEnrolmentToken(ctx context.Context, user User) (string, error) {
-	token, _, err := s.mintToken(ctx, user, "", tokenTypeEnrolment, s.cfg.TempTokenTTL,
+	token, _, err := s.mintToken(ctx, user, "", tokenTypeEnrolment, s.cfg.enrolmentTokenTTL(),
 		map[string]any{"cred": s.enrolmentCredential(user)})
 	return token, err
 }
