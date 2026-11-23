@@ -904,7 +904,16 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // reset that has already changed the password. It maps to the generic 500,
 // and the line written through Config.Logger is where an operator reads which
 // account and what failed.
+//
+// It runs without ctx's cancellation, bounded by ctx's deadline
+// (detachedContext). The password has been written by then, and a caller that
+// goes away — on a Go net/http server, a client that half-closes its
+// connection cancels the request context — would otherwise stop the
+// revocation of a store that honours its context, leaving every session alive
+// behind a 500 nobody reads.
 func (s *Service) revokeSessionsAfterReset(ctx context.Context, user User) error {
+	ctx, cancel := detachedContext(ctx)
+	defer cancel()
 	if bulk, ok := s.sessions.(UserSessionRevoker); ok {
 		if err := bulk.RevokeSessionsForUser(ctx, user.ID, user.TenantID); err != nil {
 			s.logf("auth: password reset for user %q: the password was changed, but its sessions could not be revoked and may still work: %v", user.ID, err)
