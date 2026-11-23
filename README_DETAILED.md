@@ -492,8 +492,11 @@ but not in the same time: a known address waits for its reset mail to be handed
 to the sender — a synchronous webhook or mail relay, often a second or more —
 while an unknown address, or one an invitation still reserves, is answered right
 after a lookup. The status and the body say nothing; the clock says which
-addresses have accounts. Sending asynchronously is not a fix for a deployment
-whose runtime freezes as soon as the answer is written, as AWS Lambda's does.
+addresses have accounts. Sending from a goroutine once the answer is written is
+not a fix for a deployment whose runtime freezes at that point, as AWS Lambda's
+does. A sender that only hands the delivery to a durable queue is one: the known
+branch is then short and a small floor covers it, though the token is then
+stored once the queue has the delivery rather than once the mail is out.
 
 `WithForgotPasswordMinResponseTime(d)` holds the answer until `d` has passed since
 the request reached `Auth.ForgotPassword`, on every branch alike:

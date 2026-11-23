@@ -86,8 +86,11 @@ type Config struct {
 	// known address waits for the delivery, a synchronous webhook or mail
 	// relay that can take seconds, and the others answer right after a lookup,
 	// so the time alone says which addresses have accounts though the status
-	// and the body do not. Sending asynchronously is no fix for a deployment
-	// whose runtime freezes once the answer is written, as AWS Lambda's does.
+	// and the body do not. Sending from a goroutine once the answer is written
+	// is no fix where the runtime freezes at that point, as AWS Lambda's does.
+	// A sender that only hands the delivery to a durable queue is one: the
+	// known branch is then short and a small floor covers it, though the token
+	// is then stored once the queue has the delivery, not once the mail is out.
 	//
 	// It hides the difference only where the floor is above the slow branch's
 	// worst case: a branch that already took longer is not held further, so

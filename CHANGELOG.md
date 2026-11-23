@@ -81,8 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held like any other. Keep the floor below every timeout the context does not
   carry (`http.Server.WriteTimeout`, a proxy's, an API gateway's). A body
   refused before the service is reached (`400`, `413`) is not held, and
-  neither is `Service.ForgotPassword`. Sending asynchronously instead is no
-  option for a runtime that freezes once the answer is written. What it costs:
+  neither is `Service.ForgotPassword`. Sending from a goroutine once the
+  answer is written is no option for a runtime that freezes at that point; a
+  sender that only hands the delivery to a durable queue keeps the slow branch
+  short enough for a small floor, though the token is then stored once the
+  queue has the delivery rather than once the mail is out. What it costs:
   every request lasts at least the floor, so on a runtime that counts
   concurrent executions the route needs its request rate times the floor in
   concurrency and billed duration, which a limiter keyed on the address does
