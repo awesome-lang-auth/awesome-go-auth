@@ -98,17 +98,22 @@ type Config struct {
 	// DeliveryWebhook's Timeout, for one), plus the token write that follows a
 	// good send. The hold ends early only at the request context's deadline,
 	// forgotPasswordAnswerHeadroom (100 ms) before it — on Lambda the
-	// function's, where an answer written after it is a timeout. A cancelled
-	// context does not end it: on a Go net/http server a client that
-	// half-closes its connection cancels the request context and can still
-	// read the answer, so a cancelled request is held like any other, and a
-	// client that did go away costs the server the rest of the floor. Nothing
-	// here knows of a timeout the context does not carry —
-	// http.Server.WriteTimeout, a proxy's, an API gateway's integration
-	// timeout — so keep the floor well below each of those. A body refused
-	// before the service is reached (400 INVALID_BODY, 413 BODY_TOO_LARGE) is
-	// not held: it depends on no address. Service.ForgotPassword, the library
-	// call, is never held.
+	// function's, where an answer written after it is a timeout. The work
+	// behind the answer, the send and the store included, is bounded by that
+	// same moment, floor or no floor, so no branch answers later: a sender that
+	// honours its context and is still running then is cut off, as a failed
+	// delivery (200, nothing stored), and a store write cut off there answers
+	// the 500 of a failed store. A cancelled context does not end the hold: on
+	// a Go net/http server a client that half-closes its connection cancels
+	// the request context and can still read the answer, so a cancelled
+	// request is held like any other, and a client that did go away costs the
+	// server the rest of the floor. Nothing here knows of a timeout the context
+	// does not carry — http.Server.WriteTimeout, a proxy's, an API gateway's
+	// integration timeout — so keep the floor well below each of those. A body
+	// refused before the service is reached (400 INVALID_BODY,
+	// 413 BODY_TOO_LARGE) is not held: it depends on no address.
+	// Service.ForgotPassword, the library call, is never held, and keeps the
+	// caller's deadline as it is.
 	//
 	// What it costs: every request on the route, an unknown address's
 	// included, lasts at least the floor. Where the runtime counts concurrent

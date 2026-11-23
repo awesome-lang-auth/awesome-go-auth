@@ -517,11 +517,15 @@ the request reached `Auth.ForgotPassword`, on every branch alike:
   typical case and not the outliers.
 - **It ends early only at the request's deadline.** The hold ends 100 ms before
   the request context's deadline — on Lambda the function's own, where an
-  answer written after it is a timeout. It does **not** end when the context is
-  cancelled: on a Go `net/http` server a client that half-closes its connection
-  cancels the request context and can still read the answer, so ending the hold
-  there would hand it the time the work took. A client that did go away costs
-  the server the rest of the floor.
+  answer written after it is a timeout. The work behind the answer ends at the
+  same moment, with or without a floor: a sender that honours its context and
+  is still running then is cut off, as a failed delivery (`200`, nothing
+  stored), and a store write cut off there answers the `500` of a failed
+  store, so no branch is answered at the deadline itself. The hold does
+  **not** end when the context is cancelled: on a Go `net/http` server a
+  client that half-closes its connection cancels the request context and can
+  still read the answer, so ending the hold there would hand it the time the
+  work took. A client that did go away costs the server the rest of the floor.
 - **Keep it below every timeout the context does not carry.** Nothing here knows
   of `http.Server.WriteTimeout`, a proxy's timeout or an API gateway's
   integration timeout; a floor at or above one of them turns every answer into
@@ -551,10 +555,13 @@ Independently of the floor, once the address has named an account the rest of
 the request — the invitation check, the send, the store — runs to its end even
 if the client goes away: `Service.ForgotPassword` runs it under the request
 context without its cancellation, bounded by the context's deadline when there
-is one. A client that hangs up mid-send can therefore neither leave a mailed
-link unstored nor turn a store that honours its context into a `500` that only
-a known address gets. A sender needs a timeout of its own for the same reason
-(`DeliveryWebhook` has one): nothing cancels it when the client leaves.
+is one. On the route that deadline is brought forward by the same 100 ms
+(`Auth.ForgotPassword`), so the answer is written before the request's own;
+the library call keeps the caller's deadline as it is. A client that hangs up
+mid-send can therefore neither leave a mailed link unstored nor turn a store
+that honours its context into a `500` that only a known address gets. A sender
+needs a timeout of its own for the same reason (`DeliveryWebhook` has one):
+nothing cancels it when the client leaves.
 
 ### `TwoFactorAppName` and the TOTP parameters
 
@@ -2164,8 +2171,8 @@ Three consequences for whoever writes a reset sender:
   delivered. A clear that fails is logged and does not fail the change.
 - **Nothing cancels the send when the client goes away.** The send and the store
   run under the request context without its cancellation, bounded by its
-  deadline when there is one, so a sender needs a timeout of its own
-  (`DeliveryWebhook` has one).
+  deadline when there is one (on the route, 100 ms before it), so a sender
+  needs a timeout of its own (`DeliveryWebhook` has one).
 
 ### Built-in senders
 

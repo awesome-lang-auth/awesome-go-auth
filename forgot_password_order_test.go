@@ -268,6 +268,9 @@ func TestForgotPasswordACallerThatLeavesCannotSplitTheSendFromTheStore(t *testin
 		}
 	})
 
+	// The library call keeps the caller's deadline as it is; the HTTP surface
+	// brings it forward by the answer's headroom
+	// (TestForgotPasswordWorkEndsWhereTheHoldDoes).
 	t.Run("the deadline still applies", func(t *testing.T) {
 		deadline := time.Now().Add(time.Minute)
 		ctx, cancel := context.WithDeadline(context.Background(), deadline)
@@ -281,7 +284,7 @@ func TestForgotPasswordACallerThatLeavesCannotSplitTheSendFromTheStore(t *testin
 		if _, _, err := a.Register(context.Background(), RegisterInput{Email: "deadline@example.com", Password: "password1", TenantID: "t1"}); err != nil {
 			t.Fatalf("register: %v", err)
 		}
-		if _, err := a.ForgotPassword(ctx, ForgotPasswordInput{Email: "deadline@example.com", TenantID: "t1"}); err != nil {
+		if _, err := a.Service().ForgotPassword(ctx, ForgotPasswordInput{Email: "deadline@example.com", TenantID: "t1"}); err != nil {
 			t.Fatalf("forgot password: %v", err)
 		}
 		if !had || !got.Equal(deadline) {

@@ -169,6 +169,89 @@ func TestForgotPasswordFloorNeverPassesTheDeadline(t *testing.T) {
 	}
 }
 
+// deadlineResetTokenStore is a MemoryUserStore that records the deadline its
+// reset-token write ran under.
+type deadlineResetTokenStore struct {
+	*MemoryUserStore
+	deadline time.Time
+	had      bool
+}
+
+func (s *deadlineResetTokenStore) UpdateResetToken(ctx context.Context, userID, tenantID, hash string, expiry time.Time) error {
+	s.deadline, s.had = ctx.Deadline()
+	return s.MemoryUserStore.UpdateResetToken(ctx, userID, tenantID, hash, expiry)
+}
+
+// TestForgotPasswordWorkEndsWhereTheHoldDoes: at the HTTP surface the work
+// behind the answer is bounded by the request's deadline less
+// forgotPasswordAnswerHeadroom, the moment a held answer is let go. The send
+// and the store run without the request's cancellation, so with the deadline
+// itself as their bound a known address whose send outlasted the hold was
+// answered at the deadline — on AWS Lambda a timeout, which an unknown address
+// never gets. It holds with the floor unset too, and a request with no
+// deadline gets none. Service.ForgotPassword, the library call, keeps the
+// caller's deadline as it is.
+func TestForgotPasswordWorkEndsWhereTheHoldDoes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		floor time.Duration
+	}{
+		{"with a floor", 5 * time.Second},
+		{"with the floor unset", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sent time.Time
+			var sentHad bool
+			store := &deadlineResetTokenStore{MemoryUserStore: NewMemoryUserStore()}
+			a := newPasswordEmailAuth(t, nil,
+				WithUserStore(store),
+				WithForgotPasswordMinResponseTime(tc.floor),
+				WithPasswordResetSender(func(sctx context.Context, _ PasswordResetDelivery) error {
+					sent, sentHad = sctx.Deadline()
+					return nil
+				}))
+			a.service.sleep = func(time.Duration) {} // the hold itself is the tests' above
+			if _, _, err := a.Register(context.Background(), RegisterInput{Email: "known@example.com", Password: "password1", TenantID: "t1"}); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			deadline := time.Now().Add(time.Minute)
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			defer cancel()
+			if _, err := a.ForgotPassword(ctx, ForgotPasswordInput{Email: "known@example.com", TenantID: "t1"}); err != nil {
+				t.Fatalf("forgot password: %v", err)
+			}
+			want := deadline.Add(-forgotPasswordAnswerHeadroom)
+			if !sentHad || !sent.Equal(want) {
+				t.Errorf("the send's deadline = %v (set: %v), want the request's less the headroom, %v", sent, sentHad, want)
+			}
+			if !store.had || !store.deadline.Equal(want) {
+				t.Errorf("the store's deadline = %v (set: %v), want the request's less the headroom, %v", store.deadline, store.had, want)
+			}
+		})
+	}
+
+	t.Run("a request with no deadline", func(t *testing.T) {
+		var sent, sentHad bool
+		a := newPasswordEmailAuth(t, nil, WithPasswordResetSender(func(sctx context.Context, _ PasswordResetDelivery) error {
+			sent = true
+			_, sentHad = sctx.Deadline()
+			return nil
+		}))
+		if _, _, err := a.Register(context.Background(), RegisterInput{Email: "known@example.com", Password: "password1", TenantID: "t1"}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if _, err := a.ForgotPassword(context.Background(), ForgotPasswordInput{Email: "known@example.com", TenantID: "t1"}); err != nil {
+			t.Fatalf("forgot password: %v", err)
+		}
+		if !sent {
+			t.Fatal("nothing was sent")
+		}
+		if sentHad {
+			t.Error("the send got a deadline the request did not have")
+		}
+	})
+}
+
 // TestForgotPasswordFloorAddsNothingPastTheFloor: a branch that already took
 // longer than the floor is not held at all. The floor hides the slow branch
 // only when it is set above the delivery's worst case.

@@ -622,7 +622,9 @@ func (s *Service) sessionIDOf(tokens AuthTokens) string {
 // request context and can still read the answer. The lookup itself keeps ctx,
 // since it fails alike for every address. A sender that relied on the
 // cancellation to stop now stops at its own timeout or at ctx's deadline, and
-// a direct caller cannot cancel a send once it has begun.
+// a direct caller cannot cancel a send once it has begun. Auth.ForgotPassword,
+// the HTTP surface, brings that deadline forward by
+// forgotPasswordAnswerHeadroom, so that the answer is written before it.
 //
 // An account an invitation still reserves (reservedByInvitation) is answered
 // the same way, and nothing is stored or sent: the invitation is how it gets

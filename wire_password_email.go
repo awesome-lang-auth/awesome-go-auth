@@ -323,11 +323,22 @@ func DecodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 // connection cancels the request context on a Go net/http server and can
 // still read the answer — only when the floor has passed, or shortly before
 // ctx's deadline.
+//
+// The work behind the answer ends by that same moment before the deadline,
+// floor or no floor: the service runs under ctx with its deadline brought
+// forward by forgotPasswordAnswerHeadroom (forgotPasswordWorkContext). Its
+// send and store do not end when ctx is cancelled, so with the deadline
+// itself as their bound a send that outlasted the hold would have the answer
+// written at the deadline — on AWS Lambda a timeout, which only a known
+// address can get. A sender that honours its context is cut off there instead,
+// as a failed delivery, and the route answers 200 in time.
 func (a *Auth) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (string, error) {
 	if floor := a.service.cfg.ForgotPasswordMinResponseTime; floor > 0 {
 		defer a.service.holdForgotPasswordAnswer(ctx, a.service.now().Add(floor))
 	}
-	token, err := a.service.ForgotPassword(ctx, in)
+	work, cancel := forgotPasswordWorkContext(ctx)
+	defer cancel()
+	token, err := a.service.ForgotPassword(work, in)
 	if errors.Is(err, ErrDeliveryFailed) {
 		// Logged, because the wire deliberately cannot report it: a deployment
 		// whose mail gateway is down would otherwise see nothing but 200s while no
@@ -345,10 +356,24 @@ func (a *Auth) ForgotPassword(ctx context.Context, in ForgotPasswordInput) (stri
 }
 
 // forgotPasswordAnswerHeadroom is how long before the request context's
-// deadline a held /forgot-password answer is let go, so that there is still
-// time to write it. On AWS Lambda the context's deadline is the function's,
-// and an answer written after it is a timeout, not a slow answer.
+// deadline a held /forgot-password answer is let go, and the work behind it
+// ends, so that there is still time to write it. On AWS Lambda the context's
+// deadline is the function's, and an answer written after it is a timeout,
+// not a slow answer.
 const forgotPasswordAnswerHeadroom = 100 * time.Millisecond
+
+// forgotPasswordWorkContext is ctx with its deadline, when it has one,
+// brought forward by forgotPasswordAnswerHeadroom: what Auth.ForgotPassword
+// runs the service under, so that the lookup, and the send and the store that
+// a cancelled ctx no longer stops, are over by the time a held answer is let
+// go. A ctx without a deadline is returned as it is. The returned cancel
+// releases the deadline's timer.
+func forgotPasswordWorkContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(ctx, deadline.Add(-forgotPasswordAnswerHeadroom))
+	}
+	return ctx, func() {}
+}
 
 // holdForgotPasswordAnswer waits until until — the start of the request plus
 // Config.ForgotPasswordMinResponseTime — and no later than

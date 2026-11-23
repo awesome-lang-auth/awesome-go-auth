@@ -75,7 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   difference only when it is above the slow branch's worst case: the lookup,
   the sender's timeout and the token write. The hold ends 100 ms before the
   request context's deadline — on AWS Lambda the function's, where an answer
-  written later is a timeout — and not when the context is cancelled: on a Go
+  written later is a timeout — and the work behind the answer ends then too,
+  with or without a floor: a sender still running at that moment is cut off,
+  as a failed delivery, so a known address is not answered at the deadline
+  itself. The hold does not end when the context is cancelled: on a Go
   `net/http` server a client that half-closes its connection cancels the
   request context and can still read the answer, so a cancelled request is
   held like any other. Keep the floor below every timeout the context does not
@@ -108,7 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token in place. And once the address has named an account, the invitation
   check, the send and the store run under the caller's context without its
   cancellation — bounded by its deadline, when it has one — so cancelling the
-  context no longer stops a send that has begun. A sender needs a timeout of
+  context no longer stops a send that has begun. On the route,
+  `Auth.ForgotPassword` brings that deadline 100 ms forward, the moment a held
+  answer is let go, so that the answer is written before the request's own
+  deadline; the library call keeps the caller's. A sender needs a timeout of
   its own (`DeliveryWebhook` has one). See Fixed.
 - **`POST <prefix>/change-password` ends an outstanding reset link.** Once the
   new password is stored, `Service.ChangePassword` clears the account's reset
