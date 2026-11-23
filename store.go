@@ -187,16 +187,29 @@ type SessionAdminStore interface {
 // revoking them one by one, because that is only as complete as the listing.
 //
 // The contract is the effect, not the means: once RevokeSessionsForUser has
-// returned nil, every session userID held under tenantID when the call began
-// is revoked — its refresh token is refused with ErrSessionRevoked, and a
-// lookup by id reports it revoked — however many there were. A store whose
-// listing is capped or paged, or is read from an eventually consistent index,
-// implements it so that the reset is complete for it: by paging through every
-// session with no cap, or by recording a time before which every session of
-// the account counts as revoked and honouring it wherever a session is read.
-// A session already revoked may keep its earlier revocation. An error means
-// some session may still work, and the reset answers it with the generic 500,
-// as it does a listing that fails.
+// returned nil, every session of userID under tenantID whose CreateSession had
+// returned when the call began is revoked — its refresh token is refused with
+// ErrSessionRevoked, and a lookup by id reports it revoked — however many
+// there were. A session created after the call began is not the store's to
+// catch: the reset has written the new password before it calls, and a
+// password login reads the account again once its session exists, so one
+// that proved the old password finds the new one and gives its session up
+// (see Config.RevokeSessionsOnPasswordReset).
+//
+// A store whose listing is capped or paged, or is read from an eventually
+// consistent index, implements it so that the reset is complete for it: by
+// paging through every session with no cap, or by recording a time before
+// which every session of the account counts as revoked and honouring it
+// wherever a session is read. Such a time has to order sessions as their
+// creation did. Session.CreatedAt is stamped by the service's clock before
+// CreateSession is called, so a revocation time read from another clock is
+// exact only as far as the two agree: a host clock running ahead lets a
+// session created just before the call count as created after it, and that
+// session was opened before the password write, where the login's second read
+// cannot see it. A store that orders both by a clock or a counter of its own
+// is not exposed to that. A session already revoked may keep its earlier
+// revocation. An error means some session may still work, and the reset
+// answers it with the generic 500, as it does a listing that fails.
 //
 // MemorySessionStore does not implement it: its listing is complete and
 // consistent, so the listing path is already exact there.

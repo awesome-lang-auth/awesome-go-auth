@@ -594,13 +594,56 @@ revoked nor expired (`SessionAdminStore.RevokeSessionByID`). What that ends:
 The reset itself opens no session either way; the person signs in with the new
 password. Another account's sessions are never touched.
 
-What it does not end: **a step-up token minted before the reset.** The
-`tempToken` of a 2FA challenge is not a session, so whoever passed the password
-step shortly before the reset and holds the second factor can still complete the
-challenge for `TempTokenTTL` (5 minutes by default) and get a session the reset
-never saw. A shorter `TempTokenTTL` narrows that window. An enrolment token
-(`EnrolOnLogin`) is bound to the password it was minted under and stops working
-at the reset.
+The option also ends what the old password opens that the revocation cannot
+find:
+
+- **A password login in flight** — one that proved the old password before the
+  reset and opens its session after the revocation has looked. Every login that
+  opens a session on the strength of the password (`POST <prefix>/login`, the
+  IdP's `/authorize` form and `/token`, and the forced enrolment of
+  `EnrolOnLogin`) reads the account again once its session exists; if the stored
+  password hash is no longer the one it proved, it gives the session up and is
+  refused — as a wrong password at login, `invalid_grant` at `/token`, and at the
+  enrolment as an enrolment token minted under another password is. The reset
+  writes the password before it revokes, so a session opened before the
+  revocation began is revoked, and one opened after it belongs to a login that
+  sees the new password.
+- **An OIDC authorization code minted before the reset.** It carries the
+  fingerprint of the password its `/authorize` login proved
+  (`AuthCode.Credential`, an HMAC under `Config.Secret` of the stored hash), and
+  `/token` refuses it with `invalid_grant` once the password is another.
+- **A console token from `POST <admin>/login`** for a store account. It carries
+  the same kind of fingerprint, and the admin guard, which reads the account on
+  every console request, refuses it once the password is another — `401`, or the
+  login form for a browser, as for an expired token.
+- **An enrolment token** (`EnrolOnLogin`), bound to the password it was minted
+  under.
+
+What it does not end:
+
+- **A step-up token minted before the reset.** The `tempToken` of a 2FA
+  challenge is not a session, so whoever passed the password step shortly before
+  the reset and holds the second factor can still complete the challenge for
+  `TempTokenTTL` (5 minutes by default) and get a session the reset never saw. A
+  shorter `TempTokenTTL` narrows that window.
+- **An access token on the admin console.** The console accepts an ordinary
+  access token whenever it verifies with the secret access tokens are signed
+  with (`AdminOptions.JWTSecret` unset falls back to `Config.Secret`), and reads
+  no session behind it under any `SessionCheckOn`, `allcalls` included — so one
+  issued before the reset opens the console until it expires (`AccessTokenTTL`).
+
+**What the stores owe.** `UserStore.GetUserByID` returns the account's
+`PasswordHash` and sees a password write that has returned — a read from a
+lagging replica does not. The revocation reaches every session whose creation had
+returned when it began. An `AuthCodeStore` keeps `AuthCode.Credential`; one that
+drops it makes every code fail at `/token`.
+
+**Turning it on** refuses, once, what was minted before with nothing to check:
+an authorization code not yet redeemed, and a store account's console token,
+whose holder signs in again. And a password login is refused if the account's
+password hash changes in the moment between its comparison and its session,
+whatever changed it — a reset, a `POST <prefix>/change-password`, or a concurrent
+`PasswordVerifier` migration of the same account.
 
 **A revocation that fails fails the reset**, with the generic `500` and a line
 through `Config.Logger` naming the user and the store's error. By then the
@@ -608,7 +651,9 @@ password has changed and the sessions the store did revoke stay revoked, but a
 `200` would tell the person that a session still usable is gone. The token is
 left as it is: with a store that keeps it until it is cleared, as
 `MemoryUserStore` does, the same link runs the reset and the revocation again;
-with one that consumes it when it is looked up, a new link does.
+with one that consumes it when it is looked up, a new link does. The revocation
+runs without the caller's cancellation, bounded by its deadline, so a client
+that goes away once the password is written cannot stop it half-way.
 
 The session store must implement `UserSessionRevoker` or `SessionAdminStore`
 (`MemorySessionStore` implements the second): `NewService`, and so `New`,
@@ -616,12 +661,17 @@ refuses the option on one that implements neither, rather than accept a promise
 it could not keep. **The listing path is exactly as complete as the listing.** A
 store whose listing refuses past a cap fails every reset of an account over it,
 with nothing revoked; one that lists from an eventually consistent index can
-miss a session opened in the moment before the reset (none can be opened with
-the old password after it). Such a store implements `UserSessionRevoker`, whose
-contract is the effect — every session the account held when the call began is
-revoked, its refresh token refused and a lookup by id reporting it revoked —
-however the store gets there: paging through every session with no cap, or
-recording a time before which every session of the account counts as revoked.
+miss a session opened in the moment before the reset, which then lives on (one
+opened after the write belongs to a login that sees the new password). Such a
+store implements `UserSessionRevoker`, whose contract is the effect — every
+session whose creation had returned when the call began is revoked, its refresh
+token refused and a lookup by id reporting it revoked — however the store gets
+there: paging through every session with no cap, or recording a time before
+which every session of the account counts as revoked. Such a time has to order
+sessions as their creation did: `Session.CreatedAt` is stamped by the service's
+clock before `CreateSession`, so a revocation time from another clock is exact
+only as far as the two clocks agree; a store that orders both by a clock or a
+counter of its own is not exposed to that.
 `WithRevokeSessionsOnPasswordReset(true)` turns it on. Registered as the
 deviation `reset-password-can-revoke-sessions`.
 
@@ -2824,6 +2874,7 @@ type AuthCode struct {
     CodeChallenge, CodeChallengeMethod string // S256 only; verified against code_verifier
     Scope                              string
     ExpiresAt                          time.Time
+    Credential                         string // under RevokeSessionsOnPasswordReset only; see below
 }
 
 type AuthCodeStore interface {
@@ -2842,6 +2893,13 @@ The contract, in full in the `AuthCodeStore` doc comment:
   delete, row lock, `DEL`-and-check), not a read followed by a delete.
 - An expired record is absent: `ConsumeCode` returns `ErrInvalidCode` and may
   drop it. `token` re-checks `ExpiresAt` regardless.
+- `Credential` comes back as it was saved. Under
+  `Config.RevokeSessionsOnPasswordReset`, `authorize` sets it to the fingerprint
+  of the password its login proved, and `token` refuses with `invalid_grant` a
+  code whose `Credential` is empty or no longer the account's — so a store that
+  drops the field fails every code under the option. With the option off it is
+  empty and nothing reads it (see
+  [`RevokeSessionsOnPasswordReset`](#revokesessionsonpasswordreset)).
 
 `IDPConfig.Codes` left nil selects `NewMemoryAuthCodeStore()`, an in-process
 map behind a mutex that sweeps expired entries on each save. That is correct

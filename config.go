@@ -184,13 +184,57 @@ type Config struct {
 	//   - The reset itself opens no session, either way; the person signs in
 	//     with the new password.
 	//
-	// What it does not end: a step-up token — the tempToken of a 2FA
-	// challenge — minted before the reset. Whoever passed the password step
-	// shortly before the reset and holds the second factor can still complete
-	// that challenge for TempTokenTTL (5 minutes by default) and get a session
-	// the reset never saw; a shorter TempTokenTTL narrows the window. An
-	// enrolment token (EnrolOnLogin) is bound to the password it was minted
-	// under, and stops working at the reset.
+	// The option also ends what the old password opens that the revocation
+	// cannot find:
+	//
+	//   - A password login in flight: one that proved the old password before
+	//     the reset and opens its session after the revocation has looked. A
+	//     login that opens a session on the strength of the password —
+	//     Service.Login and LoginWithChallenge (POST <prefix>/login, and the
+	//     IDP's /authorize form), the IDP's /token, and the forced enrolment of
+	//     EnrolOnLogin — reads the account again once its session exists, and
+	//     if the stored password hash is no longer the one it proved, it gives
+	//     the session up and is refused: as a wrong password at login,
+	//     invalid_grant at /token, ErrInvalidToken at the enrolment.
+	//   - An OIDC authorization code minted before the reset: it carries the
+	//     fingerprint of the password its /authorize login proved
+	//     (AuthCode.Credential), and /token refuses it with invalid_grant once
+	//     the account's password is another.
+	//   - The console token POST <admin>/login mints for a store account: it
+	//     carries the same kind of fingerprint, and the admin guard, which
+	//     reads the account on every console request, refuses it once the
+	//     password is another, as it refuses an expired one.
+	//   - An enrolment token (EnrolOnLogin), which is bound to the password it
+	//     was minted under (its cred claim).
+	//
+	// What it does not end:
+	//
+	//   - A step-up token — the tempToken of a 2FA challenge — minted before
+	//     the reset. Whoever passed the password step shortly before the reset
+	//     and holds the second factor can still complete that challenge for
+	//     TempTokenTTL (5 minutes by default) and get a session the reset never
+	//     saw; a shorter TempTokenTTL narrows the window.
+	//   - An access token on the admin console. The console accepts an
+	//     ordinary access token whenever it verifies tokens with the secret
+	//     access tokens are signed with — AdminOptions.JWTSecret unset, which
+	//     falls back to Secret — and reads no session behind it, under every
+	//     SessionCheckOn, "allcalls" included; so one issued before the reset
+	//     opens the console until it expires (AccessTokenTTL).
+	//
+	// That much rests on what the stores keep. UserStore.GetUserByID returns
+	// the account's PasswordHash and sees a password write that has returned
+	// (a read from a lagging replica does not). The revocation reaches every
+	// session whose creation had returned when it began — UserSessionRevoker's
+	// contract, or a complete and consistent listing. An AuthCodeStore keeps
+	// AuthCode.Credential; one that drops it makes every code fail at /token.
+	//
+	// Turning the option on refuses, once, what was minted before it with
+	// nothing to check: an authorization code not yet redeemed, and a store
+	// account's console token, whose holder signs in again. And a password
+	// login is refused if the account's password hash changes in the moment
+	// between its comparison and its session, whatever changed it: a reset, a
+	// POST <prefix>/change-password, or a concurrent PasswordVerifier
+	// migration of the same account.
 	//
 	// A revocation the store refuses fails the reset: the generic 500, with a
 	// line through Config.Logger naming the user and the store's error. The
@@ -208,8 +252,9 @@ type Config struct {
 	// exactly as complete as the listing: a store whose listing refuses past a
 	// cap fails every reset of an account over it with nothing revoked, and
 	// one that lists from an eventually consistent index can miss a session
-	// opened just before the reset. Such a store implements UserSessionRevoker,
-	// whose contract is that every session is revoked.
+	// opened just before the reset, which then lives on. Such a store
+	// implements UserSessionRevoker, whose contract is that every session
+	// whose creation had returned when the call began is revoked.
 	//
 	// False — the zero value, and what DefaultConfig leaves — is the
 	// reference's answer: a reset leaves every session alive (registered as

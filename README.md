@@ -482,13 +482,22 @@ revision the whole contract was extracted from.
   administrator may turn on: once the new password is stored, every session of
   the account that is neither revoked nor expired is revoked through
   `SessionAdminStore`, so its refresh token answers `401 SESSION_REVOKED` from
-  then on. An access token already issued stays valid until it expires
-  (`AccessTokenTTL`) unless `SessionCheckOn` is `allcalls`, under which it is
-  refused at once with the same code. The answer is the same `200`, and the
-  reset opens no session. A revocation the session store refuses fails the reset
-  with the generic `500`, the password already changed, and `NewService` refuses
-  the option on a session store that implements neither `SessionAdminStore` nor
-  `UserSessionRevoker`, the one-call revocation it prefers.
+  then on. What the old password opens that the revocation cannot find ends too:
+  a password login in flight across the reset — one that proved the old password
+  and opens its session after the revocation has looked — reads the account
+  again once its session exists and is refused, its session given up; an OIDC
+  authorization code minted with the old password is refused at `/token` with
+  `invalid_grant` (`AuthCode.Credential`); and the token `POST <admin>/login`
+  minted for a store account stops opening the console. An access token already
+  issued stays valid until it expires (`AccessTokenTTL`) unless `SessionCheckOn`
+  is `allcalls`, under which it is refused at once with the same code — except
+  on the admin console, which reads no session behind an access token; and a
+  step-up token minted before the reset still completes its challenge for
+  `TempTokenTTL`. The answer is the same `200`, and the reset opens no session.
+  A revocation the session store refuses fails the reset with the generic `500`,
+  the password already changed, and `NewService` refuses the option on a session
+  store that implements neither `SessionAdminStore` nor `UserSessionRevoker`,
+  the one-call revocation it prefers.
 - **The reference**: Sets the password and clears the token and nothing else: no
   session is revoked and no cookie cleared, so every refresh token issued before
   the reset keeps working (`auth.router.ts:801-825`).

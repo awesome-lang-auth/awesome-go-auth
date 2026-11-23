@@ -858,9 +858,13 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 	if err := ps.UpdatePassword(ctx, user.ID, user.TenantID, pwHash); err != nil {
 		return err
 	}
-	// After the write, so that no session can be opened with the old password
-	// once the listing has been taken; before the token is cleared, so that a
-	// store keeping the token until then lets the same link run both again.
+	// Before the token is cleared, so that a store keeping the token until then
+	// lets the same link run both again. After the write, because the write is
+	// what a password login already in flight is checked against: one that
+	// proved the old password and opens its session after the revocation has
+	// looked reads the account again once that session exists, finds this
+	// password and gives the session up (keepPasswordSession). The revocation
+	// itself ends only the sessions whose creation had returned when it began.
 	if s.cfg.RevokeSessionsOnPasswordReset {
 		if err := s.revokeSessionsAfterReset(ctx, user); err != nil {
 			return err
