@@ -843,6 +843,7 @@ func (idp *IDP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			CodeChallengeMethod: q.Get("code_challenge_method"),
 			Scope:               q.Get("scope"),
 			ExpiresAt:           idp.now().Add(idp.codeTTL()),
+			Credential:          idp.codeCredential(user),
 		})
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -873,6 +874,20 @@ func (idp *IDP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 <input name="tenant_id" placeholder="Tenant ID" value="">
 <button type="submit">Sign In</button>
 </form></body></html>`)
+}
+
+// authCodeCredentialLabel is the passwordFingerprint label of
+// AuthCode.Credential.
+const authCodeCredentialLabel = "awesome-go-auth/authorization-code-credential/v1"
+
+// codeCredential is AuthCode.Credential for a code /authorize mints for user,
+// whose password the login has just proven: its fingerprint under
+// Config.RevokeSessionsOnPasswordReset, and empty with the option off.
+func (idp *IDP) codeCredential(user User) string {
+	if !idp.authSvc.cfg.RevokeSessionsOnPasswordReset {
+		return ""
+	}
+	return idp.authSvc.passwordFingerprint(authCodeCredentialLabel, user)
 }
 
 func (idp *IDP) handleUserInfo(w http.ResponseWriter, r *http.Request) {

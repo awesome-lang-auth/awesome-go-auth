@@ -507,6 +507,16 @@ type AuthCode struct {
 	CodeChallengeMethod string
 	Scope               string
 	ExpiresAt           time.Time
+	// Credential binds the code to the password the /authorize login proved,
+	// under Config.RevokeSessionsOnPasswordReset: an HMAC under Config.Secret
+	// of the account's stored password hash, which reveals nothing about the
+	// hash. /token refuses the code (invalid_grant) when the account's
+	// password has changed since — so a code minted before a revoking reset
+	// opens no session after it — and when Credential is empty. It is empty
+	// with the option off, and /token then reads nothing of it. A store keeps
+	// it as it keeps the other fields: one that drops it makes every code
+	// redeemed under the option fail.
+	Credential string
 }
 
 // AuthCodeStore persists OIDC authorization codes for the IDP.

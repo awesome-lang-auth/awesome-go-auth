@@ -677,6 +677,23 @@ func detachedContext(ctx context.Context) (context.Context, context.CancelFunc) 
 	return detached, func() {}
 }
 
+// passwordFingerprint binds a credential that carries no session to the
+// password it was obtained with, under Config.RevokeSessionsOnPasswordReset:
+// an HMAC under Config.Secret of user's stored password hash, the construction
+// enrolmentCredential uses. It reveals nothing about the hash, and any change
+// to the password changes it. label names the credential — an authorization
+// code, a console token — so that a value minted for one is never another's.
+func (s *Service) passwordFingerprint(label string, user User) string {
+	return sign(label+"\x00"+user.PasswordHash, s.cfg.Secret)
+}
+
+// passwordFingerprintMatches reports whether credential is the fingerprint
+// under label of the password user holds now. An empty credential never
+// matches: nothing then says which password it was minted under.
+func (s *Service) passwordFingerprintMatches(label, credential string, user User) bool {
+	return credential != "" && secureEqual(credential, s.passwordFingerprint(label, user))
+}
+
 // sessionIDOf recovers the session id from an access token this service has
 // just minted, for the one publication site that cannot take it from
 // issueSession: Auth.OAuthComplete publishes identity.auth.oauth.success, and
