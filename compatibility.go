@@ -342,6 +342,17 @@ func CompatibilityNotes() APICompatibilityNotes {
 							"port asks for it explicitly: `Config.EnrolOnLogin` is off by default, and a " +
 							"deployment that enrols out of band leaves it off.",
 					},
+					{
+						Label: "How long the token lives",
+						Text: "`Config.TempTokenTTL`, the step-up token's lifetime — 5 minutes by default, as " +
+							"the reference's — unless `Config.EnrolmentTokenTTL` (`WithEnrolmentTokenTTL`), unset " +
+							"by default, gives the enrolment token one of its own, between 1 and 30 minutes, for " +
+							"users who install an authenticator app while they enrol. Its `exp` carries the " +
+							"lifetime and it is honoured until `exp` plus `Config.ClockSkew`; the step-up token " +
+							"keeps `TempTokenTTL`. A longer window is longer for whoever holds a copy of the " +
+							"token too: for an account with no factor it completes the enrolment, and opens " +
+							"the session, on its own.",
+					},
 				},
 			},
 			{

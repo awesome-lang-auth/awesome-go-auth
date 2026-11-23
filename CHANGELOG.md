@@ -108,6 +108,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer the account's. An `AuthCodeStore` that maps fields one by one must
   keep it before the option is turned on; with the option off it is empty and
   never read.
+- **`Config.EnrolmentTokenTTL` (`WithEnrolmentTokenTTL(15 * time.Minute)`): a
+  lifetime of its own for the enrolment token of a `2FA_SETUP_REQUIRED`
+  answer.** Under `Config.EnrolOnLogin` that token — what `/2fa/setup` and
+  `/2fa/verify-setup` complete a forced enrolment with, after a login or the
+  acceptance of an invitation — lived `Config.TempTokenTTL`, the step-up
+  challenge's lifetime, 5 minutes by default, and no option reached it: a
+  consumer whose invitees install an authenticator app during enrolment had
+  five minutes from the password to the first code, and a longer
+  `TempTokenTTL` would have lengthened every step-up challenge with it. Set,
+  the new field is the enrolment token's lifetime and no other token's: the
+  token's `exp` carries it, so `exp - iat` is the window a client can show;
+  every use honours it until `exp` plus `Config.ClockSkew`; and nothing else
+  the enrolment depends on lapses sooner, since the secret `/2fa/setup`
+  answers is derived from the token and `verify-setup` checks the code when it
+  is called. The step-up token keeps `TempTokenTTL`. Zero, the default, keeps
+  `TempTokenTTL` for the enrolment token too, so nothing changes for a
+  deployment that does not set it; anything else must lie between
+  `MinEnrolmentTokenTTL` and `MaxEnrolmentTokenTTL` (new, 1 and 30 minutes),
+  or `New` fails. A longer window is longer for whoever holds a copy of the
+  token as well: for an account with no factor the token alone completes the
+  enrolment and opens a session, so 15 minutes is three times the default's
+  exposure. Its binding to the password and its death once the account has a
+  factor are unchanged. The register entry `forced-enrolment-opens-a-session`
+  now says how long the token lives.
 
 ### Security
 - **The public credential routes refuse a body over 16 KiB, before anything
