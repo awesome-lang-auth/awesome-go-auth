@@ -161,19 +161,20 @@ type PasswordVerifier func(ctx context.Context, user User, password string) (ok 
 // failure is also handed to Config.Logger on the way out, which is the only
 // place an operator behind any of the four adapters can learn what went wrong.
 //
-// On timing, what is true is narrower than "unchanged". The seam adds no
-// equalisation and removes none: the login path did not equalise before it - an
-// address the store does not hold returns at login_2fa.go:108-110 before any
-// bcrypt work, while a known address pays one bcrypt compare - and it does not
-// equalise now. But a configured verifier widens that pre-existing gap by its
-// own latency. A known address whose hash does not verify now costs the bcrypt
-// compare plus whatever the verifier does, which in the case this seam exists
-// for is a call to the old provider, so a signal that was milliseconds of key
-// derivation becomes a network round trip, on an unauthenticated route. The
-// marker gate the PasswordVerifier doc requires is what keeps that cost to the
-// accounts actually being migrated; equalising what is left is the verifier's
-// own job, not this library's. None of this paragraph is asserted by a test: it
-// is a statement of posture, not a pinned property.
+// On timing, what is true is narrower than "unchanged". The login path
+// equalises the bcrypt work itself: every refused login runs one full
+// comparison, an address the store does not hold and an account without a
+// usable hash against a stand-in hash (Service.passwordMatches), which
+// TestLoginRunsOneFullComparisonOnEveryPath pins. The seam is outside that.
+// A configured verifier adds its own latency to every account whose hash does
+// not verify, and to no unknown address, so a known address costs the
+// comparison plus whatever the verifier does - in the case this seam exists
+// for, a call to the old provider: a network round trip on an unauthenticated
+// route, which says the address has an account. The marker gate the
+// PasswordVerifier doc requires is what keeps that cost to the accounts
+// actually being migrated; equalising what is left is the verifier's own job,
+// not this library's. That part is a statement of posture, not a pinned
+// property.
 //
 // Where the write sits. It happens here, as part of accepting the credential,
 // and therefore before loginPassword applies the email-verification gate. That

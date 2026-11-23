@@ -187,6 +187,12 @@ func AdminPredicate(fn AdminPolicyFunc) *AdminAccessPolicy {
 // a token carrying isRoot, which is the one claim that skips the store lookup
 // and the policy alike — so this pair is the most privileged credential the
 // console has, and it is as strong as the hash and the JWT secret together.
+//
+// Generate PasswordHash at Config.BcryptCost. POST <admin>/login compares a
+// password for Email against it at the cost it was generated at, which the
+// library never rewrites, and a password for an address no account holds
+// against a stand-in hash at Config.BcryptCost; at any other cost the time a
+// refusal takes says which address is the root's.
 type AdminRootUser struct {
 	Email        string
 	PasswordHash string
@@ -1256,8 +1262,8 @@ func (g *AdminGuard) shellHandler() http.Handler {
 // adminLogin is POST <admin>/login (:543-616): three credential sources, in
 // order, and a 24-hour session cookie for whichever answers.
 //
-// What it does not have is worth stating, because all three are the
-// reference's and all three are visible to a reviewer here:
+// What it does not have is worth stating, because both are the reference's
+// and both are visible to a reviewer here:
 //
 //   - No rate limiting of its own, and this is now a statement about two slots
 //     rather than one. HTTPConfig.RateLimiter is the auth router's and is not
@@ -1269,12 +1275,27 @@ func (g *AdminGuard) shellHandler() http.Handler {
 //   - No password policy. Config.MinPasswordLen governs registration and the
 //     reset and change routes; nothing here consults it, because nothing here
 //     sets a password.
-//   - A timing signal. bcrypt runs only when an email matched — the configured
-//     root user, or a row in the store — so a wrong email is refused measurably
-//     faster than a wrong password, on both sides. It is the same shape
-//     Service.loginPassword has, so closing it here alone would be a
-//     difference between two login routes of the same library rather than a
-//     fix.
+//
+// One thing it has that the reference does not: every request that reaches the
+// credential check runs one full bcrypt comparison, whichever source answers.
+// The reference runs bcrypt only when an email matched — the configured root
+// user, or a row in the store with a password — so a wrong email is refused
+// measurably faster than a wrong password, which names the console's accounts.
+// Here an address that matches nothing, a row with no usable hash and the
+// bootstrap secret's two names are compared against the stand-in hash instead
+// (Service.passwordMatches, spendPasswordComparison), exactly as
+// Service.loginPassword does for POST <prefix>/login, so the two login routes
+// of the library cost the same on every path.
+//
+// Every path but two, both on the root user's address. Its hash comes from
+// configuration and is compared at the cost it was generated at, not at
+// Config.BcryptCost, the stand-in's, so the deployment is told to generate it
+// at that cost (AdminRootUser). And when a store row holds the address too, a
+// wrong password is compared against the root's hash and, as the reference
+// does, against the row's, which costs two comparisons. Skipping the row would
+// cap the cost and stop that row from signing in with its own password, a
+// login the reference allows, so the second comparison stays and the
+// deployment is told to give the root an address no account holds.
 func (g *AdminGuard) adminLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Email    string `json:"email"`
@@ -1292,12 +1313,16 @@ func (g *AdminGuard) adminLogin(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	var authed *adminClaims
+	// compared records whether a password comparison has run, so that a
+	// request no source compared still pays for one below.
+	compared := false
 
 	// 1. The configured root user (:552-556). Compared by exact email, and the
 	// token it yields carries isRoot — the claim that skips the store and the
 	// policy.
 	if root := g.cfg.Admin.RootUser; root != nil && body.Email == root.Email {
-		if verifyPassword(body.Password, root.PasswordHash) {
+		compared = true
+		if g.auth.service.passwordMatches(body.Password, root.PasswordHash) {
 			authed = &adminClaims{Sub: "root", Email: root.Email, IsRoot: true}
 		}
 	}
@@ -1325,11 +1350,25 @@ func (g *AdminGuard) adminLogin(w http.ResponseWriter, r *http.Request) {
 	// subsequent request whether that person may use the console. A user the
 	// policy will refuse can therefore log in successfully and be answered 403
 	// by the very next request, which is the reference's arrangement too.
+	//
+	// A row with no password is refused as the reference refuses it, but
+	// through passwordMatches, which compares against the stand-in hash first.
 	if authed == nil && body.Email != "" {
 		user, err := g.auth.service.users.GetUserByEmail(ctx, body.Email, "")
-		if err == nil && user.PasswordHash != "" && verifyPassword(body.Password, user.PasswordHash) {
-			authed = &adminClaims{Sub: user.ID, Email: user.Email, Tid: user.TenantID}
+		if err == nil {
+			compared = true
+			if g.auth.service.passwordMatches(body.Password, user.PasswordHash) {
+				authed = &adminClaims{Sub: user.ID, Email: user.Email, Tid: user.TenantID}
+			}
 		}
+	}
+
+	// An address that matched no source, and the bootstrap secret, whose
+	// comparison is a constant-time equality that costs nothing: one
+	// comparison against the stand-in hash, so that no answer here is cheaper
+	// than a wrong password for an account that exists.
+	if !compared {
+		g.auth.service.spendPasswordComparison(body.Password)
 	}
 
 	if authed == nil {

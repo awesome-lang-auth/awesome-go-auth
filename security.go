@@ -68,6 +68,65 @@ func verifyPassword(password, hash string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
+// passwordMatches reports whether password is the one hash was made from, and
+// costs one full bcrypt comparison whatever hash is. It is the comparison of
+// the two password logins, POST <prefix>/login (loginPassword) and POST
+// <admin>/login.
+//
+// verifyPassword alone answers at once for a hash bcrypt cannot parse — "" for
+// an account that never had a password, a marker a migration left in the
+// column — because bcrypt refuses it before any key derivation, while a real
+// hash costs a whole comparison. A login answering on that difference says
+// which kind of account an address holds, so an unparseable hash is refused
+// after a comparison against the stand-in hash instead (spendPasswordComparison).
+// A real hash is compared at its own cost: the deployment's, unless it was
+// written before Config.BcryptCost last changed.
+func (s *Service) passwordMatches(password, hash string) bool {
+	if _, err := bcrypt.Cost([]byte(hash)); err != nil {
+		s.spendPasswordComparison(password)
+		return false
+	}
+	return s.compareHash([]byte(hash), []byte(password)) == nil
+}
+
+// spendPasswordComparison runs the comparison a login makes when there is no
+// hash to compare against — an address no account holds, or an account whose
+// stored value is not a bcrypt hash — so that refusing it costs what refusing a
+// wrong password costs. The result is discarded: only the work matters.
+func (s *Service) spendPasswordComparison(password string) {
+	_ = s.compareHash(s.dummyPasswordHash(), []byte(password))
+}
+
+// dummyPassword is what the stand-in hash is made from. Its value does not
+// matter: nothing is ever stored under it and the comparison's result is never
+// read.
+const dummyPassword = "awesome-go-auth: no account holds this password"
+
+// dummyPasswordHash is the stand-in hash spendPasswordComparison compares
+// against, written at the cost every new hash is written at — Config.BcryptCost,
+// bcrypt.DefaultCost when it is unset — so that the comparison costs what a
+// comparison against a real hash costs.
+//
+// It is computed once per Service, on first use rather than in NewService:
+// generating it costs as much as a comparison, which a cold start that never
+// refuses a login should not pay (a Lambda consumer allows costs up to 15).
+// The first refusal after a start therefore pays twice, once.
+func (s *Service) dummyPasswordHash() []byte {
+	s.dummyHashOnce.Do(func() {
+		hash, err := hashPassword(dummyPassword, s.cfg.BcryptCost)
+		if err != nil {
+			// Unreachable through a validated Config, whose cost bcrypt
+			// accepts. Were it reached, the comparison against a nil hash
+			// fails at once: the refusals stay refusals and only lose their
+			// cover, which the log says.
+			s.logf("auth: the stand-in password hash could not be computed, so refused logins are not cost-equalised: %v", err)
+			return
+		}
+		s.dummyHash = []byte(hash)
+	})
+	return s.dummyHash
+}
+
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
