@@ -230,7 +230,12 @@ func TestChangePasswordLeavesALinkStillBeingMailed(t *testing.T) {
 		_, err := svc.ForgotPassword(ctx, ForgotPasswordInput{Email: user.Email, TenantID: user.TenantID})
 		asked <- err
 	}()
-	token := <-mailed
+	var token string
+	select {
+	case token = <-mailed:
+	case err := <-asked:
+		t.Fatalf("forgot password returned before its mail went out: err = %v", err)
+	}
 	if err := svc.ChangePassword(ctx, changePasswordInput(user)); err != nil {
 		close(release)
 		t.Fatalf("change password: %v", err)
