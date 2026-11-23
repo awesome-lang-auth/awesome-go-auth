@@ -654,27 +654,14 @@ func (s *Service) keepPasswordSession(ctx context.Context, proven User, sessionI
 // giveUpSession revokes a session whose tokens a refused login never handed
 // out. Nothing can use it, since nobody holds its tokens; it is revoked so that
 // the account's sessions are listed as they are. The revocation runs without
-// ctx's cancellation, bounded by its deadline (detachedContext), and a failure
+// ctx's cancellation, bounded by its deadline (withoutCancel), and a failure
 // is logged and goes no further.
 func (s *Service) giveUpSession(ctx context.Context, user User, sessionID string) {
-	ctx, cancel := detachedContext(ctx)
+	ctx, cancel := withoutCancel(ctx)
 	defer cancel()
 	if err := s.revokeSession(ctx, sessionID, user.ID, user.TenantID); err != nil && !errors.Is(err, ErrSessionNotFound) {
 		s.logf("auth: session %s of user %q, opened by a login that was then refused, could not be revoked; its tokens were never handed out: %v", sessionID, user.ID, err)
 	}
-}
-
-// detachedContext is ctx without its cancellation, bounded by its deadline
-// when it has one, for the work that follows a write that has already landed:
-// a caller that goes away then — on a Go net/http server, a client that
-// half-closes its connection cancels the request context — must not cut that
-// work short. The CancelFunc releases the deadline's timer.
-func detachedContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	detached := context.WithoutCancel(ctx)
-	if deadline, ok := ctx.Deadline(); ok {
-		return context.WithDeadline(detached, deadline)
-	}
-	return detached, func() {}
 }
 
 // passwordFingerprint binds a credential that carries no session to the
@@ -910,13 +897,13 @@ func (s *Service) ResetPassword(ctx context.Context, in ResetPasswordInput) erro
 // account and what failed.
 //
 // It runs without ctx's cancellation, bounded by ctx's deadline
-// (detachedContext). The password has been written by then, and a caller that
+// (withoutCancel). The password has been written by then, and a caller that
 // goes away — on a Go net/http server, a client that half-closes its
 // connection cancels the request context — would otherwise stop the
 // revocation of a store that honours its context, leaving every session alive
 // behind a 500 nobody reads.
 func (s *Service) revokeSessionsAfterReset(ctx context.Context, user User) error {
-	ctx, cancel := detachedContext(ctx)
+	ctx, cancel := withoutCancel(ctx)
 	defer cancel()
 	if bulk, ok := s.sessions.(UserSessionRevoker); ok {
 		if err := bulk.RevokeSessionsForUser(ctx, user.ID, user.TenantID); err != nil {
