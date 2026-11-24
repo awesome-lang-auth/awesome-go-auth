@@ -316,11 +316,23 @@ type Config struct {
 	// a session — /2fa/setup hands its holder the secret, and a code of that
 	// secret is all verify-setup asks — so a copy of the token is worth a
 	// session for as long as it lives, and fifteen minutes is three times the
-	// default's exposure. What else bounds it is unchanged: the token is
-	// minted only by a login that proved the account's password or by the
-	// acceptance of an invitation, dies once the account has a factor, and
-	// dies with a password change. Keep it out of URLs, storage and logs.
-	// WithEnrolmentTokenTTL sets it.
+	// default's exposure. A copy is worth the factor too, and that outlives
+	// the token: /2fa/setup answers the same secret for every call with the
+	// same token, and no event records the call, so a copy that calls it
+	// before the owner enrols with that token learns the secret of the factor
+	// the owner then enrols, and keeps it after the token has expired. With
+	// the password, it answers the step-up until the factor is replaced. Treat
+	// a leaked enrolment token as a leaked factor: change the password, then
+	// enrol a new factor in place of that one (signed in, /2fa/setup and
+	// /2fa/verify-setup with an access token replace it).
+	//
+	// What else bounds the token is unchanged. It is minted only by a login
+	// that proved the account's password or by the acceptance of an
+	// invitation, and it dies with a password change. It is refused while the
+	// account has a factor, but not spent: a factor removed before exp
+	// without a password change brings the token back, with the same secret,
+	// so reset the password together with the factor (see EnrolOnLogin). Keep
+	// the token out of URLs, storage and logs. WithEnrolmentTokenTTL sets it.
 	EnrolmentTokenTTL time.Duration
 	// TwoFactorAppName is the issuer an authenticator app files a TOTP
 	// enrolment under: the `issuer` of the otpauth:// URI POST <prefix>/2fa/setup
@@ -615,8 +627,12 @@ func (c Config) totpIssuer() string {
 
 // MinEnrolmentTokenTTL and MaxEnrolmentTokenTTL bound Config.EnrolmentTokenTTL
 // when it is set. The floor keeps a value meant in minutes but written in
-// seconds from minting a token nobody can use; the ceiling keeps the window in
-// which a copy of the token is worth a session to minutes.
+// seconds from minting a token nobody can use; the ceiling keeps to minutes
+// the window in which a copy of the token is worth a session, or the secret
+// of the factor enrolled with it. They bound the field, not the token's whole
+// life: every use honours the token until exp plus Config.ClockSkew, so the
+// longest window is thirty minutes plus that skew, and an unset field leaves
+// the token on TempTokenTTL, which they do not bound.
 const (
 	MinEnrolmentTokenTTL = time.Minute
 	MaxEnrolmentTokenTTL = 30 * time.Minute

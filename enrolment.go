@@ -40,10 +40,12 @@ import (
 //     enrolment token.
 //   - It is honoured only while the login would still answer
 //     2FA_SETUP_REQUIRED for its user (mustEnrolSecondFactor, re-read from the
-//     store on every use). That is what makes it single-purpose: once the user
+//     store on every use). That is what makes it single-purpose: while the user
 //     has a factor — from this token, another one, an administrator, anything —
-//     every outstanding enrolment token is dead, so a replay after a successful
-//     enrolment is refused without a store of spent tokens.
+//     every outstanding enrolment token is refused, so a replay after a
+//     successful enrolment is refused without a store of spent tokens. Refused,
+//     not spent: a factor removed before the token's exp brings it back, with
+//     the same secret, unless the password changed too (the cred claim below).
 //   - POST /2fa/verify-setup with it does what the reference leaves to a second
 //     login: once the code verifies and the secret is stored, it opens the
 //     session exactly as POST /2fa/verify does. The password was verified by
@@ -54,9 +56,11 @@ import (
 //     enrolment token answers a secret derived from the token
 //     (forcedEnrolmentSecret), and POST /2fa/verify-setup with the same token
 //     accepts that secret and no other. The session that follows claims the
-//     factor, so the factor must be one nobody else can compute codes for — an
-//     all-zero key, or the RFC 6238 test vector, is refused like any secret
-//     the server did not mint.
+//     factor, so the factor must be one nobody without the token can compute
+//     codes for — an all-zero key, or the RFC 6238 test vector, is refused
+//     like any secret the server did not mint. Whoever else holds the token
+//     gets the same secret from /2fa/setup: a copy that called it knows the
+//     factor the owner then enrols with that token (Config.EnrolmentTokenTTL).
 //   - The token is bound to the credential that minted it (enrolmentCredential,
 //     the cred claim): once the account's password changes, every enrolment
 //     token minted before is dead, so a reset after a suspected compromise
@@ -192,7 +196,9 @@ func (s *Service) verifyEnrolmentToken(ctx context.Context, token string) (User,
 // The secret is the server's (forcedEnrolmentSecret) and the same for every
 // call with the same token; CompleteTOTPEnrolment accepts it and no other. A
 // token VerifyEnrolmentToken refuses is ErrInvalidToken, a store failure
-// itself. Nothing is stored.
+// itself. Nothing is stored and no event is raised, so nothing in the library
+// records a call made with a copy of the token, which learns the secret the
+// owner then enrols with the same token (see Config.EnrolmentTokenTTL).
 func (s *Service) NewForcedTOTPEnrolment(ctx context.Context, enrolmentToken string) (TOTPSetup, error) {
 	user, claims, err := s.verifyEnrolmentToken(ctx, enrolmentToken)
 	if err != nil {

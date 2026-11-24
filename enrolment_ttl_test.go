@@ -16,9 +16,13 @@ import (
 // exp carries the lifetime, so a client reading exp - iat shows the right
 // window; every use honours it until exp plus ClockSkew and refuses it after;
 // a forced enrolment whose secret was answered at the start completes late in
-// the window, and not a second past it; zero keeps the earlier lifetime; the
-// bounds are refused when the service is built; and the step-up token keeps
-// TempTokenTTL whatever the option says.
+// the window, and not a second past it; zero keeps the earlier lifetime; a
+// lifetime below TempTokenTTL is honoured as one above it is; the bounds are
+// refused when the service is built; and the step-up token keeps TempTokenTTL
+// whatever the option says. Then what the docs say a copy of the token is
+// worth, which a longer window gives more time to: a copy that read the secret
+// keeps the factor the owner enrols with that token after the token has
+// expired, and the token is refused while the account has a factor, not spent.
 
 // enrolmentClock is a service clock held at a whole second and moved by hand.
 // A token's iat and exp are whole seconds, so a clock with a fraction would
@@ -430,6 +434,238 @@ func TestEnrolmentTokenTTL_LeavesTheStepUpTokenAlone(t *testing.T) {
 		}
 		if _, err := a.service.VerifyTempToken(token); err != nil {
 			t.Fatalf("VerifyTempToken = %v, want the step-up token it always was", err)
+		}
+	})
+}
+
+// stepUpWith signs in with email and password, expecting the step-up
+// challenge of an account that holds a factor, and answers it with the code
+// secret gives at the service's clock. The error is what POST /2fa/verify
+// would answer from.
+func stepUpWith(t *testing.T, a *Auth, clock *enrolmentClock, email, password, secret string) error {
+	t.Helper()
+	ctx := context.Background()
+	result, err := a.LoginWithChallenge(ctx, LoginInput{Email: email, Password: password, TenantID: "t1"})
+	if err != nil || result.Challenge == nil || result.Challenge.SetupRequired {
+		t.Fatalf("login = %+v, %v, want the step-up challenge of an account with a factor", result, err)
+	}
+	subject, err := a.service.VerifyTempToken(result.Challenge.TempToken)
+	if err != nil {
+		t.Fatalf("VerifyTempToken: %v", err)
+	}
+	_, tokens, err := a.service.VerifyTOTP(ctx, subject.UserID, subject.TenantID, codeFor(t, secret, clock.at))
+	if err == nil && tokens.AccessToken == "" {
+		t.Fatal("the step-up passed and opened no session")
+	}
+	return err
+}
+
+// TestEnrolmentToken_ACopyKeepsTheFactorItRead pins what
+// Config.EnrolmentTokenTTL says a copy of the token is worth besides a
+// session. /2fa/setup answers the same secret for every call with the same
+// token, and the owner's enrolment stores it, so a copy that read the secret
+// before the owner enrolled holds the account's factor once the token has
+// expired: with the password, it answers the step-up a day later. The remedy
+// the docs give ends that: a new password, then a new factor in place of that
+// one, enrolled signed in. A change that derived a secret per call would fail
+// the first half, and would have to change the docs with it.
+func TestEnrolmentToken_ACopyKeepsTheFactorItRead(t *testing.T) {
+	ctx := context.Background()
+	clock, start := newEnrolmentClock()
+	a := enrolmentTTLAuth(t, clock, WithEnrolmentTokenTTL(15*time.Minute))
+	user, token := setupChallenge(t, a.service, "copied@example.com")
+
+	// Minute 1: a copy of the token reads the secret, and nothing else happens.
+	clock.at = start.Add(time.Minute)
+	copied, err := a.NewForcedTOTPEnrolment(ctx, token)
+	if err != nil {
+		t.Fatalf("NewForcedTOTPEnrolment with the copy: %v", err)
+	}
+	// Minute 12: the owner, back with an authenticator app, reads it and enrols.
+	clock.at = start.Add(12 * time.Minute)
+	owner, err := a.NewForcedTOTPEnrolment(ctx, token)
+	if err != nil {
+		t.Fatalf("NewForcedTOTPEnrolment by the owner: %v", err)
+	}
+	if owner.Secret != copied.Secret {
+		t.Fatal("the owner was answered another secret than the copy: the docs say a copy learns the factor the owner enrols")
+	}
+	if _, _, err := a.CompleteTOTPEnrolment(ctx, token, owner.Secret, codeFor(t, owner.Secret, clock.at)); err != nil {
+		t.Fatalf("CompleteTOTPEnrolment by the owner: %v", err)
+	}
+
+	// A day later the token is long refused, and the secret the copy read is
+	// the account's factor.
+	clock.at = start.Add(24 * time.Hour)
+	if _, err := a.VerifyEnrolmentToken(ctx, token); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("VerifyEnrolmentToken a day later = %v, want ErrInvalidToken", err)
+	}
+	if err := stepUpWith(t, a, clock, user.Email, "password1", copied.Secret); err != nil {
+		t.Fatalf("step-up with the secret the copy read, a day later = %v, want it to pass: the factor outlives the token", err)
+	}
+
+	// The remedy: a new password, then, signed in, a new factor in place of
+	// that one, as POST /2fa/setup and /2fa/verify-setup with an access token
+	// enrol it.
+	if err := a.ChangePassword(ctx, ChangePasswordInput{UserID: user.ID, TenantID: user.TenantID, CurrentPassword: "password1", NewPassword: "a-new-password-1"}); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+	replacement, err := a.NewTOTPEnrolment(user.Email)
+	if err != nil {
+		t.Fatalf("NewTOTPEnrolment: %v", err)
+	}
+	if err := a.VerifyTOTPSetup(ctx, user.ID, user.TenantID, replacement.Secret, codeFor(t, replacement.Secret, clock.at)); err != nil {
+		t.Fatalf("VerifyTOTPSetup of the replacement: %v", err)
+	}
+	if err := stepUpWith(t, a, clock, user.Email, "a-new-password-1", copied.Secret); !errors.Is(err, ErrInvalidCode) {
+		t.Fatalf("step-up with the copied secret once the factor was replaced = %v, want ErrInvalidCode", err)
+	}
+	if err := stepUpWith(t, a, clock, user.Email, "a-new-password-1", replacement.Secret); err != nil {
+		t.Fatalf("step-up with the replacement = %v, want it to pass", err)
+	}
+}
+
+// TestEnrolmentToken_RefusedWhileTheAccountHasAFactor pins what the docs say
+// of the token once its account has a factor: refused, not spent. The owner
+// enrols at minute 2 of 15 and the token is refused at minute 3. A factor
+// removed at minute 8 without a password change, as a host's own "reset 2FA"
+// through DisableTOTP removes it, brings the token back with the secret it
+// derived before, and so does a per-user policy lifted and restored inside the
+// window. A factor removed after exp, or together with the password, which is
+// the remedy the docs give, leaves it refused, and the next login mints a
+// token with another secret.
+func TestEnrolmentToken_RefusedWhileTheAccountHasAFactor(t *testing.T) {
+	ctx := context.Background()
+
+	type enrolledAccount struct {
+		a      *Auth
+		clock  *enrolmentClock
+		start  time.Time
+		user   User
+		token  string
+		secret string
+	}
+	// enrolled is an account that enrolled its factor with token at minute 2,
+	// and whose token was refused at minute 3, where the clock is left.
+	enrolled := func(t *testing.T, email string) enrolledAccount {
+		t.Helper()
+		clock, start := newEnrolmentClock()
+		a := enrolmentTTLAuth(t, clock, WithEnrolmentTokenTTL(15*time.Minute))
+		user, token := setupChallenge(t, a.service, email)
+		setup, err := a.NewForcedTOTPEnrolment(ctx, token)
+		if err != nil {
+			t.Fatalf("NewForcedTOTPEnrolment: %v", err)
+		}
+		clock.at = start.Add(2 * time.Minute)
+		if _, _, err := a.CompleteTOTPEnrolment(ctx, token, setup.Secret, codeFor(t, setup.Secret, clock.at)); err != nil {
+			t.Fatalf("CompleteTOTPEnrolment at minute 2: %v", err)
+		}
+		clock.at = start.Add(3 * time.Minute)
+		if _, err := a.VerifyEnrolmentToken(ctx, token); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("VerifyEnrolmentToken while the account has a factor = %v, want ErrInvalidToken", err)
+		}
+		if _, err := a.NewForcedTOTPEnrolment(ctx, token); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("NewForcedTOTPEnrolment while the account has a factor = %v, want ErrInvalidToken", err)
+		}
+		return enrolledAccount{a: a, clock: clock, start: start, user: user, token: token, secret: setup.Secret}
+	}
+
+	t.Run("a factor removed without a password change brings it back", func(t *testing.T) {
+		acc := enrolled(t, "removed@example.com")
+		acc.clock.at = acc.start.Add(8 * time.Minute)
+		if err := acc.a.DisableTOTP(ctx, acc.user.ID, acc.user.TenantID); err != nil {
+			t.Fatalf("DisableTOTP: %v", err)
+		}
+		if _, err := acc.a.VerifyEnrolmentToken(ctx, acc.token); err != nil {
+			t.Fatalf("VerifyEnrolmentToken once the factor is gone = %v, want the token honoured again: refused is not spent", err)
+		}
+		again, err := acc.a.NewForcedTOTPEnrolment(ctx, acc.token)
+		if err != nil || again.Secret != acc.secret {
+			t.Fatalf("NewForcedTOTPEnrolment once the factor is gone = %q, %v, want the secret the token derived before", again.Secret, err)
+		}
+	})
+
+	t.Run("a factor removed after exp leaves it refused", func(t *testing.T) {
+		acc := enrolled(t, "afterexp@example.com")
+		acc.clock.at = acc.start.Add(15*time.Minute + acc.a.service.cfg.ClockSkew + time.Second)
+		if err := acc.a.DisableTOTP(ctx, acc.user.ID, acc.user.TenantID); err != nil {
+			t.Fatalf("DisableTOTP: %v", err)
+		}
+		if _, err := acc.a.VerifyEnrolmentToken(ctx, acc.token); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("VerifyEnrolmentToken past exp plus ClockSkew = %v, want ErrInvalidToken", err)
+		}
+	})
+
+	t.Run("a factor removed together with the password leaves it refused", func(t *testing.T) {
+		acc := enrolled(t, "together@example.com")
+		acc.clock.at = acc.start.Add(8 * time.Minute)
+		if err := acc.a.ChangePassword(ctx, ChangePasswordInput{UserID: acc.user.ID, TenantID: acc.user.TenantID, CurrentPassword: "password1", NewPassword: "a-new-password-1"}); err != nil {
+			t.Fatalf("ChangePassword: %v", err)
+		}
+		if err := acc.a.DisableTOTP(ctx, acc.user.ID, acc.user.TenantID); err != nil {
+			t.Fatalf("DisableTOTP: %v", err)
+		}
+		if _, err := acc.a.VerifyEnrolmentToken(ctx, acc.token); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("VerifyEnrolmentToken once the password and the factor were reset = %v, want ErrInvalidToken", err)
+		}
+		if _, err := acc.a.NewForcedTOTPEnrolment(ctx, acc.token); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("NewForcedTOTPEnrolment once the password and the factor were reset = %v, want ErrInvalidToken", err)
+		}
+		result, err := acc.a.LoginWithChallenge(ctx, LoginInput{Email: acc.user.Email, Password: "a-new-password-1", TenantID: "t1"})
+		if err != nil || result.Challenge == nil || !result.Challenge.SetupRequired {
+			t.Fatalf("login with the new password = %+v, %v, want 2FA_SETUP_REQUIRED", result, err)
+		}
+		next, err := acc.a.NewForcedTOTPEnrolment(ctx, result.Challenge.TempToken)
+		if err != nil {
+			t.Fatalf("NewForcedTOTPEnrolment with the new login's token: %v", err)
+		}
+		if next.Secret == acc.secret {
+			t.Fatal("the new login's token derives the secret the old token did")
+		}
+	})
+
+	t.Run("a per-user policy lifted and restored brings it back", func(t *testing.T) {
+		clock, start := newEnrolmentClock()
+		a, err := New(WithBcryptCost(testBcryptCost), WithEnrolOnLogin(true), WithEnrolmentTokenTTL(15*time.Minute))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		a.service.now = clock.now
+		store, ok := a.service.users.(*MemoryUserStore)
+		if !ok {
+			t.Fatalf("user store = %T, want the memory store New wires", a.service.users)
+		}
+		user, _, err := a.service.Register(ctx, RegisterInput{Email: "policy@example.com", Password: "password1", TenantID: "t1"})
+		if err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if err := store.UpdateRequire2FA(ctx, user.ID, user.TenantID, true); err != nil {
+			t.Fatal(err)
+		}
+		result, err := a.LoginWithChallenge(ctx, LoginInput{Email: user.Email, Password: "password1", TenantID: "t1"})
+		if err != nil || result.Challenge == nil || !result.Challenge.SetupRequired {
+			t.Fatalf("login under the per-user flag = %+v, %v, want 2FA_SETUP_REQUIRED", result, err)
+		}
+		token := result.Challenge.TempToken
+		setup, err := a.NewForcedTOTPEnrolment(ctx, token)
+		if err != nil {
+			t.Fatalf("NewForcedTOTPEnrolment: %v", err)
+		}
+
+		clock.at = start.Add(3 * time.Minute)
+		if err := store.UpdateRequire2FA(ctx, user.ID, user.TenantID, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.VerifyEnrolmentToken(ctx, token); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("VerifyEnrolmentToken while the policy is lifted = %v, want ErrInvalidToken", err)
+		}
+		clock.at = start.Add(8 * time.Minute)
+		if err := store.UpdateRequire2FA(ctx, user.ID, user.TenantID, true); err != nil {
+			t.Fatal(err)
+		}
+		again, err := a.NewForcedTOTPEnrolment(ctx, token)
+		if err != nil || again.Secret != setup.Secret {
+			t.Fatalf("NewForcedTOTPEnrolment once the policy is restored = %q, %v, want the secret the token derived before", again.Secret, err)
 		}
 	})
 }

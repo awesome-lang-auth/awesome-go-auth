@@ -129,9 +129,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `New` fails. A longer window is longer for whoever holds a copy of the
   token as well: for an account with no factor the token alone completes the
   enrolment and opens a session, so 15 minutes is three times the default's
-  exposure. Its binding to the password and its death once the account has a
-  factor are unchanged. The register entry `forced-enrolment-opens-a-session`
-  now says how long the token lives.
+  exposure. A copy is worth the factor too, and that outlives the token:
+  `/2fa/setup` answers the same secret for every call with the same token and
+  records nothing, so a copy that calls it before the owner enrols with that
+  token learns the secret of the factor the owner then enrols, and keeps it
+  after the token has expired; with the password, it answers the step-up until
+  the factor is replaced. Treat a leaked enrolment token as a leaked factor:
+  change the password, then enrol a new factor in its place. The token's
+  binding to the password, and its refusal while the account has a factor,
+  are unchanged; that refusal does not spend it, so a factor removed before
+  `exp` without a password change brings the token back, with the same
+  secret: reset the password together with the factor. The register entry
+  `forced-enrolment-opens-a-session` now says how long the token lives and
+  what a copy of it is worth.
 
 ### Security
 - **The public credential routes refuse a body over 16 KiB, before anything

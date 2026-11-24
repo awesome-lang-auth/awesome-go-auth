@@ -133,6 +133,10 @@ var wantClaims = map[string][]string{
 	// of the enrolment routes rather than a narrowing of the token. Then how
 	// long the token lives: the reference's 5 minutes unless the deployment
 	// gives it a lifetime of its own, which the step-up token does not share.
+	// And what a copy of the token is worth beyond a session, which a longer
+	// window lengthens: the factor's secret, kept after the token expires, and
+	// a token that is refused while a factor exists rather than spent. An entry
+	// that lost either would understate what a leaked token costs.
 	"forced-enrolment-opens-a-session": {
 		"2FA_SETUP_REQUIRED", "Config.Require2FA", "Authorization: Bearer", "tempToken",
 		"every other route refuses it", "401 INVALID_TEMP_TOKEN", "POST <prefix>/2fa/verify",
@@ -141,6 +145,7 @@ var wantClaims = map[string][]string{
 		"Config.EnrolOnLogin", "off by default", "password change", "a secret the server derives",
 		"enrolled out of band", "Trust on first use",
 		"Config.TempTokenTTL", "Config.EnrolmentTokenTTL", "between 1 and 30 minutes", "Config.ClockSkew",
+		"keeps it after the token has expired", "a leaked factor", "not spent", "brings it back",
 	},
 	"idp-mode-adds-an-oauth-authorization-server": {
 		"S256", "plain", "client_secret_basic", "client_secret_post", "refresh_token", "offline_access",

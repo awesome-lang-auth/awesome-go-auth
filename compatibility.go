@@ -297,7 +297,7 @@ func CompatibilityNotes() APICompatibilityNotes {
 					"`POST <prefix>/2fa/verify-setup` accept it, as the body's `tempToken` or as " +
 					"`Authorization: Bearer`, and every other route refuses it. It is honoured " +
 					"only while the login would still answer `2FA_SETUP_REQUIRED` for its user, " +
-					"so it dies the moment a factor exists, and a replay is " +
+					"so it is refused once a factor exists, and a replay is " +
 					"`401 INVALID_TEMP_TOKEN`; it is bound to the password that minted it, and dies with a " +
 					"password change. `/2fa/setup` with it answers a secret the server derives from the token, " +
 					"and `verify-setup` accepts that secret and no other. A `verify-setup` that completes with it stores the " +
@@ -351,7 +351,12 @@ func CompatibilityNotes() APICompatibilityNotes {
 							"lifetime and it is honoured until `exp` plus `Config.ClockSkew`; the step-up token " +
 							"keeps `TempTokenTTL`. A longer window is longer for whoever holds a copy of the " +
 							"token too: for an account with no factor it completes the enrolment, and opens " +
-							"the session, on its own.",
+							"the session, on its own. A copy that only calls `/2fa/setup` gets the secret the " +
+							"owner then enrols with the same token, and keeps it after the token has expired: " +
+							"with the password, it answers the step-up until the factor is replaced, so treat " +
+							"a leaked enrolment token as a leaked factor. And the token is refused while the " +
+							"account has a factor, not spent: a factor removed before `exp` without a password " +
+							"change brings it back, so reset the password together with the factor.",
 					},
 				},
 			},

@@ -771,14 +771,15 @@ delegates) are the same steps for a host serving its own routes, and
 `Auth.TOTPEnrolmentCaller` is the gate the adapters put on the two routes.
 
 **The secret is the server's.** The session a forced enrolment opens claims the
-factor, so the factor has to be one nobody else can compute codes for.
-`/2fa/setup` with an enrolment token answers a secret derived from the token
-(an HMAC under `Config.Secret` of its tenant, subject and id: 160 bits, the same
-for every call with the same token), and `verify-setup` with that token accepts
-that secret and no other. An empty secret, an all-zero key, the RFC 6238 test
-key, a secret of the client's own and the secret another token was answered are
-all `400 "Invalid TOTP code"`, and enrol nothing. A client that signs in again
-calls `/2fa/setup` again.
+factor, so the factor has to be one nobody without the token can compute codes
+for. `/2fa/setup` with an enrolment token answers a secret derived from the
+token (an HMAC under `Config.Secret` of its tenant, subject and id: 160 bits,
+the same for every call with the same token), and `verify-setup` with that
+token accepts that secret and no other. An empty secret, an all-zero key, the
+RFC 6238 test key, a secret of the client's own and the secret another token
+was answered are all `400 "Invalid TOTP code"`, and enrol nothing. A client
+that signs in again calls `/2fa/setup` again. Whoever else holds the token gets
+the same secret; what that costs is below.
 
 **How long it lives.** The enrolment token's lifetime is `Config.TempTokenTTL`,
 the step-up token's — 5 minutes by default, as the reference's — unless
@@ -810,10 +811,27 @@ session: `/2fa/setup` hands whoever holds it the secret, and a code of that
 secret is all `verify-setup` asks — no password, no guess. A copy of the token,
 wherever it leaked, is worth a session for as long as the token lives, so a
 longer window lengthens that exposure too: 15 minutes is three times the
-default's, 30 six times. What else bounds it does not change: the token is
-minted only by a login that proved the password or by an invitation's
-acceptance, it dies once the account has a factor, and it dies with a password
-change. Lengthen it for users who install an authenticator app while they
+default's, 30 six times.
+
+A copy is worth the factor too, and that outlives the token. `/2fa/setup`
+answers the same secret for every call with the same token, and no event
+records the call, so a copy that calls it before the owner enrols with that
+token learns the secret of the factor the owner then enrols, without opening
+anything, and keeps it after the token has expired: together with the
+password, it answers the step-up until the account's factor is replaced. A
+longer window is more time between the token's minting and the owner's
+enrolment, which is when that read works. Treat a leaked enrolment token as a
+leaked factor: change the password, then enrol a new factor in place of that
+one (signed in, `/2fa/setup` and `/2fa/verify-setup` with an access token
+replace it).
+
+What else bounds the token does not change. It is minted only by a login that
+proved the password or by an invitation's acceptance, and it dies with a
+password change. It is refused while the account has a factor, but not spent:
+a factor removed before `exp` without a password change (a host's own "reset
+2FA" through `DisableTOTP`, or an edit of the store) brings the token back,
+with the same secret. Reset the password together with the factor, as above.
+Lengthen the window for users who install an authenticator app while they
 enrol, no further than they need, and keep the token out of URLs, storage and
 logs.
 
@@ -828,15 +846,18 @@ What keeps the token to its one purpose:
   body's `tempToken` is `401 INVALID_TEMP_TOKEN`. In particular, the step-up
   token a user *with* a factor holds after the password alone cannot enrol a
   replacement factor.
-- **It lives only as long as the need.** Each use re-reads the user and
-  requires that the login would still answer `2FA_SETUP_REQUIRED`. Once a
-  factor exists — from this token, another one, an administrator — or once the
+- **It is honoured only while the need lasts.** Each use re-reads the user and
+  requires that the login would still answer `2FA_SETUP_REQUIRED`. While a
+  factor exists — from this token, another one, an administrator — or while the
   policy is lifted, every outstanding enrolment token answers
   `401 INVALID_TEMP_TOKEN`. That is what refuses a replay after a successful
-  enrolment, with no store of spent tokens. Two `verify-setup` calls racing
-  with the same token can both pass the check. That window is not closed,
-  since whoever holds the token can obtain another one from the password
-  anyway.
+  enrolment, with no store of spent tokens. Refused is not spent: if the need
+  comes back before the token's `exp` (the factor removed, the policy restored)
+  and the password has not changed, the token is honoured again, with the same
+  secret, so reset the password together with the factor. Two `verify-setup`
+  calls racing with the same token can both pass the check. That window is not
+  closed, since whoever holds the token can obtain another one from the
+  password anyway.
 - **It is bound to the password that minted it.** The token carries an HMAC of
   the stored password hash (its `cred` claim), checked on every use: once the
   password changes — a reset, a change, a migration rehash — every enrolment
