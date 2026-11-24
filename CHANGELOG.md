@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-24
+
+Password reset and login hardening (#109, #110, #111, #112): a reset mail is
+sent before its token is stored, so a refused delivery no longer kills the link
+mailed before it; the public credential routes refuse a body over 16 KiB;
+`Config.EmailLangs` bounds the language a request selects; `/forgot-password`
+can answer in the same time for every address; a refused password login costs
+one bcrypt comparison whatever the address names; a reset can end the account's
+sessions; and the enrolment token gets a lifetime of its own.
+
+Four changes act on upgrade, with no configuration change: `/forgot-password`
+sends before it stores (a sender that spends the token from inside the call now
+gets `ErrInvalidToken`); the ten public credential routes answer a body over
+16 KiB with `413 BODY_TOO_LARGE`; every refused password login runs a bcrypt
+comparison, an unknown address's included, so a deployment that limits per
+address only should add a per-client limit in front of the login routes; and
+`/change-password` ends an outstanding reset link. So do the other entries
+under Fixed. The rest is opt-in and off by default: `Config.EmailLangs`,
+`Config.ForgotPasswordMinResponseTime`, `Config.RevokeSessionsOnPasswordReset`
+(with `UserSessionRevoker` and `AuthCode.Credential`) and
+`Config.EnrolmentTokenTTL`. The API changes are additions only; hosts that
+implement `UserPasswordStore` or `SessionStore` should read Changed and Fixed.
+The `amr`/`auth_time`/`mfa_at` claims (#103) remain held back by their open
+security review.
+
 ### Added
 - **`Config.EmailLangs` (`WithEmailLangs("it", "en")`): the languages a
   request's `emailLang` may select.** The body field reached every sender

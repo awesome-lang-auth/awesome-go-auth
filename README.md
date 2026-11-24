@@ -2314,6 +2314,7 @@ What is left, and where each row of the table above closes:
 | v0.13.0 | the 1.10.8 parity fixes (empty bodies, the magic-link split, the linked-account upsert, register without a session, the token-trusting auth gate, the OAuth conflict default), `RefreshSecret`, and the IdP token endpoint's PKCE, `client_secret_basic` and `refresh_token` grant |
 | v0.14.0 | closed registration (`HTTPConfig.ClosedRegistration`), the enforced second factor at login with an opt-in forced enrolment (`Config.EnrolOnLogin`), and machine access to the admin API (`AdminOptions.MachineAccess`) with the user writes resolving their tenant |
 | v0.15.0 | staff invitations for closed realms (`InvitationStore`, admin invite/list/revoke, public single-use accept with password and TOTP enrolment) |
+| v0.16.0 | password reset and login hardening: the reset mail sent before its token is stored, credential-route bodies bounded at 16 KiB, an opt-in list of mail languages (`Config.EmailLangs`), an opt-in response floor on `/forgot-password` (`Config.ForgotPasswordMinResponseTime`), one bcrypt comparison on every refused login, opt-in session revocation on a reset (`Config.RevokeSessionsOnPasswordReset`, `UserSessionRevoker`), and the enrolment token's own lifetime (`Config.EnrolmentTokenTTL`) |
 | v1.0.0 | removal of the shims those releases deprecate, the unauthenticated `MCPServer`, the refusal of a `RefreshSecret` equal to `Secret`, and a final documentation truth pass |
 
 v0.11.0 carries the breaking removals (`SseHub`, `WebhookDispatcher`, the
