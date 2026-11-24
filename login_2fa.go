@@ -252,7 +252,9 @@ func (s *Service) LoginWithChallenge(ctx context.Context, in LoginInput) (LoginR
 // (mustEnrolSecondFactor, enrolment.go). They are typed apart, so the token
 // that may only enrol can never complete a step-up, and the step-up token —
 // which a user with an enrolled factor holds after the password alone — can
-// never enrol a replacement factor.
+// never enrol a replacement factor. Their lifetimes can differ as well: the
+// enrolment token lives Config.EnrolmentTokenTTL when that is set, the
+// step-up token always Config.TempTokenTTL.
 //
 // The enrolment token is minted only under Config.EnrolOnLogin. Without it the
 // setup-required branch carries the step-up token, as it did before the option

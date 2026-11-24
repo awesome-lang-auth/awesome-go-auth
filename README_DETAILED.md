@@ -418,6 +418,7 @@ type Config struct {
     IssueSessionOnRegister bool                         // default: false, the reference's answer — see IssueSessionOnRegister
     RevokeSessionsOnPasswordReset bool                  // default: false, the reference's answer — see RevokeSessionsOnPasswordReset
     TempTokenTTL          time.Duration                 // default: 5m; the step-up token a 2FA challenge hands the client
+    EnrolmentTokenTTL     time.Duration                 // default: 0, TempTokenTTL; the enrolment token under EnrolOnLogin, 1m to 30m — see Mandatory second factor and forced enrolment
     ClockSkew             time.Duration                 // default: 30s
     MinPasswordLen        int                           // default: 8
     BcryptCost            int                           // default: bcrypt.DefaultCost (10); 0 means unset
@@ -740,7 +741,8 @@ What that token can do is the deployment's choice, `Config.EnrolOnLogin`
   example. Reset the password together with the factor.
 
 Under `EnrolOnLogin`, the second answer's `tempToken` is an **enrolment token**. It lives for
-`Config.TempTokenTTL` (5 minutes by default) and is accepted by exactly two
+`Config.TempTokenTTL` (5 minutes by default), or for `Config.EnrolmentTokenTTL`
+when that is set (**How long it lives**, below), and is accepted by exactly two
 routes, `POST <prefix>/2fa/setup` and `POST <prefix>/2fa/verify-setup`, either
 as the body's `tempToken` or as `Authorization: Bearer <token>`. The bearer
 form is how a client written against the reference presents it, since the
@@ -769,14 +771,69 @@ delegates) are the same steps for a host serving its own routes, and
 `Auth.TOTPEnrolmentCaller` is the gate the adapters put on the two routes.
 
 **The secret is the server's.** The session a forced enrolment opens claims the
-factor, so the factor has to be one nobody else can compute codes for.
-`/2fa/setup` with an enrolment token answers a secret derived from the token
-(an HMAC under `Config.Secret` of its tenant, subject and id: 160 bits, the same
-for every call with the same token), and `verify-setup` with that token accepts
-that secret and no other. An empty secret, an all-zero key, the RFC 6238 test
-key, a secret of the client's own and the secret another token was answered are
-all `400 "Invalid TOTP code"`, and enrol nothing. A client that signs in again
-calls `/2fa/setup` again.
+factor, so the factor has to be one nobody without the token can compute codes
+for. `/2fa/setup` with an enrolment token answers a secret derived from the
+token (an HMAC under `Config.Secret` of its tenant, subject and id: 160 bits,
+the same for every call with the same token), and `verify-setup` with that
+token accepts that secret and no other. An empty secret, an all-zero key, the
+RFC 6238 test key, a secret of the client's own and the secret another token
+was answered are all `400 "Invalid TOTP code"`, and enrol nothing. A client
+that signs in again calls `/2fa/setup` again. Whoever else holds the token gets
+the same secret; what that costs is below.
+
+**How long it lives.** The enrolment token's lifetime is `Config.TempTokenTTL`,
+the step-up token's — 5 minutes by default, as the reference's — unless
+`Config.EnrolmentTokenTTL` gives it one of its own:
+
+```go
+a, err := auth.New(
+    auth.WithRequire2FA(true),
+    auth.WithEnrolOnLogin(true),
+    auth.WithEnrolmentTokenTTL(15*time.Minute), // time to install an authenticator app
+)
+```
+
+Zero, the default, keeps `TempTokenTTL`. Anything else must lie between
+`MinEnrolmentTokenTTL` and `MaxEnrolmentTokenTTL`, 1 and 30 minutes, or `New`
+fails. The step-up token keeps `TempTokenTTL` either way, so a longer window to
+enrol is not a longer step-up challenge. The token's `exp` carries the
+lifetime — `exp - iat` is the window a client can show — and every use honours
+it until `exp` plus `Config.ClockSkew` (30 seconds by default), then answers
+`401 INVALID_TEMP_TOKEN`. Nothing else the enrolment depends on lapses sooner:
+the secret `/2fa/setup` answers is derived from the token rather than stored,
+and `verify-setup` checks the code against the clock when it is called, so a
+secret fetched at the start of the window still enrols at its end. The
+acceptance of an invitation mints the same token, with the same lifetime.
+
+The window is a security setting, not only a convenience. For an account with
+no factor, the enrolment token alone completes the enrolment and opens a
+session: `/2fa/setup` hands whoever holds it the secret, and a code of that
+secret is all `verify-setup` asks — no password, no guess. A copy of the token,
+wherever it leaked, is worth a session for as long as the token lives, so a
+longer window lengthens that exposure too: 15 minutes is three times the
+default's, 30 six times.
+
+A copy is worth the factor too, and that outlives the token. `/2fa/setup`
+answers the same secret for every call with the same token, and no event
+records the call, so a copy that calls it before the owner enrols with that
+token learns the secret of the factor the owner then enrols, without opening
+anything, and keeps it after the token has expired: together with the
+password, it answers the step-up until the account's factor is replaced. A
+longer window is more time between the token's minting and the owner's
+enrolment, which is when that read works. Treat a leaked enrolment token as a
+leaked factor: change the password, then enrol a new factor in place of that
+one (signed in, `/2fa/setup` and `/2fa/verify-setup` with an access token
+replace it).
+
+What else bounds the token does not change. It is minted only by a login that
+proved the password or by an invitation's acceptance, and it dies with a
+password change. It is refused while the account has a factor, but not spent:
+a factor removed before `exp` without a password change (a host's own "reset
+2FA" through `DisableTOTP`, or an edit of the store) brings the token back,
+with the same secret. Reset the password together with the factor, as above.
+Lengthen the window for users who install an authenticator app while they
+enrol, no further than they need, and keep the token out of URLs, storage and
+logs.
 
 What keeps the token to its one purpose:
 
@@ -789,15 +846,18 @@ What keeps the token to its one purpose:
   body's `tempToken` is `401 INVALID_TEMP_TOKEN`. In particular, the step-up
   token a user *with* a factor holds after the password alone cannot enrol a
   replacement factor.
-- **It lives only as long as the need.** Each use re-reads the user and
-  requires that the login would still answer `2FA_SETUP_REQUIRED`. Once a
-  factor exists — from this token, another one, an administrator — or once the
+- **It is honoured only while the need lasts.** Each use re-reads the user and
+  requires that the login would still answer `2FA_SETUP_REQUIRED`. While a
+  factor exists — from this token, another one, an administrator — or while the
   policy is lifted, every outstanding enrolment token answers
   `401 INVALID_TEMP_TOKEN`. That is what refuses a replay after a successful
-  enrolment, with no store of spent tokens. Two `verify-setup` calls racing
-  with the same token can both pass the check. That window is not closed,
-  since whoever holds the token can obtain another one from the password
-  anyway.
+  enrolment, with no store of spent tokens. Refused is not spent: if the need
+  comes back before the token's `exp` (the factor removed, the policy restored)
+  and the password has not changed, the token is honoured again, with the same
+  secret, so reset the password together with the factor. Two `verify-setup`
+  calls racing with the same token can both pass the check. That window is not
+  closed, since whoever holds the token can obtain another one from the
+  password anyway.
 - **It is bound to the password that minted it.** The token carries an HMAC of
   the stored password hash (its `cred` claim), checked on every use: once the
   password changes — a reset, a change, a migration rehash — every enrolment
@@ -988,7 +1048,9 @@ Returns a `Config` with sensible defaults.
 
 ### `(Config).validate() error`
 
-Called internally; ensures secret length >= 32 and TTLs > 0.
+Called internally; ensures secret length >= 32 and TTLs > 0, and that
+`EnrolmentTokenTTL`, when set, lies between `MinEnrolmentTokenTTL` and
+`MaxEnrolmentTokenTTL` (1 and 30 minutes).
 
 ---
 
@@ -1271,6 +1333,7 @@ Pass to `auth.New(...)`:
 | `WithRequire2FA(bool)` | Require 2FA for all users |
 | `WithRevokeSessionsOnPasswordReset(bool)` | A successful `POST /reset-password` also revokes the account's sessions; off by default, the reference's answer — see [RevokeSessionsOnPasswordReset](#revokesessionsonpasswordreset) |
 | `WithTwoFactorAppName(string)` | Issuer of the TOTP provisioning URI, the reference's `twoFactor.appName`; empty keeps `Issuer` — see [TwoFactorAppName](#twofactorappname-and-the-totp-parameters) |
+| `WithEnrolmentTokenTTL(time.Duration)` | How long the enrolment token of a `2FA_SETUP_REQUIRED` answer lives under `WithEnrolOnLogin(true)`, 1 to 30 minutes; zero or unset keeps `TempTokenTTL` (5 minutes), and the step-up token keeps it always — see [forced enrolment](#mandatory-second-factor-and-forced-enrolment--require2fa) |
 | `WithTokenClaimsBuilder(TokenClaimsBuilder)` | Custom JWT claims — see [Custom Claims](#custom-claims) |
 | `WithPasswordVerifier(PasswordVerifier)` | Accept the previous identity provider's password on first login and adopt it locally; a port extension, off unless set — see [Password verifier](#password-verifier-migration-seam) |
 | `WithMagicLinkSender(MagicLinkSender)` | Deliver magic links — see [Delivery](#delivery) |

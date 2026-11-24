@@ -231,11 +231,12 @@ func testForcedEnrolment(t *testing.T, mount Mounter) {
 
 	t.Run("only the secret /2fa/setup minted completes", func(t *testing.T) {
 		// The session a forced enrolment opens claims the factor, so the factor
-		// must be one nobody else can compute codes for: the secret the server
-		// minted for the token. An empty secret is an empty HMAC key, and all
-		// zeros and the RFC 6238 test key are known to everybody; a strong
-		// secret of the client's own, or the one another token minted, is no
-		// better. Each is refused before anything is stored.
+		// must be one nobody without the token can compute codes for: the
+		// secret the server minted for the token. An empty secret is an empty
+		// HMAC key, and all zeros and the RFC 6238 test key are known to
+		// everybody; a strong secret of the client's own, or the one another
+		// token minted, is no better. Each is refused before anything is
+		// stored.
 		env := enrolmentEnv(t, mount, auth.DefaultHTTPConfig())
 		env.Seed("mintedsecret@example.com")
 		token := setupRequiredToken(t, env, "mintedsecret@example.com")

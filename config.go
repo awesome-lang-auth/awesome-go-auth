@@ -138,7 +138,11 @@ type Config struct {
 	EmailVerificationTTL          time.Duration
 	EmailVerificationMode         string
 	EmailChangeTTL                time.Duration
-	TempTokenTTL                  time.Duration
+	// TempTokenTTL is the lifetime of the step-up token a 2FA challenge hands
+	// the client — 5 minutes in DefaultConfig, the reference's hardcoded '5m'
+	// — and, while EnrolmentTokenTTL is zero, of the enrolment token a
+	// 2FA_SETUP_REQUIRED answer carries under EnrolOnLogin.
+	TempTokenTTL time.Duration
 	// IssueSessionOnRegister decides whether POST <prefix>/register — and
 	// Service.Register — also logs the new account in: when true, a successful
 	// registration opens a session exactly as a successful POST <prefix>/login
@@ -286,6 +290,50 @@ type Config struct {
 	// token only, and an account under a mandatory policy is enrolled out of
 	// band. WithEnrolOnLogin sets it.
 	EnrolOnLogin bool
+	// EnrolmentTokenTTL is how long the enrolment token of a
+	// 2FA_SETUP_REQUIRED answer lives under EnrolOnLogin: the window in which
+	// POST <prefix>/2fa/setup and POST <prefix>/2fa/verify-setup complete the
+	// enrolment with it and open the session. The token's own exp carries it,
+	// so exp - iat is the window a client can show, and every use honours the
+	// token until exp plus ClockSkew. Nothing else the enrolment depends on
+	// lapses sooner: the secret /2fa/setup answers is derived from the token
+	// rather than stored, and verify-setup checks the code against the clock
+	// at the moment it is called.
+	//
+	// Zero — the zero value, and what DefaultConfig leaves — is TempTokenTTL,
+	// the step-up token's lifetime, as before this field existed. Set, it must
+	// lie between MinEnrolmentTokenTTL and MaxEnrolmentTokenTTL, one minute
+	// and thirty, or NewService refuses the configuration; the bounds are this
+	// field's, and an unset field leaves the token on TempTokenTTL whatever
+	// that is. The step-up token keeps TempTokenTTL either way, and without
+	// EnrolOnLogin there is no enrolment token for the field to change. It is
+	// for a consumer whose invitees install an authenticator app during
+	// enrolment, for whom five minutes from the password to the first code
+	// can be too few.
+	//
+	// The window is a security setting, not only a convenience. For an
+	// account with no factor the token alone completes the enrolment and opens
+	// a session — /2fa/setup hands its holder the secret, and a code of that
+	// secret is all verify-setup asks — so a copy of the token is worth a
+	// session for as long as it lives, and fifteen minutes is three times the
+	// default's exposure. A copy is worth the factor too, and that outlives
+	// the token: /2fa/setup answers the same secret for every call with the
+	// same token, and no event records the call, so a copy that calls it
+	// before the owner enrols with that token learns the secret of the factor
+	// the owner then enrols, and keeps it after the token has expired. With
+	// the password, it answers the step-up until the factor is replaced. Treat
+	// a leaked enrolment token as a leaked factor: change the password, then
+	// enrol a new factor in place of that one (signed in, /2fa/setup and
+	// /2fa/verify-setup with an access token replace it).
+	//
+	// What else bounds the token is unchanged. It is minted only by a login
+	// that proved the account's password or by the acceptance of an
+	// invitation, and it dies with a password change. It is refused while the
+	// account has a factor, but not spent: a factor removed before exp
+	// without a password change brings the token back, with the same secret,
+	// so reset the password together with the factor (see EnrolOnLogin). Keep
+	// the token out of URLs, storage and logs. WithEnrolmentTokenTTL sets it.
+	EnrolmentTokenTTL time.Duration
 	// TwoFactorAppName is the issuer an authenticator app files a TOTP
 	// enrolment under: the `issuer` of the otpauth:// URI POST <prefix>/2fa/setup
 	// returns, and the prefix of its label. It is the reference's
@@ -577,6 +625,28 @@ func (c Config) totpIssuer() string {
 	return c.Issuer
 }
 
+// MinEnrolmentTokenTTL and MaxEnrolmentTokenTTL bound Config.EnrolmentTokenTTL
+// when it is set. The floor keeps a value meant in minutes but written in
+// seconds from minting a token nobody can use; the ceiling keeps to minutes
+// the window in which a copy of the token is worth a session, or the secret
+// of the factor enrolled with it. They bound the field, not the token's whole
+// life: every use honours the token until exp plus Config.ClockSkew, so the
+// longest window is thirty minutes plus that skew, and an unset field leaves
+// the token on TempTokenTTL, which they do not bound.
+const (
+	MinEnrolmentTokenTTL = time.Minute
+	MaxEnrolmentTokenTTL = 30 * time.Minute
+)
+
+// enrolmentTokenTTL is the lifetime of the enrolment token: EnrolmentTokenTTL
+// when it is set, TempTokenTTL otherwise. See Config.EnrolmentTokenTTL.
+func (c Config) enrolmentTokenTTL() time.Duration {
+	if c.EnrolmentTokenTTL != 0 {
+		return c.EnrolmentTokenTTL
+	}
+	return c.TempTokenTTL
+}
+
 // secretFor is the HS256 key a token of tokenType is signed and verified with:
 // RefreshSecret for a refresh token when it is set, Secret for everything else
 // and for a refresh token when it is not. The step-up token stays on Secret
@@ -623,6 +693,10 @@ func (c Config) validate() error {
 	}
 	if c.EmailVerificationTTL <= 0 || c.EmailChangeTTL <= 0 || c.TempTokenTTL <= 0 {
 		return errors.New("auth: email and temp token ttl must be > 0")
+	}
+	if c.EnrolmentTokenTTL != 0 && (c.EnrolmentTokenTTL < MinEnrolmentTokenTTL || c.EnrolmentTokenTTL > MaxEnrolmentTokenTTL) {
+		return fmt.Errorf("auth: enrolment token ttl must be between %s and %s, or 0 to use the temp token ttl; got %s",
+			MinEnrolmentTokenTTL, MaxEnrolmentTokenTTL, c.EnrolmentTokenTTL)
 	}
 	if c.InvitationTTL < 0 {
 		return errors.New("auth: invitation ttl must be > 0, or 0 for the default (72h)")

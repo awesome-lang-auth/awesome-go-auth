@@ -270,6 +270,24 @@ func WithEnrolOnLogin(enabled bool) Option {
 	}
 }
 
+// WithEnrolmentTokenTTL sets Config.EnrolmentTokenTTL: how long the enrolment
+// token of a 2FA_SETUP_REQUIRED answer lives under WithEnrolOnLogin — the
+// window in which the account enrols its factor and gets its session.
+//
+//	auth.WithEnrolOnLogin(true), auth.WithEnrolmentTokenTTL(15 * time.Minute) // time to install an authenticator app
+//
+// Not calling it, or passing zero, keeps the token on TempTokenTTL, 5 minutes
+// by default, as before the option existed. Anything else must lie between
+// MinEnrolmentTokenTTL and MaxEnrolmentTokenTTL, one minute and thirty, or New
+// fails. The step-up token keeps TempTokenTTL. A longer window is a longer one
+// for whoever holds a copy of the token too — see Config.EnrolmentTokenTTL.
+func WithEnrolmentTokenTTL(d time.Duration) Option {
+	return func(b *authBuilder) error {
+		b.cfg.EnrolmentTokenTTL = d
+		return nil
+	}
+}
+
 // WithIssueSessionOnRegister sets Config.IssueSessionOnRegister: whether a
 // successful POST <prefix>/register also logs the new account in, as a
 // successful POST <prefix>/login would.
