@@ -117,6 +117,71 @@ func TestEnrolmentTokenTTL_LengthensTheTokenAndItsWindow(t *testing.T) {
 	}
 }
 
+// TestEnrolmentTokenTTL_ShorterThanTempTokenTTL: a lifetime set below
+// TempTokenTTL is the token's lifetime as well. A deployment that shortens
+// the enrolment window, two minutes under the default five, gets two minutes:
+// the token carries them, every use honours it until exp plus ClockSkew and
+// refuses it one second later, the service call and the gate alike, and it
+// is refused long before TempTokenTTL. The step-up token keeps its five.
+func TestEnrolmentTokenTTL_ShorterThanTempTokenTTL(t *testing.T) {
+	ctx := context.Background()
+	clock, start := newEnrolmentClock()
+	a := enrolmentTTLAuth(t, clock, WithEnrolmentTokenTTL(2*time.Minute))
+	if got := a.service.cfg.TempTokenTTL; got != 5*time.Minute {
+		t.Fatalf("TempTokenTTL = %s, want the default 5m0s: the case is a lifetime below it", got)
+	}
+	_, token := setupChallenge(t, a.service, "short@example.com")
+
+	if got := tokenWindow(t, token); got != 2*time.Minute {
+		t.Fatalf("enrolment token exp - iat = %s, want 2m0s: a lifetime below TempTokenTTL is the token's too", got)
+	}
+
+	skew := a.service.cfg.ClockSkew
+	for _, tc := range []struct {
+		name    string
+		after   time.Duration
+		honours bool
+	}{
+		{"at minute 1", time.Minute, true},
+		{"at exp", 2 * time.Minute, true},
+		{"at exp plus ClockSkew", 2*time.Minute + skew, true},
+		{"a second past exp plus ClockSkew", 2*time.Minute + skew + time.Second, false},
+		{"at TempTokenTTL", 5 * time.Minute, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock.at = start.Add(tc.after)
+			_, err := a.VerifyEnrolmentToken(ctx, token)
+			caller, herr, ok := a.TOTPEnrolmentCaller(ctx, enrolmentGateRequest(), token)
+			if tc.honours {
+				if err != nil {
+					t.Fatalf("VerifyEnrolmentToken %s after the login = %v, want the token honoured", tc.after, err)
+				}
+				if !ok || !caller.Forced {
+					t.Fatalf("TOTPEnrolmentCaller %s after the login = %+v, %+v, %v, want the forced enrolment", tc.after, caller, herr, ok)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInvalidToken) {
+				t.Fatalf("VerifyEnrolmentToken %s after the login = %v, want ErrInvalidToken: the token lives 2 minutes, not TempTokenTTL", tc.after, err)
+			}
+			if ok || herr != HTTPErrInvalidTempToken {
+				t.Fatalf("TOTPEnrolmentCaller %s after the login = %+v, %+v, %v, want 401 INVALID_TEMP_TOKEN", tc.after, caller, herr, ok)
+			}
+		})
+	}
+
+	t.Run("the step-up token keeps TempTokenTTL", func(t *testing.T) {
+		clock.at = start
+		stepUp, err := a.IssueTempToken(ctx, User{ID: "u1", TenantID: "t1", Email: "direct@example.com"})
+		if err != nil {
+			t.Fatalf("IssueTempToken: %v", err)
+		}
+		if got := tokenWindow(t, stepUp); got != 5*time.Minute {
+			t.Fatalf("IssueTempToken exp - iat = %s, want 5m0s: a shorter enrolment window is not a shorter step-up", got)
+		}
+	})
+}
+
 // TestEnrolmentTokenTTL_ForcedEnrolmentCompletesUntilTheTokenExpires: the
 // secret is answered at the start of the window, as an enrolment page asks for
 // it before the authenticator app is installed, and the enrolment is
